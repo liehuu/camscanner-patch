@@ -135,7 +135,13 @@ jobs:
       - name: Lint dylib (崩宿主专项检查)
         run: |
           set -euo pipefail
-          python3 tools/lint_dylib.py "build/${DYLIB_NAME}.dylib"
+          # 先跑判据自测：lint 自己的规则也必须被验证。
+          # 这不是形式主义 —— lint_dylib.py 的 B3 判据已经被证明会误报两次
+          # （startswith("_") 全跳过、前缀白名单误判 _dlsym/_fopen/_fclose），
+          # 没有自测的话，这类回归会一路带到设备上才发现。
+          python3 tools/lint_selftest.py
+          # 再跑真检查；源码层始终跑，产物层在编译后才做
+          SRC_FILE=src/CamScannerSaveToFiles.m python3 tools/lint_dylib.py "build/${DYLIB_NAME}.dylib"
 
       # ═══════════════════════════════════════════════════════════════════
       # 以下步骤只在 mode=full 时执行，全部需要原始 ipa

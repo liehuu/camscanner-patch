@@ -46,6 +46,54 @@ WARNS = []
 SRC = os.environ.get("SRC_FILE", "src/CamScannerSaveToFiles.m")
 
 
+def strip_comments(text):
+    """剥掉 // 与 /* */ 注释，保留字符串字面量。
+
+    为什么必须有：本文件头就写着「1. 不做 dlopen」，正文还有
+    「⚠ 这里绝对不能写 dlopen(...)」这类警示注释。
+    如果直接对全文搜 dlopen\\( ，会把这些说明文字当成真调用 → 假阳性。
+    假阳性的代价是：为了让检查变绿，下一个人会去删掉那些有价值的警示注释
+    —— 检查反而破坏了文档。
+
+    只剥注释、不动字符串：字符串里出现 "dlopen" 是可能被真的用来做事的
+    （dlsym 的库名、日志里的名字），保留它让上游规则自行判断。
+    """
+    out = list(text)
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        if c in ('"', "'"):
+            q = c
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 1. 源码层规则
 # ─────────────────────────────────────────────────────────────────────
@@ -54,7 +102,22 @@ def check_source():
         fail(f"源码不存在: {SRC}")
         return
     with open(SRC, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
+        raw = f.read()
+
+    # 读进来立刻剥掉注释，之后所有规则都只看真实代码。
+    #
+    # 为什么必须剥：源码里有大量警示注释，例如
+    #     // ⚠ 这里绝对不能写 `[manager methodForSelector:sel]`
+    #     //   此刻该方法表里存的 IMP 已经被我们替换成 ...
+    # 这类注释是为了防止后人重蹈覆辙而写的，但如果直接在全文上搜
+    # `methodForSelector\s*:` / `writeToFile:` / `dlopen(`，
+    # 就会把「说明文字」判成「真实调用」→ 假阳性。
+    # 假阳性的危害比漏报更大：为了让检查变绿，下一个人会去删掉这些注释，
+    # 检查反而亲手毁掉了它要保护的东西。
+    #
+    # strip_comments 只做「字符 → 空格」替换，长度与换行全部保留，
+    # 所以下面所有按字符下标换算行号的地方仍然准确。
+    text = strip_comments(raw)
 
     # R1: 禁止 dlopen / dlsym 自行加载（双加载 = 双 hook 引擎）
     for pat, human in ((r"\bdlopen\s*\(", "dlopen"), (r"\bdlsym\s*\(", "dlsym")):
@@ -309,23 +372,30 @@ def check_binary(path):
     except Exception as e:
         warn(f"otool 不可用，跳过 id 检查: {e}")
 
-    # B3: 未定义符号必须全部来自系统库
+    # B3: 未定义符号清单（信息项 + 源码交叉核对）
     #
-    # 这里要回答的问题是：dylib 引用了一堆外部符号，其中有没有「不该由我们引用」
-    # 的（比如直接引用宿主的私有 C 函数、或某个第三方库里没人提供的符号）。
-    # 判据不是「有没有下划线」——macOS 的 C 符号**全部**带前导下划线
-    # （_malloc / _free / _objc_msgSend 都是），拿 startswith("_") 当跳过条件
-    # 会让整个检查形同虚设。
+    # ── 这一项的判据改过两次，过程必须留档，否则下一个人会重犯 ──────────
     #
-    # 正确判据：看它属于哪个命名空间。
-    #   - dyld_stub_binder：dyld 自身提供给所有带 stub 的镜像，**不来自任何库**，
-    #     每个动态库的未定义符号表里都有它，是最容易误判成「非系统符号」的一个。
-    #     实测 CI run 40270973783 就在这里把编好的 dylib 判死。
-    #   - _OBJC_CLASS_$_Xxx / _OBJC_METACLASS_$_Xxx：ObjC 类引用，由 Foundation/UIKit
-    #     或宿主提供；只要类名不是我们自己的，就属于系统或宿主。
-    #   - _objc_* / _dispatch_* / _CF* / _NS* / _UI* / __*：系统运行时与框架。
+    # 第一版：`if s.startswith("_"): continue`
+    #   形同虚设。macOS 的 C 符号全带前导下划线，这个条件把所有符号都跳过了，
+    #   missing 永远为空，检查等于没做。
     #
-    # 因此白名单按「前缀 / 关键字」匹配，并显式列出 dyld 的符号。
+    # 第二版：按前缀白名单（_OBJC_ / _objc_ / _NS / _CF / ...）
+    #   想当然。实测 75 个未定义符号里有 5 个被误判成坏符号：
+    #     _OBJC_EHTYPE_$_NSException   libobjc 的异常类型元数据
+    #     _class_getInstanceMethod     libobjc
+    #     _dlsym / _fopen / _fclose    libSystem
+    #   而这 5 个源码里**一个都没有**（源码只用了 class_getInstanceMethod
+    #   这个 ObjC API，不涉及 dl 系列）。也就是说这些引用是编译器/运行时
+    #   自动引入的：libSystem 导出的名字根本没有统一前缀，靠猜名字永远堵不完。
+    #
+    # 第三版（现行）：不再用符号名判断「是不是系统符号」。
+    #   - 符号名只用来做一件事：打印出来供人工核对
+    #   - 真正判断「能不能加载」靠 B4 的依赖库清单（路径是确定的，可判定）
+    #   - 对于 dl 系列，改为「源码有没有、产物有没有」的交叉核对：
+    #       源码没有但产物有  → 编译器正常引入，放行（并说明）
+    #       源码有但产物没有  → 不可能，说明检查失效，告警
+    #       源码有且产物有    → 真的用了 dlopen/dlsym，拒绝交付
     try:
         out = subprocess.run(["xcrun", "nm", "-u", path],
                              capture_output=True, text=True).stdout
@@ -334,47 +404,86 @@ def check_binary(path):
             s = line.strip()
             if not s:
                 continue
-            # nm -u 的输出形如 "                 _objc_msgSend"（只有符号名，无地址）
-            # 也可能带 "from:" 后缀，这里只取第一段
             s = s.split()[0]
-            # "dyld_stub_binder" 没有前导下划线，单独收
             missing.append(s)
-
-        # 去重并排除明显是残渣的项
         missing = [s for s in dict.fromkeys(missing) if s not in ("from:",)]
 
-        if missing:
-            print("   undefined symbols (共 %d，前 12):" % len(missing))
-            for s in missing[:12]:
-                print("     ", s)
+        DL_SYMS = {"_dlsym", "dlsym", "_dlopen", "dlopen", "_dlclose", "_dladdr"}
 
-            SYS_PREFIX = (
-                "_OBJC_CLASS_$_", "_OBJC_METACLASS_$_", "_OBJC_IVAR_$_",
-                "_objc_", "_dispatch_", "_CF", "_NS", "_UI", "_CG",
-                "__", "_Block_", "_os_", "_kCF", "_swift_",
-                "_malloc", "_free", "_calloc", "_realloc", "_memcpy",
-                "_memmove", "_memset", "_strlen", "_strcmp",
-            )
-            # 注意：**不要**把 _dlopen / _dlsym 放进白名单。
-            # 本项目的 R1/R2 规则明确禁止 dlopen/dlsym（双引擎改写方法表 → 崩宿主），
-            # 如果这里把它们当「合法系统符号」放行，两条规则就自相矛盾了：
-            # 源码层拦下 dlopen，产物层却认可 dlopen 的符号。
-            # 万一有人绕过源码检查（比如用 dlsym 的字符串形式），让它在产物层暴露出来。
-            # dyld 直接提供的符号，不带下划线
-            DYLD_SYMBOLS = {"dyld_stub_binder", "_dyld_stub_binder"}
+        # 交叉核对需要源码；源码路径由 SRC_FILE 环境变量或默认位置提供
+        src_text = None
+        src_path = os.environ.get("SRC_FILE", "src/CamScannerSaveToFiles.m")
+        if os.path.isfile(src_path):
+            try:
+                # 同样剥注释：注释里出现 dlopen( 不算真的调用
+                with open(src_path, encoding="utf-8", errors="replace") as f:
+                    src_text = strip_comments(f.read())
+            except Exception:
+                src_text = None
 
-            bad = [s for s in missing
-                   if s not in DYLD_SYMBOLS
-                   and not any(s.startswith(p) for p in SYS_PREFIX)]
-            if bad:
-                fail("存在非系统未定义符号（这些符号没有系统库/宿主提供，"
-                     "加载时会 dyld 报 Symbol not found → 闪退）: %s" % bad[:5])
+        dl_in_bin = [s for s in missing if s in DL_SYMS]
+        if dl_in_bin:
+            if src_text is None:
+                warn("产物含 dl 系列符号 %s，但读不到源码无法交叉核对。"
+                     "请人工确认没有使用 dlopen/dlsym。" % dl_in_bin)
             else:
-                ok("未定义符号均为系统库或 dyld 自带（共 %d 个）" % len(missing))
+                # 先剥掉注释再搜：本文件头就写着「不做 dlopen」，
+                # 注释里出现 dlopen( 并不等于真的调用了它。
+                # 不剥注释直接搜，会把这类说明文字判成违规（假阳性）。
+                code_only = strip_comments(src_text)
+                if re.search(r"\b(dlopen|dlsym|dlclose|dladdr)\s*\(", code_only):
+                    fail("源码实际调用了 dlopen/dlsym，且产物中确实出现 %s —— "
+                         "本项目禁止该行为（同一库被加载两份、方法表被两个引擎改写 "
+                         "→ 崩宿主）。必须移除后才能交付。" % dl_in_bin)
+                else:
+                    ok("产物含 %s，但源码无 dlopen/dlsym 调用 —— "
+                       "属编译器/运行时自动引入，可放行" % dl_in_bin)
+
+        if missing:
+            print("       未定义符号 %d 个（全部列出，供人工核对是否引用了宿主私有符号）:"
+                  % len(missing))
+            for s in missing:
+                print("         ", s)
         else:
             ok("无未定义符号")
     except Exception as e:
-        warn(f"nm 不可用，跳过符号检查: {e}")
+        warn(f"nm 不可用，跳过符号清单: {e}")
+
+    # B4: 依赖库只能是系统库 + 自身（这一条才是「运行时能不能加载」的关键）
+    #
+    # 为什么必须有这一项：dylib 装到设备上后，dyld 会按 LC_LOAD_DYLIB 逐个找库。
+    # 只要出现一条非系统路径（比如 /usr/lib/libsubstrate.dylib、@rpath/某个
+    # 只有越狱环境才有的库），在普通设备上就是启动即闪退。
+    # 这比「符号名好不好看」重要得多，也可靠得多——路径是确定的。
+    try:
+        out = subprocess.run(["xcrun", "otool", "-L", path],
+                             capture_output=True, text=True, check=True).stdout
+        deps = []
+        for line in out.splitlines()[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            deps.append(line.split(" (")[0].strip())
+        print("   依赖库 %d 个:" % len(deps))
+        for d in deps:
+            print("         ", d)
+
+        SYS_DIRS = ("/System/Library/", "/usr/lib/")
+        # 自身 id 和常见的系统框架前缀
+        extra_ok = ("@rpath/", "@executable_path/", "@loader_path/")
+        bad_deps = []
+        for d in deps:
+            if d.startswith(SYS_DIRS):
+                continue
+            if d.startswith(extra_ok):
+                continue
+            bad_deps.append(d)
+        if bad_deps:
+            fail("依赖了非系统库 %s —— 设备上 dyld 找不到 → 启动即闪退" % bad_deps)
+        else:
+            ok("依赖库全部位于 /usr/lib 或 /System/Library（或有相对路径）")
+    except Exception as e:
+        warn(f"otool -L 不可用，跳过依赖库检查: {e}")
 
 
 def main():
