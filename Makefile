@@ -39,11 +39,14 @@ $(BUILD):
 presyntax:
 	@echo "=== 语法预检 ==="
 	$(PYTHON) tools/presyntax.py $(SRC)
+	@echo "=== 声明顺序检查 ==="
+	$(PYTHON) tools/decl_order.py $(SRC)
 
 # 连崩宿主检查一起跑。注意 lint 的产物层检查需要 build 出来的 dylib，
 # 没有 macOS 时它会自动跳过（只做源码层检查）。
 check:
 	$(PYTHON) tools/presyntax.py $(SRC)
+	$(PYTHON) tools/decl_order.py $(SRC)
 	@SRC_FILE=$(SRC) $(PYTHON) tools/lint_dylib.py
 
 dylib: presyntax $(BUILD)

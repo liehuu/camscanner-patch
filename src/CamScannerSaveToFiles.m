@@ -351,6 +351,16 @@ static void CSFSPresentExportPicker(NSArray<NSURL *> *fileURLs) {
 
 static NSInteger gCSFSOfficeShareType = 0x7B;   // 最近一次面板展示时的格式
 
+// ── orig IMP 指针 ──────────────────────────────────────────────────────
+// 必须定义在使用点之前。C 语言没有 Hoisting：CSFSBeginSaveToFiles 在 ~L394
+// 就要用它们重派发给原实现，而原先这两个定义写在 ~L619，clang 直接报
+//   error: use of undeclared identifier 'gOrigShareActionWithOperationTpe'
+//   error: call to undeclared function ... [-Wimplicit-function-declaration]
+//   error: redefinition ... as different kind of symbol
+// 所以统一挪到模块级状态区，和 gCSFSOfficeShareType 放一起。
+static BOOL (*gOrigShareActionWithOperationTpe)(id, SEL, NSInteger) = NULL;
+static BOOL (*gOrigShareActionWithOperationTpeNeedLog)(id, SEL, NSInteger, BOOL) = NULL;
+
 @interface CSFSExportState : NSObject
 @property (class, nonatomic, readonly) CSFSExportState *shared;
 @property (atomic, assign) BOOL pendingSaveToFiles;
@@ -616,8 +626,8 @@ static NSMutableArray *CSFS_officeFileShareViewData(id self, SEL _cmd) {
 // 所以两个都 hook，且把 :needLog: 当主拦截点：拦到后自行分发，
 // 不再让原实现重复执行一遍埋点/跳转。
 
-static BOOL (*gOrigShareActionWithOperationTpe)(id, SEL, NSInteger) = NULL;
-static BOOL (*gOrigShareActionWithOperationTpeNeedLog)(id, SEL, NSInteger, BOOL) = NULL;
+// （gOrigShareActionWithOperationTpe / ...NeedLog 两个指针已上移到模块级状态区，
+//   原因见那里的注释：C 无 Hoisting，定义必须早于使用点。）
 
 // 抽出公共拦截逻辑，避免两份重复代码在细节上漂移
 static BOOL CSFSTryInterceptShareAction(id self, NSInteger operationType) {

@@ -88,6 +88,9 @@ jobs:
           # 这几类缺陷一旦进到 clang 就是一次 3~5 分钟的 CI 往返，
           # 而它们完全可以纯文本判定。
           python3 tools/presyntax.py src/CamScannerSaveToFiles.m
+          # 声明顺序：C 无 Hoisting，定义晚于使用就是编译错误。
+          # 单独一项，因为上面 6 项都查不到它（括号是平的、块是配的、selector 也是可知的）。
+          python3 tools/decl_order.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |
