@@ -364,8 +364,18 @@ jobs:
           OUT="out/CamScanner_7.26.5_SaveToFiles.ipa"
           mkdir -p out
           rm -f "${OUT}"
-          # 移除可能残留的旧签名目录，保证重签干净
-          rm -rf work/Payload/*.app/_CodeSignature
+          # 不删 _CodeSignature：上一步 codesign 刚生成它，删掉会让 bundle
+          # 「主二进制有 embedded signature、资源 seal 目录却不在」的混合态。
+          # LiveContainer 导入本就会用自己的证书重签，保留原签名目录是
+          # 冗余但无害的正确态；删掉则是把一个未知态交给下游。
+          # 这里只做存在性确认，不写不删。
+          SIG="${APP_DIR}/_CodeSignature"
+          if [ -f "${SIG}/CodeResources" ]; then
+            echo "OK: _CodeSignature/CodeResources 在位（codesign 产物已保留）"
+          else
+            echo "::warning::未见到 _CodeSignature/CodeResources —— 若导入器要求资源 seal，需回头查签名步骤"
+          fi
+          # 只打 Payload：ipa 规范只需要这个目录，顶层元数据不是安装必需。
           ( cd work && zip -qry "../${OUT}" Payload )
           echo "=== 产物 ==="
           ls -la "${OUT}"

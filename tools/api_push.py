@@ -144,15 +144,27 @@ def main():
         files = list(args.files)
 
     if not files:
-        print("没有要提交的文件")
-        return 0
+        # 这个分支踩过两次同一个坑：先 `git commit` 再跑 `--all`，
+        # 于是工作树是干净的、api_push 报「没有要提交的文件」，
+        # 而本地 HEAD 明明还没有同步到远端。
+        # 直接拿 HEAD 清单补推，并明确告知调用方发生了什么。
+        if not args.files:
+            files = git("ls-tree", "-r", "HEAD", "--name-only", "-z").decode(
+                "utf-8", "replace").split("\0")
+            files = [f for f in files if f]
+            if files:
+                print("工作区干净（或未指定 --files），改按本地 HEAD 清单推 %d 个文件"
+                      % len(files))
+        if not files:
+            print("没有要提交的文件")
+            return 0
 
     msg = args.message
     if args.message_file:
         msg = open(args.message_file, encoding="utf-8").read().rstrip("\n")
     # --from-head 且未显式给消息时，直接沿用本地 HEAD 的提交说明。
     # 远端重建出来的 commit message 与本地一致，事后回读才好对齐。
-    if not msg and args.from_head:
+    if not msg and (args.from_head or not args.files):
         msg = git("log", "-1", "--pretty=%B").decode("utf-8", "replace").rstrip("\n")
     if not msg:
         print("ERROR: 需要 --message 或 --message-file", file=sys.stderr)
