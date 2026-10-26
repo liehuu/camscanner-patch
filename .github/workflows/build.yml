@@ -53,6 +53,10 @@ jobs:
     name: Build
     runs-on: macos-14
     timeout-minutes: 40
+    permissions:
+      # 显式声明。若仓库「默认 GITHUB_TOKEN 权限」被管理员设为 restricted，
+      # 不写这一项就只剩「无」，读 release asset 会 403 且毫无线索。
+      contents: read
 
     steps:
       - name: Checkout
@@ -158,10 +162,22 @@ jobs:
             echo "从直链下载: ${URL}"
             # 私有 release asset 走 API 时需要 octet-stream；普通直链带不带都无妨。
             # -L 跟随跳转（GitHub release 会 302 到 objects.githubusercontent.com）
-            curl -fL --retry 3 --retry-delay 2 \
+            #
+            # 403 排查留档（2026-10-26 真实踩过）：
+            #   asset 挂在 **draft** release 下时，contents:read 的 GITHUB_TOKEN
+            #   读不到它 —— draft 资产只对具备 contents:write 的集成开放，
+            #   返回的是 403 而不是 404，光看状态码会以为是权限配错。
+            #   解决：把承载输入包的 release 转正（draft:false，仓库 private
+            #   依然保证外部不可见），或给 job 加 contents:write。
+            if ! curl -fL --retry 3 --retry-delay 2 \
                  -H "Authorization: Bearer ${{ github.token }}" \
                  -H "Accept: application/octet-stream" \
-                 -o "in/_downloaded.ipa" "${URL}"
+                 -o "in/_downloaded.ipa" "${URL}"; then
+              echo "::error::下载输入 ipa 失败。若为 403：① asset 是否在 draft release 里" \
+                          "（转正或用 contents:write）② 仓库默认 GITHUB_TOKEN 权限是否被设为 restricted。"
+              ls -la in/ || true
+              exit 1
+            fi
             IPA="in/_downloaded.ipa"
           else
             IPA_NAME="${{ github.event.inputs.ipa_name }}"
