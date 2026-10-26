@@ -1,21 +1,36 @@
 name: Build CamScanner SaveToFiles IPA
 
 # 触发方式：
-#   1. 手动 workflow_dispatch（推荐；需要先从 Releases / 私链下载原始 ipa 放到 in/ 目录并提交到 private 分支或 LFS）
-#   2. push 到 main 且改动 src/ 或 tools/
+#   1. 手动 workflow_dispatch，mode=dylib  → 只编译 dylib（不需要原始 ipa，秒级验证源码能否编过）
+#   2. 手动 workflow_dispatch，mode=full   → 完整链路：解包 → 注入 → 重签 → 重打包 → 出 ipa
+#                                            （原始 ipa 走 in/ 目录或 ipa_url 直链）
+#   3. push 到 main 且改动 src/ 或 tools/  → 自动跑 mode=dylib
+#
+# 为什么要有 mode=dylib：
+#   「能否编译通过」和「注入后能否装上去」是两个失败点。
+#   前者只需要源码 + 交叉编译工具链，不需要那个 200MB 的 ipa。
+#   把它拆出来，可以在几分钟内拿到编译结论，而不是每次都等整条链路。
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'dylib = 只编译（无需 ipa）；full = 编译+注入+重签+出 ipa'
+        required: true
+        default: 'dylib'
+        type: choice
+        options:
+          - dylib
+          - full
       ipa_name:
-        description: 'in/ 目录下的原始 ipa 文件名（留空则取 in/ 下第一个 .ipa）'
+        description: '[full] in/ 目录下的原始 ipa 文件名（留空则取 in/ 下唯一那个 .ipa）'
         required: false
         default: ''
       ipa_url:
-        description: '（可选）原始 ipa 直链。填了就从这里下，忽略 in/ 目录'
+        description: '[full] 原始 ipa 直链（填了就从这里下，忽略 in/ 目录）'
         required: false
         default: ''
       bundle_id:
-        description: '目标 Bundle ID（用于校验 ipa 是否为目标应用）'
+        description: '[full] 目标 Bundle ID（用于校验 ipa 是否为目标应用）'
         required: false
         default: 'com.intsig.CamScannerLite'
   push:
@@ -35,9 +50,9 @@ env:
 
 jobs:
   build:
-    name: Compile dylib + inject + repack
+    name: Build
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -45,15 +60,86 @@ jobs:
         with:
           lfs: true
 
+      - name: Resolve mode
+        id: mode
+        run: |
+          set -euo pipefail
+          # 手动触发读 inputs；push 触发没有 inputs，一律按 dylib 处理
+          M="${{ github.event.inputs.mode }}"
+          if [ -z "${M}" ]; then M="dylib"; fi
+          echo "mode=${M}" >> "${GITHUB_OUTPUT}"
+          echo "本次模式: ${M}"
+
       - name: Show toolchain
         run: |
           set -euo pipefail
           xcodebuild -version || true
+          echo "--- iphoneos sdk ---"
           xcrun --sdk iphoneos --show-sdk-version
+          echo "--- clang ---"
           clang --version | head -2
+          echo "--- python ---"
           python3 --version
 
+      - name: Pre-syntax check (无编译器语法闸门)
+        run: |
+          set -euo pipefail
+          # 放在编译之前：括号配平 / 块配平 / selector 可知性 / hook 签名对齐
+          # 这几类缺陷一旦进到 clang 就是一次 3~5 分钟的 CI 往返，
+          # 而它们完全可以纯文本判定。
+          python3 tools/presyntax.py src/CamScannerSaveToFiles.m
+
+      - name: Compile dylib (arm64 + arm64e)
+        run: |
+          set -euo pipefail
+          SDKBASE="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK: ${SDKBASE}"
+          mkdir -p build
+          ARCHS="arm64 arm64e"
+          for ARCH in ${ARCHS}; do
+            echo "=== 编译 ${ARCH} ==="
+            xcrun --sdk iphoneos clang \
+              -arch "${ARCH}" \
+              -isysroot "${SDKBASE}" \
+              -miphoneos-version-min=13.0 \
+              -fobjc-arc \
+              -fmodules \
+              -dynamiclib \
+              -install_name "${INSTALL_NAME}" \
+              -compatibility_version 1.0.0 \
+              -current_version 1.0.0 \
+              -Os \
+              -Wall -Wextra \
+              -Wno-unused-parameter \
+              -Wno-deprecated-declarations \
+              -o "build/${DYLIB_NAME}.${ARCH}.dylib" \
+              src/CamScannerSaveToFiles.m \
+              -framework Foundation \
+              -framework UIKit
+          done
+
+          # 合并成 fat
+          xcrun lipo -create \
+            "build/${DYLIB_NAME}.arm64.dylib" \
+            "build/${DYLIB_NAME}.arm64e.dylib" \
+            -output "build/${DYLIB_NAME}.dylib"
+
+          echo "=== 产物架构 ==="
+          xcrun lipo -info "build/${DYLIB_NAME}.dylib"
+          echo "=== 导出符号（应有 constructor）==="
+          xcrun nm -gU "build/${DYLIB_NAME}.dylib" 2>/dev/null | head -20 || true
+
+      - name: Lint dylib (崩宿主专项检查)
+        run: |
+          set -euo pipefail
+          python3 tools/lint_dylib.py "build/${DYLIB_NAME}.dylib"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 以下步骤只在 mode=full 时执行，全部需要原始 ipa
+      # ═══════════════════════════════════════════════════════════════════
+
       - name: Locate input ipa
+        if: steps.mode.outputs.mode == 'full'
         id: locate
         run: |
           set -euo pipefail
@@ -100,6 +186,7 @@ jobs:
           echo "使用 ipa: ${IPA} ($(du -h "${IPA}" | cut -f1))"
 
       - name: Unpack ipa
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           rm -rf work && mkdir -p work
@@ -113,6 +200,7 @@ jobs:
           echo "APP_DIR=${APP_DIR}" >> "${GITHUB_ENV}"
 
       - name: Guard against double injection
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           # ─────────────────────────────────────────────────────────────
@@ -144,6 +232,7 @@ jobs:
           echo "OK: 输入包干净，可以注入"
 
       - name: Verify target app
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP_DIR}/Info.plist")"
@@ -177,58 +266,8 @@ jobs:
           BIN="${APP_DIR}/${APP_EXECUTABLE}"
           python3 tools/check_classes.py "${BIN}" CSShareManager CSActivityUtil CSShareModel
 
-      - name: Pre-syntax check (无编译器语法闸门)
-        run: |
-          set -euo pipefail
-          # 放在编译之前：括号配平 / 块配平 / selector 可知性 / hook 签名对齐
-          # 这几类缺陷一旦进到 clang 就是一次 3~5 分钟的 CI 往返，
-          # 而它们完全可以纯文本判定。
-          python3 tools/presyntax.py src/CamScannerSaveToFiles.m
-
-      - name: Compile dylib (arm64 + arm64e)
-        run: |
-          set -euo pipefail
-          SDKBASE="$(xcrun --sdk iphoneos --show-sdk-path)"
-          mkdir -p build
-          ARCHS="arm64 arm64e"
-          for ARCH in ${ARCHS}; do
-            echo "=== 编译 ${ARCH} ==="
-            xcrun --sdk iphoneos clang \
-              -arch "${ARCH}" \
-              -isysroot "${SDKBASE}" \
-              -miphoneos-version-min=13.0 \
-              -fobjc-arc \
-              -fmodules \
-              -dynamiclib \
-              -install_name "${INSTALL_NAME}" \
-              -compatibility_version 1.0.0 \
-              -current_version 1.0.0 \
-              -Os \
-              -Wall -Wextra \
-              -Wno-unused-parameter \
-              -Wno-deprecated-declarations \
-              -o "build/${DYLIB_NAME}.${ARCH}.dylib" \
-              src/CamScannerSaveToFiles.m \
-              -framework Foundation \
-              -framework UIKit
-          done
-
-          # 合并成 fat
-          xcrun lipo -create \
-            "build/${DYLIB_NAME}.arm64.dylib" \
-            "build/${DYLIB_NAME}.arm64e.dylib" \
-            -output "build/${DYLIB_NAME}.dylib"
-
-          echo "=== 产物架构 ==="
-          xcrun lipo -info "build/${DYLIB_NAME}.dylib"
-          xcrun size -arch arm64 "build/${DYLIB_NAME}.dylib" || true
-
-      - name: Lint dylib (崩宿主专项检查)
-        run: |
-          set -euo pipefail
-          python3 tools/lint_dylib.py "build/${DYLIB_NAME}.dylib"
-
       - name: Inject LC_LOAD_DYLIB
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           BIN="${APP_DIR}/${APP_EXECUTABLE}"
@@ -245,6 +284,7 @@ jobs:
           }
 
       - name: Embed dylib into app
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           mkdir -p "${APP_DIR}/Frameworks"
@@ -260,10 +300,12 @@ jobs:
           xcrun otool -L "${APP_DIR}/${APP_EXECUTABLE}" | grep "${DYLIB_NAME}"
 
       - name: Sign (ad-hoc)
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           ENT="tools/entitlements.plist"
-          SIGN_ID="-"     # ad-hoc；若要在无越狱设备上用 AltStore/SideStore 安装，需换成真实证书
+          SIGN_ID="-"     # ad-hoc。LiveContainer 安装时会用 LC 自身证书重新签名，
+                          # 所以这里的签名只是为了让包在结构上自洽，最终签名由 LC 完成。
           # 顺序很重要：先里后外。--deep 会重新签内嵌组件，
           # 所以对 app 的 --deep 签必须放最后，否则会覆盖 dylib 的签名。
           # 步骤 1：签 dylib
@@ -307,6 +349,7 @@ jobs:
           }
 
       - name: Repack ipa
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -euo pipefail
           OUT="out/CamScanner_7.26.5_SaveToFiles.ipa"
@@ -320,21 +363,20 @@ jobs:
           unzip -l "${OUT}" | head -12
           shasum -a 256 "${OUT}"
 
-      - name: Upload artifact
+      - name: Upload ipa
+        if: steps.mode.outputs.mode == 'full'
         uses: actions/upload-artifact@v4
         with:
           name: CamScanner-SaveToFiles-ipa
-          path: |
-            out/*.ipa
-            build/CamScannerSaveToFiles.dylib
+          path: out/*.ipa
           retention-days: 14
 
-      - name: Upload diagnostics
-        if: always()
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics
+          name: CamScannerSaveToFiles-dylib
           path: |
-            build/*.log
-          if-no-files-found: ignore
-          retention-days: 7
+            build/CamScannerSaveToFiles.dylib
+            build/CamScannerSaveToFiles.arm64.dylib
+            build/CamScannerSaveToFiles.arm64e.dylib
+          retention-days: 14
