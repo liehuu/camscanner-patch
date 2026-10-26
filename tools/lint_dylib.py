@@ -309,29 +309,68 @@ def check_binary(path):
     except Exception as e:
         warn(f"otool 不可用，跳过 id 检查: {e}")
 
-    # B3: 导出符号里不得有 C++ 异常/未定义符号
+    # B3: 未定义符号必须全部来自系统库
+    #
+    # 这里要回答的问题是：dylib 引用了一堆外部符号，其中有没有「不该由我们引用」
+    # 的（比如直接引用宿主的私有 C 函数、或某个第三方库里没人提供的符号）。
+    # 判据不是「有没有下划线」——macOS 的 C 符号**全部**带前导下划线
+    # （_malloc / _free / _objc_msgSend 都是），拿 startswith("_") 当跳过条件
+    # 会让整个检查形同虚设。
+    #
+    # 正确判据：看它属于哪个命名空间。
+    #   - dyld_stub_binder：dyld 自身提供给所有带 stub 的镜像，**不来自任何库**，
+    #     每个动态库的未定义符号表里都有它，是最容易误判成「非系统符号」的一个。
+    #     实测 CI run 40270973783 就在这里把编好的 dylib 判死。
+    #   - _OBJC_CLASS_$_Xxx / _OBJC_METACLASS_$_Xxx：ObjC 类引用，由 Foundation/UIKit
+    #     或宿主提供；只要类名不是我们自己的，就属于系统或宿主。
+    #   - _objc_* / _dispatch_* / _CF* / _NS* / _UI* / __*：系统运行时与框架。
+    #
+    # 因此白名单按「前缀 / 关键字」匹配，并显式列出 dyld 的符号。
     try:
         out = subprocess.run(["xcrun", "nm", "-u", path],
                              capture_output=True, text=True).stdout
         missing = []
         for line in out.splitlines():
             s = line.strip()
-            if not s or s.startswith("_"):
+            if not s:
                 continue
+            # nm -u 的输出形如 "                 _objc_msgSend"（只有符号名，无地址）
+            # 也可能带 "from:" 后缀，这里只取第一段
+            s = s.split()[0]
+            # "dyld_stub_binder" 没有前导下划线，单独收
             missing.append(s)
+
+        # 去重并排除明显是残渣的项
+        missing = [s for s in dict.fromkeys(missing) if s not in ("from:",)]
+
         if missing:
-            print("   undefined symbols (前 10):")
-            for s in missing[:10]:
+            print("   undefined symbols (共 %d，前 12):" % len(missing))
+            for s in missing[:12]:
                 print("     ", s)
-            # Foundation/UIKit/objc 的都是系统库，正常
+
+            SYS_PREFIX = (
+                "_OBJC_CLASS_$_", "_OBJC_METACLASS_$_", "_OBJC_IVAR_$_",
+                "_objc_", "_dispatch_", "_CF", "_NS", "_UI", "_CG",
+                "__", "_Block_", "_os_", "_kCF", "_swift_",
+                "_malloc", "_free", "_calloc", "_realloc", "_memcpy",
+                "_memmove", "_memset", "_strlen", "_strcmp",
+            )
+            # 注意：**不要**把 _dlopen / _dlsym 放进白名单。
+            # 本项目的 R1/R2 规则明确禁止 dlopen/dlsym（双引擎改写方法表 → 崩宿主），
+            # 如果这里把它们当「合法系统符号」放行，两条规则就自相矛盾了：
+            # 源码层拦下 dlopen，产物层却认可 dlopen 的符号。
+            # 万一有人绕过源码检查（比如用 dlsym 的字符串形式），让它在产物层暴露出来。
+            # dyld 直接提供的符号，不带下划线
+            DYLD_SYMBOLS = {"dyld_stub_binder", "_dyld_stub_binder"}
+
             bad = [s for s in missing
-                   if not any(k in s for k in ("_OBJC_", "_objc_", "_NS", "_CF",
-                                               "_dispatch_", "__", "_UI", "_Block",
-                                               "_NSString", "_os_", "_free", "_malloc"))]
+                   if s not in DYLD_SYMBOLS
+                   and not any(s.startswith(p) for p in SYS_PREFIX)]
             if bad:
-                fail(f"存在非系统未定义符号: {bad[:5]}")
+                fail("存在非系统未定义符号（这些符号没有系统库/宿主提供，"
+                     "加载时会 dyld 报 Symbol not found → 闪退）: %s" % bad[:5])
             else:
-                ok("未定义符号均为系统库")
+                ok("未定义符号均为系统库或 dyld 自带（共 %d 个）" % len(missing))
         else:
             ok("无未定义符号")
     except Exception as e:
