@@ -1,0 +1,26 @@
+# 构建中间产物
+build/
+work/
+out/
+DerivedData/
+
+# 注入前的二进制备份
+*.orig
+*_testbin
+
+# 编译产物
+*.dylib
+*.o
+*.dSYM/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 注意：刻意「不」忽略 in/*.ipa
+# CI 需要 checkout 到原始包才能解包注入。若不想把 167MB 提交进仓库，
+# 用 workflow_dispatch 的 ipa_url 输入直接从私有 Release / 直链下载。

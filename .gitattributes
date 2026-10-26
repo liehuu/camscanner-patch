@@ -1,0 +1,18 @@
+# 原始 ipa 体积大（本包 167MB），必须走 LFS，否则超过 GitHub 100MB 单文件硬限制直接拒绝 push
+in/*.ipa   filter=lfs diff=lfs merge=lfs -text
+in/*.IPA   filter=lfs diff=lfs merge=lfs -text
+out/*.ipa  filter=lfs diff=lfs merge=lfs -text
+
+# 一律 LF。CI 在 macOS 上跑，若 .yml / shell 片段带 CRLF，
+# bash 会把 \r 当成命令的一部分，报 "command not found" 这种极难排查的错。
+* text=auto eol=lf
+
+*.m        text eol=lf
+*.h        text eol=lf
+*.py       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.md       text eol=lf
+*.plist    text eol=lf
+Makefile   text eol=lf
+.gitignore text eol=lf

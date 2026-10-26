@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  原包为 App Store 分发（fairplay 已砸壳，cryptid=0），entitlements 只有最基本几项。
+	  这里尽量「少给」，避免签名后设备侧因 entitlement 校验失败被拒。
+	  注意：
+	    - 不要加 get-task-allow（那是 debug 用，正式包带上会加剧被系统拒的风险）
+	    - 不要加 platform-application（那是越狱设备专用的特权）
+	    - application-identifier / team-identifier 由真实证书签名时自动覆写，
+	      这里留占位是为了让 ad-hoc 签名也能过基本检查。
+	-->
+	<key>application-identifier</key>
+	<string>com.intsig.CamScannerLite</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>PLACEHOLDER</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>com.intsig.CamScannerLite</string>
+	</array>
+</dict>
+</plist>

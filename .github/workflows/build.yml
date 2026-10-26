@@ -1,0 +1,340 @@
+name: Build CamScanner SaveToFiles IPA
+
+# 触发方式：
+#   1. 手动 workflow_dispatch（推荐；需要先从 Releases / 私链下载原始 ipa 放到 in/ 目录并提交到 private 分支或 LFS）
+#   2. push 到 main 且改动 src/ 或 tools/
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_name:
+        description: 'in/ 目录下的原始 ipa 文件名（留空则取 in/ 下第一个 .ipa）'
+        required: false
+        default: ''
+      ipa_url:
+        description: '（可选）原始 ipa 直链。填了就从这里下，忽略 in/ 目录'
+        required: false
+        default: ''
+      bundle_id:
+        description: '目标 Bundle ID（用于校验 ipa 是否为目标应用）'
+        required: false
+        default: 'com.intsig.CamScannerLite'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tools/**'
+      - '.github/workflows/build.yml'
+      - 'Makefile'
+
+env:
+  DYLIB_NAME: CamScannerSaveToFiles
+  INSTALL_NAME: /usr/lib/CamScannerSaveToFiles.dylib
+  # 目标应用的可执行文件名（Payload/<App>.app/<App>）
+  APP_EXECUTABLE: CamScanner_Lite
+  APP_BUNDLE_NAME: CamScanner_Lite.app
+
+jobs:
+  build:
+    name: Compile dylib + inject + repack
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version | head -2
+          python3 --version
+
+      - name: Locate input ipa
+        id: locate
+        run: |
+          set -euo pipefail
+          mkdir -p in
+          URL="${{ github.event.inputs.ipa_url }}"
+          if [ -n "${URL}" ]; then
+            echo "从直链下载: ${URL}"
+            # 私有 release asset 走 API 时需要 octet-stream；普通直链带不带都无妨。
+            # -L 跟随跳转（GitHub release 会 302 到 objects.githubusercontent.com）
+            curl -fL --retry 3 --retry-delay 2 \
+                 -H "Authorization: Bearer ${{ github.token }}" \
+                 -H "Accept: application/octet-stream" \
+                 -o "in/_downloaded.ipa" "${URL}"
+            IPA="in/_downloaded.ipa"
+          else
+            IPA_NAME="${{ github.event.inputs.ipa_name }}"
+            ls -la in/ || true
+            if [ -n "${IPA_NAME}" ] && [ -f "in/${IPA_NAME}" ]; then
+              IPA="in/${IPA_NAME}"
+            else
+              # 只取纯 .ipa，排除可能残留的 _downloaded.ipa 干扰计数
+              COUNT="$(ls -1 in/*.ipa 2>/dev/null | wc -l | tr -d ' ')"
+              if [ "${COUNT}" -gt 1 ]; then
+                echo "::error::in/ 下有 ${COUNT} 个 ipa，容易拿错包。请只保留一个，或用 ipa_name 显式指定。"
+                ls -1 in/*.ipa
+                exit 1
+              fi
+              IPA="$(ls -1 in/*.ipa 2>/dev/null | head -1 || true)"
+            fi
+          fi
+
+          if [ -z "${IPA}" ] || [ ! -f "${IPA}" ]; then
+            echo "::error::未找到输入 ipa。把原始 ipa 放到 in/（见 in/README.md），或填 ipa_url。"
+            exit 1
+          fi
+          # 至少 10MB，防止把 HTML 错误页当成 ipa
+          SIZE="$(wc -c < "${IPA}" | tr -d ' ')"
+          if [ "${SIZE}" -lt 10485760 ]; then
+            echo "::error::${IPA} 只有 ${SIZE} 字节，不像 ipa（可能下载到了错误页）"
+            head -c 400 "${IPA}" || true
+            exit 1
+          fi
+          echo "ipa=${IPA}" >> "${GITHUB_OUTPUT}"
+          echo "使用 ipa: ${IPA} ($(du -h "${IPA}" | cut -f1))"
+
+      - name: Unpack ipa
+        run: |
+          set -euo pipefail
+          rm -rf work && mkdir -p work
+          unzip -q "${{ steps.locate.outputs.ipa }}" -d work
+          APP_DIR="work/Payload/${APP_BUNDLE_NAME}"
+          if [ ! -d "${APP_DIR}" ]; then
+            echo "::error::Payload 下没有 ${APP_BUNDLE_NAME}"
+            ls -la work/Payload || true
+            exit 1
+          fi
+          echo "APP_DIR=${APP_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Guard against double injection
+        run: |
+          set -euo pipefail
+          # ─────────────────────────────────────────────────────────────
+          # 这一步拦的是「跑起来崩」，不是「编不过」。
+          # 若误把已注入过的包当作输入，会得到：
+          #   LC_LOAD_DYLIB 里有两条同名条目 → dyld 只加载一份，但方法会交换两次
+          #   （一次指向原 IMP，一次指向已交换的 IMP）→ 递归调用 / 栈溢出 → 宿主闪退
+          # 所以必须在这里硬拦，而不是指望后面 install_name_tool 报错。
+          # ─────────────────────────────────────────────────────────────
+          BIN="${APP_DIR}/${APP_EXECUTABLE}"
+          # grep -c 无匹配时退出码为 1，在 pipefail 下会让整步失败（假阳性）。
+          # 这里显式吞掉退出码，只看输出的数字。
+          HIT="$(xcrun otool -L "${BIN}" | grep -c "${DYLIB_NAME}" || true)"
+          HIT="${HIT:-0}"
+          echo "主二进制中 ${DYLIB_NAME} 加载项数量: ${HIT}"
+          if [ "${HIT}" -ne 0 ]; then
+            echo "::error::输入 ipa 已经被注入过（主二进制已有 ${DYLIB_NAME}）。请使用原始未修改的包。"
+            xcrun otool -L "${BIN}" | grep "${DYLIB_NAME}" || true
+            exit 1
+          fi
+          if [ -e "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib" ]; then
+            echo "::error::输入 ipa 内已存在 Frameworks/${DYLIB_NAME}.dylib，说明是注入过的包。"
+            exit 1
+          fi
+          # 原始包应带合法 _CodeSignature；若已被剥离，多半经过第三方重签/改包，拒绝在未知基线上作业
+          if [ ! -d "${APP_DIR}/_CodeSignature" ]; then
+            echo "::warning::输入包没有 _CodeSignature，可能已被处理过。将以现有内容为基线继续。"
+          fi
+          echo "OK: 输入包干净，可以注入"
+
+      - name: Verify target app
+        run: |
+          set -euo pipefail
+          BID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP_DIR}/Info.plist")"
+          echo "Bundle ID: ${BID}"
+          EXPECT="${{ github.event.inputs.bundle_id }}"
+          if [ -z "${EXPECT}" ]; then EXPECT="com.intsig.CamScannerLite"; fi
+          if [ "${BID}" != "${EXPECT}" ]; then
+            echo "::error::Bundle ID 不匹配，期望 ${EXPECT}，实际 ${BID}"
+            exit 1
+          fi
+          # 版本核对（补丁是针对 7.26.5 的私有类与方法实现的，版本不符直接拒绝）
+          VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_DIR}/Info.plist")"
+          echo "Version: ${VER}"
+          if [ "${VER}" != "7.26.5" ]; then
+            echo "::warning::版本为 ${VER}，补丁按 7.26.5 的符号与签名编写，行为可能不符预期。"
+          fi
+          # 关键私有类必须存在，否则说明目标不对
+          #
+          # 注意：这里不能用 `nm -gU | grep "_OBJC_CLASS_\$_CSShareManager"`。
+          # 实测本包（7.26.5，Flutter + Swift 混编）里 **没有** 这种经典 ObjC 类符号，
+          # 类名是以裸 C 字符串形式存在于类名区：
+          #   0x7d48de0  "CSShareManager"
+          #   0x7d490d7  "CSActivityUtil"
+          #   0x7d49a07  "CSShareModel"
+          # 用符号表判断会 100% 误判为「不是目标应用」而拦住整条流水线。
+          #
+          # 也不用 `strings | grep -qx`：macOS 的 strings 有最小长度与截断行为，
+          # 且在 pipefail 下无匹配会污染退出码。改为独立的 Python 检查脚本，
+          # 做字节级精确匹配（b"\0ClassName\0"），既能保证是完整类名，
+          # 又不依赖平台工具差异，也不受 YAML heredoc 缩进干扰。
+          BIN="${APP_DIR}/${APP_EXECUTABLE}"
+          python3 tools/check_classes.py "${BIN}" CSShareManager CSActivityUtil CSShareModel
+
+      - name: Pre-syntax check (无编译器语法闸门)
+        run: |
+          set -euo pipefail
+          # 放在编译之前：括号配平 / 块配平 / selector 可知性 / hook 签名对齐
+          # 这几类缺陷一旦进到 clang 就是一次 3~5 分钟的 CI 往返，
+          # 而它们完全可以纯文本判定。
+          python3 tools/presyntax.py src/CamScannerSaveToFiles.m
+
+      - name: Compile dylib (arm64 + arm64e)
+        run: |
+          set -euo pipefail
+          SDKBASE="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p build
+          ARCHS="arm64 arm64e"
+          for ARCH in ${ARCHS}; do
+            echo "=== 编译 ${ARCH} ==="
+            xcrun --sdk iphoneos clang \
+              -arch "${ARCH}" \
+              -isysroot "${SDKBASE}" \
+              -miphoneos-version-min=13.0 \
+              -fobjc-arc \
+              -fmodules \
+              -dynamiclib \
+              -install_name "${INSTALL_NAME}" \
+              -compatibility_version 1.0.0 \
+              -current_version 1.0.0 \
+              -Os \
+              -Wall -Wextra \
+              -Wno-unused-parameter \
+              -Wno-deprecated-declarations \
+              -o "build/${DYLIB_NAME}.${ARCH}.dylib" \
+              src/CamScannerSaveToFiles.m \
+              -framework Foundation \
+              -framework UIKit
+          done
+
+          # 合并成 fat
+          xcrun lipo -create \
+            "build/${DYLIB_NAME}.arm64.dylib" \
+            "build/${DYLIB_NAME}.arm64e.dylib" \
+            -output "build/${DYLIB_NAME}.dylib"
+
+          echo "=== 产物架构 ==="
+          xcrun lipo -info "build/${DYLIB_NAME}.dylib"
+          xcrun size -arch arm64 "build/${DYLIB_NAME}.dylib" || true
+
+      - name: Lint dylib (崩宿主专项检查)
+        run: |
+          set -euo pipefail
+          python3 tools/lint_dylib.py "build/${DYLIB_NAME}.dylib"
+
+      - name: Inject LC_LOAD_DYLIB
+        run: |
+          set -euo pipefail
+          BIN="${APP_DIR}/${APP_EXECUTABLE}"
+          cp "${BIN}" "${BIN}.orig"
+
+          echo "=== 注入前 ==="
+          python3 tools/inject_dylib.py --check "${BIN}" "${INSTALL_NAME}"
+          python3 tools/inject_dylib.py "${BIN}" "${INSTALL_NAME}"
+
+          echo "=== 校验 ==="
+          xcrun otool -l "${BIN}" | grep -A2 "LC_LOAD_DYLIB" | grep "${DYLIB_NAME}" || {
+            echo "::error::注入失败"
+            exit 1
+          }
+
+      - name: Embed dylib into app
+        run: |
+          set -euo pipefail
+          mkdir -p "${APP_DIR}/Frameworks"
+          # 放到 Frameworks/ 下并用 @executable_path 相对路径，避免 /usr/lib 需要真实写入系统分区
+          cp "build/${DYLIB_NAME}.dylib" "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib"
+          xcrun install_name_tool -id "@executable_path/Frameworks/${DYLIB_NAME}.dylib" \
+            "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib"
+          # 把主二进制里刚注入的 /usr/lib/... 改指到 Frameworks
+          xcrun install_name_tool -change "${INSTALL_NAME}" \
+            "@executable_path/Frameworks/${DYLIB_NAME}.dylib" \
+            "${APP_DIR}/${APP_EXECUTABLE}"
+          echo "=== 最终加载项 ==="
+          xcrun otool -L "${APP_DIR}/${APP_EXECUTABLE}" | grep "${DYLIB_NAME}"
+
+      - name: Sign (ad-hoc)
+        run: |
+          set -euo pipefail
+          ENT="tools/entitlements.plist"
+          SIGN_ID="-"     # ad-hoc；若要在无越狱设备上用 AltStore/SideStore 安装，需换成真实证书
+          # 顺序很重要：先里后外。--deep 会重新签内嵌组件，
+          # 所以对 app 的 --deep 签必须放最后，否则会覆盖 dylib 的签名。
+          # 步骤 1：签 dylib
+          codesign -f -s "${SIGN_ID}" --timestamp=none \
+            "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib"
+          # 步骤 2：签 app 内其它 Frameworks（原始包里可能已有）
+          if [ -d "${APP_DIR}/Frameworks" ]; then
+            find "${APP_DIR}/Frameworks" -name "*.dylib" -o -name "*.framework" 2>/dev/null | \
+            while IFS= read -r f; do
+              [ "${f}" = "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib" ] && continue
+              codesign -f -s "${SIGN_ID}" --timestamp=none "${f}" || true
+            done
+          fi
+          # 步骤 3：签插件与 Watch 扩展（若存在）
+          if [ -d "${APP_DIR}/PlugIns" ]; then
+            codesign -f -s "${SIGN_ID}" --timestamp=none --deep "${APP_DIR}/PlugIns" || true
+          fi
+          # 步骤 4：签主二进制（带 entitlements）
+          codesign -f -s "${SIGN_ID}" --timestamp=none \
+            --entitlements "${ENT}" \
+            "${APP_DIR}/${APP_EXECUTABLE}"
+          # 步骤 5：最后签整个 bundle（--deep 兜底，放最后才不会被前面覆盖）
+          codesign -f -s "${SIGN_ID}" --timestamp=none \
+            --entitlements "${ENT}" \
+            --deep "${APP_DIR}"
+          echo "=== 签名校验 ==="
+          codesign -dv --verbose=2 "${APP_DIR}" 2>&1 | head -20
+          echo "--- dylib 自身签名 ---"
+          codesign -dv --verbose=2 "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib" 2>&1 | head -12
+          # 确认注入的加载项与 dylib 的 id 一致（不一致 = 装上去闪退）
+          LOADED="$(xcrun otool -L "${APP_DIR}/${APP_EXECUTABLE}" | grep "${DYLIB_NAME}" | awk '{print $1}')"
+          ID="$(xcrun otool -D "${APP_DIR}/Frameworks/${DYLIB_NAME}.dylib" | tail -1)"
+          echo "loaded: ${LOADED}"
+          echo "id    : ${ID}"
+          if [ "${LOADED}" != "${ID}" ]; then
+            echo "::error::install_name 不匹配：主二进制期望 ${LOADED}，dylib 实际 id ${ID}"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${APP_DIR}" 2>&1 | head -20 || {
+            echo "::warning::ad-hoc 签名严格校验不通过（正常现象，ad-hoc 无锚点）"
+          }
+
+      - name: Repack ipa
+        run: |
+          set -euo pipefail
+          OUT="out/CamScanner_7.26.5_SaveToFiles.ipa"
+          mkdir -p out
+          rm -f "${OUT}"
+          # 移除可能残留的旧签名目录，保证重签干净
+          rm -rf work/Payload/*.app/_CodeSignature
+          ( cd work && zip -qry "../${OUT}" Payload )
+          echo "=== 产物 ==="
+          ls -la "${OUT}"
+          unzip -l "${OUT}" | head -12
+          shasum -a 256 "${OUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CamScanner-SaveToFiles-ipa
+          path: |
+            out/*.ipa
+            build/CamScannerSaveToFiles.dylib
+          retention-days: 14
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
