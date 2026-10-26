@@ -38,6 +38,14 @@ import urllib.request
 
 API = "https://api.github.com"
 
+# Git Data API create-blob 的实际上限附近。超过这个尺寸 API 会返回
+# 422 "Sorry, your input was too large to process" —— 而那个报错只给一个
+# 英文技术说明，看不出「是哪个文件、为什么、该怎么办」。
+# 真实踩过：CI 的 266MB artifact 下载到 dist/ 时被 `git add -A` 一起吞进
+# HEAD，推送时 Input too large，事后还得分两步（amend + gc）才能把体积降回来。
+# 在源头拦：超过尺寸的文件直接不入 tree，并说明该走 Git LFS 或别入库。
+MAX_BLOB_BYTES = 90 * 1024 * 1024
+
 
 def get_token():
     """从 git credential 取已缓存的 GitHub token，避免把 token 写进命令行历史。"""
