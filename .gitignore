@@ -24,3 +24,5 @@ Thumbs.db
 # 注意：刻意「不」忽略 in/*.ipa
 # CI 需要 checkout 到原始包才能解包注入。若不想把 167MB 提交进仓库，
 # 用 workflow_dispatch 的 ipa_url 输入直接从私有 Release / 直链下载。
+# 临时比对文件（与远端源码做字节 diff 时产生）
+remote_src.m

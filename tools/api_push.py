@@ -100,6 +100,9 @@ def main():
     ap.add_argument("--message-file", default="")
     ap.add_argument("--files", nargs="*", default=[], help="要提交的文件（相对路径）")
     ap.add_argument("--all", action="store_true", help="提交工作区所有已跟踪的改动 + 新增文件")
+    ap.add_argument("--from-head", action="store_true",
+                    help="推送本地 HEAD commit 的完整文件清单（用于本地已 commit、"
+                         "或远端分叉后按内容 superset 重建线性历史）")
     ap.add_argument("--token", default="")
     args = ap.parse_args()
 
@@ -110,7 +113,23 @@ def main():
     gh = Gh(token)
 
     # ── 收集要提交的文件 ────────────────────────────────────────────────
-    if args.all:
+    if args.from_head:
+        # 本地 HEAD 已有完整 commit 时，工作树反而是干净的（--all 会报
+        # 「没有要提交的文件」），所以需要从 HEAD 直接取清单。
+        # 两种典型场景：
+        #   a. 本地已 commit，要把它同步到远端；
+        #   b. 本机 git smart-HTTP 通道不通，之前每次都只用 API 推工作树，
+        #      于是远端留下若干「没有对应本地 commit」的提交，历史分叉。
+        #      此时若本地 HEAD 的内容是远端内容的超集（已验证过关键文件
+        #      逐个 SAME），按 HEAD 清单整体重建一次即可，远端仍是线性的。
+        files = git("ls-tree", "-r", "HEAD", "--name-only", "-z").decode(
+            "utf-8", "replace").split("\0")
+        files = [f for f in files if f]
+        if not files:
+            print("HEAD 下没有文件", file=sys.stderr)
+            return 1
+        print("按本地 HEAD 清单推送 %d 个文件" % len(files))
+    elif args.all:
         # git status --porcelain 的格式：XY <path>；重命名是 "R  old -> new"
         files = []
         for line in git("status", "--porcelain").decode("utf-8", "replace").splitlines():
@@ -131,6 +150,10 @@ def main():
     msg = args.message
     if args.message_file:
         msg = open(args.message_file, encoding="utf-8").read().rstrip("\n")
+    # --from-head 且未显式给消息时，直接沿用本地 HEAD 的提交说明。
+    # 远端重建出来的 commit message 与本地一致，事后回读才好对齐。
+    if not msg and args.from_head:
+        msg = git("log", "-1", "--pretty=%B").decode("utf-8", "replace").rstrip("\n")
     if not msg:
         print("ERROR: 需要 --message 或 --message-file", file=sys.stderr)
         return 1
