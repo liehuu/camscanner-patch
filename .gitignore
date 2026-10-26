@@ -26,3 +26,6 @@ Thumbs.db
 # 用 workflow_dispatch 的 ipa_url 输入直接从私有 Release / 直链下载。
 # 临时比对文件（与远端源码做字节 diff 时产生）
 remote_src.m
+
+# 交付产物目录（从 CI artifact 下载解包而来，绝不入库）
+dist/

@@ -149,13 +149,31 @@ camscanner-patch/
 
 ### 跑 CI
 
-1. 提供原始 ipa，二选一：
-   - 放到 `in/`（例：`in/CamScanner_7.26.5_original.ipa`，约 167 MB，走 Git LFS），或
-   - 不放进仓库，触发时在 `ipa_url` 填私有 Release 直链。
-   细节见 `in/README.md`。
-2. GitHub → Actions → **Build CamScanner SaveToFiles IPA** → Run workflow。
-3. 产物：`CamScanner-SaveToFiles-ipa`，含 `out/CamScanner_7.26.5_SaveToFiles.ipa`
-   和 `build/CamScannerSaveToFiles.dylib`。
+两种模式（`workflow_dispatch` 的 `mode` 输入）：
+
+| mode | 做什么 | 需要原始 ipa | 耗时 |
+|---|---|---|---|
+| `dylib`（默认） | 只编译 + 崩宿主 lint，验证源码**能否编过** | 否 | ~1 分钟 |
+| `full` | 解包 → 注入 → 重签 → 重打包 → 出 ipa | 是 | ~8 分钟 |
+
+提供原始 ipa，二选一：
+
+- 放到 `in/`（例：`in/CamScanner_7.26.5_original.ipa`，约 192 MB，走 Git LFS），或
+- 不放进仓库，触发时在 `ipa_url` 填私有 Release 直链。细节见 `in/README.md`。
+
+**踩过的坑（`ipa_url` 要读私有 Release asset）**：asset 挂在 **draft** release 下时，
+`contents:read` 的 `GITHUB_TOKEN` 读不到它 —— draft 资产只对具备 `contents:write` 的
+集成开放，GitHub 返回 **403 而不是 404**，只看状态码会误判成权限整体配错。
+所以承载输入包的 release 必须转正（`draft:false`；仓库本身是 private，外部仍不可见）。
+下载时 workflow 会带 `Accept: application/octet-stream`，正好是 asset API 的取回方式。
+
+触发步骤：
+
+1. GitHub → Actions → **Build CamScanner SaveToFiles IPA** → Run workflow。
+2. `mode` 选 `full`，`ipa_url` 填 asset API 地址
+   （形如 `https://api.github.com/repos/<owner>/<repo>/releases/assets/<id>`）。
+3. 产物：`CamScanner-SaveToFiles-ipa`，含 `out/CamScanner_7.26.5_SaveToFiles.ipa`。
+   `CamScannerSaveToFiles-dylib` 产物两种模式都会上传。
 
 CI 会强制校验：
 
