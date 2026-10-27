@@ -1864,6 +1864,64 @@ static void CSFS_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animate
     }
 }
 
+// ── v7：真面板挂点（CSSharePanellViewController 的条目数组）─────────
+// v6 探针真机实证（CSFS(3).log 14:33:54）：
+//   P1 exportWordAction hit → P2 showShareView hit
+//   → P4 present: CSSharePanellViewController on CSJsonWordEditViewController
+//   且 P3 showOfficeShareView 未触发 —— 面板根本不走 officeFileShareViewData！
+//   （前四轮全败的真正原因：一直往另一条路径的数组里塞条目。）
+// 面板数据链（全部反汇编实证，地址见注释）：
+//   CSSharePanellViewController → CSSharePanelAdpterManager（collection 数据源）
+//     → CSShareCompositionalMainWaysSectionAdapter          ← 主要分享方式分区
+//         channelArray : NSArray<CSActionSheetOperation*>   ← 条目数组（loadData 填充）
+//         渲染：[item titleString] + [CSShareManager whiteBackgroundIconWithModel:]
+//               （0x1018d7448 / 0x1018d74ac / 0x1018d7498）
+//         点击：[item actionSheetOperationType] → shareActionWithOperationTpe:needLog:
+//               （0x1018d7910 / 0x1018d7a34 —— 0xE5 已被 CSFSTryInterceptShareAction 接住）
+// 挂点：hook channelArray getter —— 渲染和点击都从它取条目，改一处即全链生效。
+static NSArray *(*gOrigChannelArray)(id, SEL) = NULL;
+
+static NSArray *CSFS_channelArray(id self, SEL _cmd) {
+    @try {
+        NSArray *orig = nil;
+        if (gOrigChannelArray) orig = gOrigChannelArray(self, _cmd);
+        if (orig.count == 0) return orig;
+
+        // 已含「保存到文件」条目则原样返回（防重复追加）
+        for (id it in orig) {
+            if ([it respondsToSelector:@selector(actionSheetOperationType)]) {
+                NSInteger (*fn)(id, SEL) = (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
+                if (fn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
+                    return orig;
+                }
+            }
+        }
+
+        Class opCls = NSClassFromString(@"CSActionSheetOperation");
+        if (!opCls) {
+            CSFS_LOG(@"v7 WARN: CSActionSheetOperation 未注册，条目不追加");
+            return orig;
+        }
+        id item = [[opCls alloc] init];
+        if (!item) return orig;
+
+        // 标题与点击 ID。CSActionSheetOperation 是 ObjC 类，
+        // KVC 优先、失败回退 IMP 直调（复用既有工具，勿再手写 setter 解析）
+        BOOL wroteTitle = CSFSSetStringIfPossible(item, @[ @"titleString" ], kCSFSSaveToFilesTitle);
+        BOOL wroteType  = CSFSSetIntegerIfPossible(item, @[ @"actionSheetOperationType" ], kCSFSSaveToFilesId);
+        CSFS_LOG(@"v7 channelArray +save-to-files (title=%d type=%d total=%lu)",
+                 (int)wroteTitle, (int)wroteType, (unsigned long)(orig.count + 1));
+
+        NSMutableArray *out = [orig mutableCopy];
+        [out addObject:item];
+        return out;
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v7 channelArray threw: %@", e.reason);
+        if (gOrigChannelArray) return gOrigChannelArray(self, _cmd);
+        return nil;
+    }
+}
+
 static void CSFSInstall(void) {
     if (gCSFSInstalled) return;
 
@@ -2015,6 +2073,20 @@ static void CSFSInstall(void) {
                                        (IMP)CSFS_presentVC,
                                        (IMP *)&gOrigPresentVC);
             CSFS_LOG(@"P4 present hook=%d", (int)p4);
+        }
+
+        // ── v7 真面板挂点 ────────────────────────────────────────────
+        // CSShareCompositionalMainWaysSectionAdapter.channelArray 是
+        // 「导出文档」分享面板（CSSharePanellViewController）条目的唯一来源。
+        Class mainWays = NSClassFromString(@"CSShareCompositionalMainWaysSectionAdapter");
+        if (mainWays) {
+            BOOL h7 = CSFSHookInstance(mainWays,
+                                       NSSelectorFromString(@"channelArray"),
+                                       (IMP)CSFS_channelArray,
+                                       (IMP *)&gOrigChannelArray);
+            CSFS_LOG(@"★★★ v7 channelArray hook=%d ★★★（真面板条目来源）", (int)h7);
+        } else {
+            CSFS_LOG(@"v7 WARN: CSShareCompositionalMainWaysSectionAdapter 未找到");
         }
 
         gCSFSInstalled = (gOrigOfficeFileShareViewData != NULL) || anyOCR;
