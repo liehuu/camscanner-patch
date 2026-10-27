@@ -1813,6 +1813,57 @@ static BOOL CSFSHookInstance(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
     return YES;
 }
 
+// ── v6 路径探针（诊断期专用，定位真实路径后删除）────────────────────
+// v5 日志证明：点「导出文档」后，已装的全部 hook 一条都没触发
+// （officeFileShareViewData 被调用时必打日志，但日志毫无动静）。
+// 说明用户的真实路径不经过现有 hook 覆盖的任何方法。
+// 下面四个探针只记日志、全部转发原实现，一次运行即可照亮真实路径：
+//   P1 exportWordAction      —— 验证「导出文档」按钮是否走 CSJsonWordEditBottomView
+//   P2 showShareView         —— 验证 CSShareManager 链条第一环
+//   P3 showOfficeShareView   —— 验证第二环（officeFileShareViewData 的直接调用方）
+//   P4 presentViewController —— 广谱：任何模态弹出都记录类名
+static IMP gOrigExportWordAction = NULL;
+static void CSFS_exportWordAction(id self, SEL _cmd) {
+    @try {
+        CSFS_LOG(@"P1 exportWordAction hit (%@)", NSStringFromClass([self class]));
+        if (gOrigExportWordAction) gOrigExportWordAction(self, _cmd);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"P1 threw: %@", e.reason);
+    }
+}
+
+static IMP gOrigShowShareView = NULL;
+static void CSFS_showShareView(id self, SEL _cmd) {
+    @try {
+        CSFS_LOG(@"P2 showShareView hit");
+        if (gOrigShowShareView) gOrigShowShareView(self, _cmd);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"P2 threw: %@", e.reason);
+    }
+}
+
+static IMP gOrigShowOfficeShareView = NULL;
+static void CSFS_showOfficeShareView(id self, SEL _cmd) {
+    @try {
+        CSFS_LOG(@"P3 showOfficeShareView hit");
+        if (gOrigShowOfficeShareView) gOrigShowOfficeShareView(self, _cmd);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"P3 threw: %@", e.reason);
+    }
+}
+
+static void (*gOrigPresentVC)(id, SEL, UIViewController *, BOOL, void (^)(void)) = NULL;
+static void CSFS_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated,
+                           void (^completion)(void)) {
+    @try {
+        CSFS_LOG(@"P4 present: %@ on %@",
+                 NSStringFromClass([vc class]), NSStringFromClass([self class]));
+        if (gOrigPresentVC) gOrigPresentVC(self, _cmd, vc, animated, completion);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"P4 threw: %@", e.reason);
+    }
+}
+
 static void CSFSInstall(void) {
     if (gCSFSInstalled) return;
 
@@ -1919,6 +1970,51 @@ static void CSFSInstall(void) {
                              NSSelectorFromString(@"shareWithActivityItems:subject:result:"),
                              (IMP)CSFS_shareWithActivityItems,
                              (IMP *)&gOrigShareWithActivityItems);
+        }
+
+        // ── v6 路径探针安装（诊断期，定位后随探针函数一起删）──────────
+        Class wordBtn = NSClassFromString(@"CSJsonWordEditBottomView");
+        if (wordBtn) {
+            SEL selEWA = NSSelectorFromString(@"exportWordAction");
+            BOOL inst = CSFSHookInstance(wordBtn, selEWA,
+                                         (IMP)CSFS_exportWordAction,
+                                         (IMP *)&gOrigExportWordAction);
+            if (!inst) {
+                // exportWordAction 可能是类方法（+），退回 class_getClassMethod
+                Method cm = class_getClassMethod(wordBtn, selEWA);
+                if (cm) {
+                    gOrigExportWordAction = method_setImplementation(cm, (IMP)CSFS_exportWordAction);
+                    CSFS_LOG(@"P1 hooked +[CSJsonWordEditBottomView exportWordAction] orig=%p",
+                             gOrigExportWordAction);
+                } else {
+                    CSFS_LOG(@"P1 WARN: exportWordAction 方法不存在（实例+类都找不到）");
+                }
+            }
+        } else {
+            CSFS_LOG(@"P1 WARN: CSJsonWordEditBottomView 未找到");
+        }
+
+        if (shareManager) {
+            BOOL p2 = CSFSHookInstance(shareManager,
+                                       NSSelectorFromString(@"showShareView"),
+                                       (IMP)CSFS_showShareView,
+                                       (IMP *)&gOrigShowShareView);
+            CSFS_LOG(@"P2 showShareView hook=%d", (int)p2);
+
+            BOOL p3 = CSFSHookInstance(shareManager,
+                                       NSSelectorFromString(@"showOfficeShareView"),
+                                       (IMP)CSFS_showOfficeShareView,
+                                       (IMP *)&gOrigShowOfficeShareView);
+            CSFS_LOG(@"P3 showOfficeShareView hook=%d", (int)p3);
+        }
+
+        Class vcBase = NSClassFromString(@"UIViewController");
+        if (vcBase) {
+            BOOL p4 = CSFSHookInstance(vcBase,
+                                       NSSelectorFromString(@"presentViewController:animated:completion:"),
+                                       (IMP)CSFS_presentVC,
+                                       (IMP *)&gOrigPresentVC);
+            CSFS_LOG(@"P4 present hook=%d", (int)p4);
         }
 
         gCSFSInstalled = (gOrigOfficeFileShareViewData != NULL) || anyOCR;
