@@ -1989,6 +1989,13 @@ static NSString *CSFSXMLEscape(NSString *in) {
     return m;
 }
 
+// v14：空白字符集（typed IMP，避免 P5）
+static id CSFSWhiteSpaceSet(void) {
+    SEL wsel = NSSelectorFromString(@"whitespaceAndNewlineCharacterSet");
+    id (*wcf)(id, SEL) = (id (*)(id, SEL))[NSCharacterSet methodForSelector:wsel];
+    return wcf([NSCharacterSet class], wsel);
+}
+
 // 递归收集 JSON 里的字符串值；dict 按 key 排序尽量保序，array 保序
 static void CSFSCollectStrings(id obj, NSMutableArray *out2) {
     if ([obj isKindOfClass:[NSString class]]) {
@@ -2011,7 +2018,9 @@ static void CSFSCollectStrings(id obj, NSMutableArray *out2) {
     }
 }
 
-// 扫沙盒找与 docId 相关的缓存文本（v13：放宽扩展名 + 失败时枚举候选）
+// 扫沙盒找 JSON Word 缓存（v14：含 Library；Results 目录按 mtime 最新优先）
+// 实证（用户真机）：缓存位于 Library/<hash>/OtherFiles/imageToExcelResultsNew/<大写ID>
+// —— 无扩展名、文件名与 docId 无关，只能按「Results 目录 + 最新修改时间」锁定。
 static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
     NSString *baseId = docId;
     if ([baseId hasSuffix:@"_wordj"]) {
@@ -2019,14 +2028,14 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
     }
     NSString *tmpDir = NSTemporaryDirectory();
     NSArray *roots = @[
+        [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject],
         [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
         [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
         tmpDir,
     ];
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *cands = [NSMutableArray array];   // @(path)
     __block NSString *best = nil;
-    __block NSString *fallback = nil;
-    __block NSMutableArray *jsonSeen = [NSMutableArray array];
     for (NSString *root in roots) {
         if (root.length == 0) continue;
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
@@ -2035,43 +2044,44 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
             BOOL isDir = NO;
             NSString *full = [root stringByAppendingPathComponent:rel];
             if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) continue;
-            // 深层路径全匹配（不限扩展名）：缓存可能无扩展名
-            BOOL hitDoc = (baseId.length > 4 && [rel containsString:baseId]);
-            BOOL hitWord = ([rel.lowercaseString containsString:@"jsonword"] ||
-                            [rel.lowercaseString containsString:@"wordj"] ||
-                            [rel.lowercaseString containsString:@"jsonwordcache"]);
-            if (hitDoc) { best = full; break; }
-            if (hitWord && !fallback) fallback = full;
-            // 诊断收集：前 50 个 .json 候选路径
-            if ([rel.pathExtension.lowercaseString isEqualToString:@"json"] &&
-                jsonSeen.count < 50) {
-                [jsonSeen addObject:rel];
+            // ① docId 基段命中（最高优先，立即用）
+            if (baseId.length > 4 && [rel containsString:baseId]) {
+                best = full;
+                break;
+            }
+            // ② Results 目录下的数据文件（imageToWordResults / imageToExcelResultsNew…）
+            if ([rel containsString:@"Results"]) {
+                [cands addObject:full];
             }
         }
         if (best) break;
     }
-    if (!best && !fallback) {
-        // v13 诊断：列出全部 .json 候选，定位真实缓存位置
-        for (NSString *j in jsonSeen) CSFS_LOG(@"v13 json candidate: %@", j);
-        CSFS_LOG(@"v13 no cache matched (docId=%@, %lu json files in sandbox)",
-                 docId, (unsigned long)jsonSeen.count);
+    if (!best && cands.count > 0) {
+        // 按修改时间降序，取最新（用户正在编辑的文档必然是最新生成的）
+        NSArray *sorted = [cands sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSDate *da = [[fm attributesOfItemAtPath:a error:nil] objectForKey:NSFileModificationDate];
+            NSDate *db = [[fm attributesOfItemAtPath:b error:nil] objectForKey:NSFileModificationDate];
+            return [db compare:da];
+        }];
+        best = sorted.firstObject;
+        CSFS_LOG(@"v14 candidates=%lu newest=%@", (unsigned long)cands.count, best);
+    }
+    if (!best) {
+        CSFS_LOG(@"v13 no cache matched (docId=%@)", docId);
         return nil;
     }
-    NSString *path = best ?: fallback;
-    CSFS_LOG(@"v13 cache hit: %@ (by %@)", path, best ? @"docId" : @"keyword");
-    NSError *err = nil;
     SEL rsel = NSSelectorFromString(@"stringWithContentsOfFile:encoding:error:");
     NSString *(*rfn)(id, SEL, NSString *, NSUInteger, NSError **) =
         (NSString *(*)(id, SEL, NSString *, NSUInteger, NSError **))
         [NSString methodForSelector:rsel];
-    NSString *txt = rfn([NSString class], rsel, path,
-                        NSUTF8StringEncoding, &err);
-    CSFS_LOG(@"v12 json file: %@ (len=%lu err=%@)", path,
-             (unsigned long)txt.length, err.localizedDescription ?: @"nil");
+    NSError *rerr = nil;
+    NSString *txt = rfn([NSString class], rsel, best,
+                        NSUTF8StringEncoding, &rerr);
+    CSFS_LOG(@"v14 cache file: %@ (len=%lu err=%@)", best,
+             (unsigned long)txt.length, rerr.localizedDescription ?: @"nil");
     return txt;
 }
 
-// 用 App 自带 SSZipArchive 生成最小 .docx；失败返回 NO
 static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
     Class zipCls = NSClassFromString(@"SSZipArchive");
     if (!zipCls) {
@@ -2245,7 +2255,46 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         CSFS_LOG(@"v12 json parse threw: %@", e.reason);
                                     }
                                     if (parsed) {
-                                        CSFSCollectStrings(parsed, lines);
+                                        // v14：JSON Word 专用提取（实证结构）：
+                                        // segments[]页 → segments[]块 → paras[]段 → slices[].text
+                                        @try {
+                                            if ([parsed isKindOfClass:[NSDictionary class]]) {
+                                                id topSegs = ((NSDictionary *)parsed)[@"segments"];
+                                                if ([topSegs isKindOfClass:[NSArray class]]) {
+                                                    for (id page in topSegs) {
+                                                        if (![page respondsToSelector:@selector(objectForKey:)]) continue;
+                                                        id blocks = [page objectForKey:@"segments"];
+                                                        if (![blocks isKindOfClass:[NSArray class]]) continue;
+                                                        for (id block in blocks) {
+                                                            if (![block respondsToSelector:@selector(objectForKey:)]) continue;
+                                                            id paras = [block objectForKey:@"paras"];
+                                                            if (![paras isKindOfClass:[NSArray class]]) continue;
+                                                            NSMutableString *line = [NSMutableString string];
+                                                            for (id para in paras) {
+                                                                if (![para respondsToSelector:@selector(objectForKey:)]) continue;
+                                                                id slices = [para objectForKey:@"slices"];
+                                                                if (![slices isKindOfClass:[NSArray class]]) continue;
+                                                                for (id sl in slices) {
+                                                                    if (![sl respondsToSelector:@selector(objectForKey:)]) continue;
+                                                                    id t = [sl objectForKey:@"text"];
+                                                                    if ([t isKindOfClass:[NSString class]]) {
+                                                                        [line appendString:t];
+                                                                    }
+                                                                }
+                                                            }
+                                                            NSString *trimmed = [line stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
+                                                            if (trimmed.length > 0) [lines addObject:trimmed];
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } @catch (NSException *e) {
+                                            CSFS_LOG(@"v14专用解析 threw: %@", e.reason);
+                                        }
+                                        if (lines.count == 0) {
+                                            // 保底：通用递归收集
+                                            CSFSCollectStrings(parsed, lines);
+                                        }
                                         CSFS_LOG(@"v12 json parsed, %lu strings",
                                                  (unsigned long)lines.count);
                                     } else {

@@ -413,6 +413,8 @@ SYSTEM_SELECTORS = {
     # NSMutableString / NSString（v12 docx 生成：XML 转义与文本清洗）
     "replaceOccurrencesOfString:withString:options:range:",
     "stringByTrimmingCharactersInSet:",
+    # NSArray（v14 候选按 mtime 排序）
+    "sortedArrayUsingComparator:",
     "string", "absoluteString", "pathExtension", "lastPathComponent",
     "fileModificationDate", "fileType", "fileSize",
     "attributesOfItemAtPath:error:",
