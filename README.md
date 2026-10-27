@@ -3,8 +3,32 @@
 给扫描全能王 / CamScanner Lite **7.26.5**（`com.intsig.CamScannerLite`）的分享面板补回
 「保存到文件」，让「图片转 Word」生成的文件能直接存进 iOS「文件」App。
 
-补丁形态是**注入式 dylib**，构建与重签全部在 GitHub Actions 的 macOS runner 上完成，
-本机不需要 Xcode / clang / codesign。
+补丁形态是**注入式 dylib**。编译在 GitHub Actions 的 macOS runner 上完成（产物仅 ~140KB），
+**注入与重打包在本机用纯 Python 完成**，不需要 Xcode / clang / codesign，也不需要下载 266MB 的成品 ipa。
+
+> **当前产物**：`dist/CamScanner_7.26.5_SaveToFiles_local.ipa`（192 MB，2026-10-27）
+> 对应 CI run `40439162575`（commit `6bcd9e25`，success）
+> dylib 含 **arm64 + arm64e 双切片**，与主二进制 arm64e 对齐。
+
+---
+
+## 0. v3 版本修了什么（真机反馈驱动）
+
+前两版补丁装上后「完全没反应」。真机反馈推翻静态结论，查出四条根因，
+**全部属于「编译能过、装上无效」类型**，静态检查一条都抓不到：
+
+| # | 根因 | 为什么查不到 | 后果 |
+|---|---|---|---|
+| A | 条目属性名全错：`title`→**`titleString`**、`identifyId`→**`actionSheetOperationType`**、`iconImage`→**`selectedIcon`/`rightIcon`** | 名字「看着像」，KVC 抛异常被自己 `@catch` 吞掉 | 面板静默不变 |
+| B | 纵向数据源是**二维数组**，一维 `addObject:` | `cellForRowAtIndexPath:` 分组时走 `data[section][row]` | **崩宿主** |
+| C | 「转换失败」根因是 `Reachability` 误报 `NotReachable` | 转换函数第一步就查网络（`0x101755fb4 cbz`） | 弹「转换失败」 |
+| D | setter 名漏一个 `List`：`setVerticallyDataSource:` 在二进制里**不存在** | 只扫 `adrp+ldr` 得「0 处引用」假结论，实际走 `__objc_stubs` 跳板 | hook 从未装上 |
+
+**D 的方法论教训**：现代 clang 把方法调用编成 `bl <stub>`，selref 的 `adrp+ldr` 在
+`__objc_stubs` 段里而不在调用点。必须先解析 `__objc_stubs` 建立 `stub地址 → selector名`
+映射，再在 `__text` 找 `bl stub`。我据此差点第二次改错方向。
+
+详见 `扫描全能王_图片转Word_保存到文件_缺陷分析报告.md` 第「三·补」章。
 
 ---
 
