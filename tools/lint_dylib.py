@@ -46,6 +46,21 @@ WARNS = []
 SRC = os.environ.get("SRC_FILE", "src/CamScannerSaveToFiles.m")
 
 
+def _blocks_containing(text, needle, span=2600):
+    """返回 text 中每一处 needle 前后 span 字符的窗口。
+
+    用途：判断某个调用是否被包在 dispatch_async(global_queue) 的 block 里。
+    为什么用「窗口」而不是精确解析 block：ObjC 的 block 语法带 ^ 与嵌套
+    大括号，用正则做精确配平会非常脆；窗口法对「调用点紧跟在
+    dispatch_async 之后几行」这种实际写法足够准确，且不会误伤。
+    """
+    out = []
+    for m in re.finditer(re.escape(needle), text):
+        lo = max(0, m.start() - span)
+        out.append(text[lo:m.start() + span])
+    return out
+
+
 def strip_comments(text):
     """剥掉 // 与 /* */ 注释，保留字符串字面量。
 
@@ -150,7 +165,7 @@ def check_source():
     def enclosing_func(text, pos):
         """向上找最近的 CSFS_ hook 函数起点（用于判断 early-return 守卫）"""
         best = -1
-        for m in re.finditer(r"^static\s+[A-Za-z_][\w \t\*]*?\b(CSFS_\w+)\s*\(", text, re.MULTILINE):
+        for m in re.finditer(r"^static\s+[^\n(=;]*?\b(CSFS\w+)\s*\(", text, re.MULTILINE):
             if m.start() <= pos:
                 best = m.start()
         return best
@@ -220,31 +235,180 @@ def check_source():
         else:
             ok(f"{var}: {len(call_positions)} 处调用全部受判空保护")
 
-    # R3: hook 内不得出现同步文件 IO
-    io_pats = [
+    # R3: 不得在 hook 热路径里做同步文件 IO
+    #
+    # 分两类处理，因为二者的危害程度不同：
+    #   A. 写操作 / 读整个文件内容 —— 无条件禁止。这类必然拖垮主线程。
+    #   B. 目录扫描 / 取属性 —— 允许，但**必须**出现在后台队列的 block 里。
+    #      判断方法：该调用所在的最近一个 dispatch_async 是 global/concurrent
+    #      队列，且调用之后到函数尾没有又跑回主线程。
+    #
+    # 实际教训（2026-10-26）：第一版把 attributesOfItemAtPath: 写进了
+    # sortUsingComparator:，每比一次读一次盘，O(n log n) 次同步 IO。
+    # 检查器当时能用一条正则拦住，说明「一刀切禁止」有价值；但完全禁止
+    # 又会让「后台扫沙盒找刚生成的文件」这条路无法实现 —— 于是改成
+    # 「默认禁止，后台队列显式豁免」。
+    io_pats_hard = [
         (r"\bNSData\s+dataWithContentsOf", "NSData dataWithContentsOf*"),
         (r"\bwriteToFile\s*:", "writeToFile:"),
-        (r"\bcontentsOfDirectoryAtPath\s*:", "contentsOfDirectoryAtPath:"),
-        (r"\battributesOfItemAtPath\s*:", "attributesOfItemAtPath:"),
         (r"\bcreateFileAtPath\s*:", "createFileAtPath:"),
     ]
-    for pat, human in io_pats:
+    for pat, human in io_pats_hard:
         if re.search(pat, text):
             fail(f"源码出现 {human}：hook 热路径内的文件 IO 会被 watchdog 杀进程")
         else:
             ok(f"无 {human}")
 
-    # R4: 所有 hook 函数必须包 @try
-    # 注意：参数里可能含 block 类型（如 void (^)(void)），其括号会打断简单的
-    # \([^)]*\) 匹配，导致整个 hook 被漏检。这里改用「按行定位函数头 +
-    # 按大括号配平截取函数体」，确保不漏。
+    BG_HINT = "CSFS_BACKGROUND_SCAN_OK"
+
+    # ── R3b: 目录扫描类 IO 的「必须在后台队列」校验 ────────────────────
+    #
+    # 这段逻辑前后重写了四遍，前几版都是「往回看 N 个字符找 dispatch_async」，
+    # 全部失败。失败原因值得记下来，因为它是这类静态检查的通病：
+    #   ① 调用点和 dispatch_async 之间隔着几十行，字符窗口够不到；
+    #   ② IO 真正的落点（CSFSScanRecentFiles）和业务入口
+    #      （CSFSCollectReadyFileURLs）是两层函数，只看直接调用点永远
+    #      看不到后台队列；
+    #   ③ 标记写在注释里，而这里读的是剥掉注释的文本 —— 永远匹配不到。
+    # 每一条都让豁免静默失效，而报错只说「请放进后台 block」，
+    # 完全指不到真正卡在哪一步。
+    #
+    # 现在改用「调用图 + 区间」的简单模型，一次把三种情况都覆盖：
+    #   1. 收集所有函数体区间；
+    #   2. 从 IO 函数出发，反向找出所有能到达它的函数（≤4 跳）；
+    #   3. 若某个「被安装的 hook」在其函数体里调用了这条链上的任何函数，
+    #      则该 hook 体内必须出现 dispatch_get_global_queue；
+    #   4. 且 IO 函数体内不得再 dispatch_get_main_queue（否则等于没离开主线程）。
+
+    def _func_spans(txt):
+        """返回 [(name, body_start, body_end)]，按大括号配平取函数体。"""
+        out = []
+        heads = list(re.finditer(r"^static\s+[^\n(=;]*?\b(CSFS\w+)\s*\(",
+                                 txt, re.MULTILINE))
+        for i, h in enumerate(heads):
+            stop = heads[i + 1].start() if i + 1 < len(heads) else len(txt)
+            # 找函数体起止
+            j = txt.find("{", h.end())
+            if j < 0 or j > stop:
+                continue
+            d, k = 0, j
+            while k < stop:
+                if txt[k] == "{":
+                    d += 1
+                elif txt[k] == "}":
+                    d -= 1
+                    if d == 0:
+                        break
+                k += 1
+            out.append((h.group(1), j, min(k, stop)))
+        return out
+
+    spans = _func_spans(text)
+    installed_names = set()
+    for m in re.finditer(r"CSFSHookInstance\s*\(([^;]*?)\)\s*;", text, re.S):
+        for fm in re.finditer(r"\(\s*IMP\s*\)\s*(CSFS\w+)", m.group(1)):
+            installed_names.add(fm.group(1))
+    for m in re.finditer(r"class_addMethod\s*\([^;]*?\(\s*IMP\s*\)\s*(CSFS\w+)", text, re.S):
+        installed_names.add(m.group(1))
+
+    io_pats_soft = [
+        (r"\bcontentsOfDirectoryAtPath\s*:", "contentsOfDirectoryAtPath:"),
+        (r"\battributesOfItemAtPath\s*:", "attributesOfItemAtPath:"),
+        (r"\benumeratorAtPath\s*:", "enumeratorAtPath:"),
+    ]
+    for pat, human in io_pats_soft:
+        m0 = re.search(pat, text)
+        if not m0:
+            ok(f"无 {human}")
+            continue
+
+        # IO 落在哪个函数里
+        io_fn = None
+        for name, bs, be in spans:
+            if bs <= m0.start() <= be:
+                io_fn = name
+                break
+        if not io_fn:
+            fail(f"源码出现 {human}，但定位不到所属函数 — 检查脚本可能失效")
+            continue
+
+        # 反向可达：哪些函数调用了这条链
+        chain = {io_fn}
+        for _ in range(4):
+            grew = False
+            for name, bs, be in spans:
+                if name in chain:
+                    continue
+                body = text[bs:be]
+                for c in chain:
+                    if re.search(r"\b" + re.escape(c) + r"\s*\(", body):
+                        chain.add(name)
+                        grew = True
+                        break
+            if not grew:
+                break
+
+        # 哪些 hook 直接/间接调到了它
+        callers = []
+        for name, bs, be in spans:
+            if name not in installed_names:
+                continue
+            body = text[bs:be]
+            if any(re.search(r"\b" + re.escape(c) + r"\s*\(", body) for c in chain):
+                callers.append((name, bs, be))
+
+        body_of_io = next((text[bs:be] for nm, bs, be in spans if nm == io_fn), "")
+        io_returns_to_main = "dispatch_get_main_queue" in body_of_io
+
+        if BG_HINT not in raw:
+            fail(f"源码出现 {human}：hook 热路径内的文件 IO 会被 watchdog 杀进程"
+                 f"（请放进 dispatch_get_global_queue 的 block，"
+                 f"并在源码标注 {BG_HINT}）［诊断：io_fn={io_fn} 缺标记］")
+        elif io_returns_to_main:
+            fail(f"{human} 所在函数 {io_fn} 内出现 dispatch_get_main_queue，"
+                 f"等于没离开主线程 ［诊断：chain={sorted(chain)}］")
+        elif not callers:
+            fail(f"{human} 所在函数 {io_fn} 无法从任何已安装 hook 到达 — "
+                 f"要么是死代码，要么检查器失效 ［诊断：chain={sorted(chain)}］")
+        else:
+            bad = [nm for nm, bs, be in callers
+                   if "dispatch_get_global_queue" not in text[bs:be]]
+            if bad:
+                fail(f"{human}：{io_fn} 被 {bad} 调用，但这些 hook 体内没有 "
+                     f"dispatch_get_global_queue — 会卡主线程"
+                     f" ［诊断：chain={sorted(chain)}］")
+            else:
+                ok(f"{human} 仅在后台队列内可达"
+                   f"（{io_fn} ← {[c[0] for c in callers]}，已豁免）")
+
+    # R4: 只有「真正被安装成 IMP 的 hook」才必须整体包 @try
+    #
+    # 曾经这里是「所有 CSFS* 函数都要包 @try」，结果把 CSFSItemClass /
+    # CSFSTopWindow / CSFSInterestingExtensions 这类纯工具函数全判成 FAIL。
+    # 那 11 条 FAIL 全是假警报 —— 而假警报的代价是把真警报淹没：
+    # 人看到满屏红就开始一路往下滑，真正危险的那条反而漏过去了。
+    #
+    # 正确的判据是「它有没有被交给 method_setImplementation / class_addMethod」，
+    # 也就是出现在 CSFSHookInstance(...) 的第三个实参位置上。工具函数不满足，
+    # 自然不检。
+    installed = set()
+    for m in re.finditer(r"CSFSHookInstance\s*\(([^;]*?)\)\s*;", text, re.S):
+        args = m.group(1)
+        for fm in re.finditer(r"\(\s*IMP\s*\)\s*(CSFS\w+)", args):
+            installed.add(fm.group(1))
+    for m in re.finditer(r"class_addMethod\s*\([^;]*?\(\s*IMP\s*\)\s*(CSFS\w+)", text, re.S):
+        installed.add(m.group(1))
+
     hook_starts = []
-    for m in re.finditer(r"^static\s+[A-Za-z_][\w \t\*]*?\b(CSFS_\w+)\s*\(",
+    for m in re.finditer(r"^static\s+[^\n(=;]*?\b(CSFS\w+)\s*\(",
                          text, re.MULTILINE):
-        hook_starts.append((m.group(1), m.start()))
+        fn = m.group(1)
+        if installed and fn not in installed:
+            continue          # 工具函数，不要求整体 @try
+        hook_starts.append((fn, m.start()))
 
     if not hook_starts:
-        fail("未解析到任何 CSFS_ hook 函数 — 检查脚本本身可能失效")
+        fail("未解析到任何被安装的 hook 函数 — 检查脚本本身可能失效")
 
     for idx, (fn, start) in enumerate(hook_starts):
         # 函数体起点：从 start 找到第一个不在括号内的 '{'

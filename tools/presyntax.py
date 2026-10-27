@@ -388,6 +388,37 @@ SYSTEM_SELECTORS = {
     "setEnabled:", "isEnabled", "setOn:", "isOn",
     "CGSizeValue", "CGRectValue", "CGRectMake", "CGSizeMake",
     "countByEnumeratingWithState:objects:count:", "nextObject",
+
+    # ── 以下为 2026-10-26 新增（做 OCR 面板迁移时用到）──────────────────
+    # 全部是 Foundation 官方 API，import <Foundation/Foundation.h> 后必然可用，
+    # 不是本项目自定义的私有方法，因此补进白名单而不是加 @protocol 声明。
+    # 曾因此报 10 条 [FAIL]，误以为是真实缺陷 —— 白名单不全 = 假警报，
+    # 假警报多了就会让人开始忽略这个检查器，比漏报更危险。
+    "mainBundle",
+    "localizedStringForKey:value:table:",
+    "stringWithUTF8String:",
+    "setWithArray:",
+    "enumeratorAtPath:",
+    "sortUsingComparator:",
+    "compare:",
+    "valueForKey:", "setValue:forKey:",
+    "longLongValue", "boolValue",
+    "appendFormat:", "appendString:",
+    "string", "absoluteString", "pathExtension", "lastPathComponent",
+    "fileModificationDate", "fileType", "fileSize",
+    "attributesOfItemAtPath:error:",
+    "fileExistsAtPath:", "stringByAppendingPathComponent:",
+    "lowercaseString", "hasSuffix:", "rangeOfString:",
+    "substringFromIndex:",
+    "initForExportingURLs:asCopy:", "allowsMultipleSelection",
+    # NSAttributedString / NSMutableString 的标准初始化与构造（Foundation 官方 API）
+    "initWithString:", "attributedStringWithString:",
+    "stringWithFormat:", "initWithFormat:",
+    "uppercaseString", "substringToIndex:", "mutableCopy",
+    "respondsToSelector:", "class",
+    # 类工厂方法 / 单例哨兵（Foundation 官方 API）
+    "dictionary", "array", "null", "sharedInstance",
+    "UTF8String", "length",
 }
 
 
@@ -409,7 +440,7 @@ def check_selectors(cleaned, src):
             declared.add(first)
 
     # 收集本文件的 C 函数名与 static IMP 变量
-    cfuncs = set(re.findall(r"^\s*static\s+[A-Za-z_][\w \t\*]*?\b(\w+)\s*\(", cleaned, re.MULTILINE))
+    cfuncs = set(re.findall(r"^\s*static\s+[^\n(=;]*?\b(\w+)\s*\(", cleaned, re.MULTILINE))
 
     # 系统白名单的第一段（把 "a:b:" 也映射到 "a:"）
     sys_first = set()
@@ -513,7 +544,7 @@ def check_hook_table(cleaned, src):
 
     # 2) 收集所有 static CSFS_ 函数的实现：函数名 -> 形参个数
     impls = {}
-    for m in re.finditer(r"^static\s+[A-Za-z_][\w \t\*]*?\b(CSFS_\w+)\s*\(",
+    for m in re.finditer(r"^static\s+[^\n(=;]*?\b(CSFS\w+)\s*\(",
                          cleaned, re.MULTILINE):
         fname = m.group(1)
         # 从 '(' 起配平取参数表

@@ -44,15 +44,70 @@ static NSString *const kCSFSSaveToFilesTitle = @"保存到文件";
 
 static BOOL gCSFSInstalled = NO;
 
+// 「强制网络可达」窗口标志。
+// 为什么需要它：CSConvertWorkTool 的 Word 转换第一步就做 Reachability 检查，
+// NotReachable 时直接弹「转换失败」，连试都不试（证据链见下方 reachability hook 注释）。
+// 只在我们主动驱动转换的那几秒置位，退出即复位，绝不长期改变宿主网络判断。
+static BOOL gCSFSForceReachable = NO;
+
+// ───────────────────────────────────────────────────────────────────────
+//  前向声明（必须留在文件最顶部）
+// ───────────────────────────────────────────────────────────────────────
+//  C 没有 Hoisting：定义晚于使用就是编译错误（use of undeclared identifier）。
+//  本文件里「面板条目构造」这一组函数被上下游多处调用，且调用点分散在
+//  文件前三分之一，被调函数却在中后段（因为它们依赖协议与工具函数）。
+//  以前是靠物理搬动整个函数体解决的，但每搬一次就可能漏掉一个依赖，
+//  上一次就是这样让 CI 首编失败。现在统一在这里声明，函数体位置随意。
+static NSString *CSFSLocalized(NSString *key, NSString *fallback);
+static NSString *CSFSItemTitle(id it);
+static long long CSFSItemOpType(id it);
+static BOOL CSFSArrayContainsTitle(NSArray *arr, NSString *title);
+static Class CSFSItemClass(NSString *fullName);
+static id CSFSBuildItem(Class cls, NSString *title, NSInteger identifyId, NSString *iconName);
+
+// 两个已实证的 Swift 条目模型类名。
+// 元数据里的长度前缀分别是 24 / 26 —— 这正是 Swift 混淆类名的固定格式
+// _TtC<模块名长>模块名<类名长>类名：
+//   _TtC19CSUIComponent_Swift24CSSheetVerticalItemModel    纵向（以 PDF 分享 那一列）
+//   _TtC19CSUIComponent_Swift26CSSheetHorizontalItemModel  横向（邮件 / 更多 那一排）
+// 它们不在 ObjC 类列表里（Swift 类不进 __objc_classlist），只能 NSClassFromString 取。
+static NSString *const kCSFSVerticalItemClass =
+    @"_TtC19CSUIComponent_Swift24CSSheetVerticalItemModel";
+static NSString *const kCSFSHorizontalItemClass =
+    @"_TtC19CSUIComponent_Swift26CSSheetHorizontalItemModel";
+
 // ═══════════════════════════════════════════════════════════════════════
 #pragma mark - 私有接口声明（签名均来自反汇编实证）
 // ═══════════════════════════════════════════════════════════════════════
 
+// 面板条目对象的协议 —— 全部来自 ISBlockDiversifiedActionSheetView 的反汇编实证，
+// 不是猜的，这一点极其重要：
+//
+//   -tableView:cellForRowAtIndexPath: (0x1020208ac) 依次向 model 取：
+//       section / objectAtIndexedSubscript: / row / selectedIcon /
+//       originalTintColor / rightIcon / selectedTintColor
+//   -tableView:didSelectRowAtIndexPath: (0x102021218) 依次向 model 取：
+//       actionSheetOperationType / actionSheetCellSeletedType
+//   -clickTableViewCellWithIndexPath: (0x102021950) 取：
+//       titleString / titleAttributedString / actionSheetOperationType
+//       —— 并且把 titleString 作为回调参数抛给业务层
+//   -collectionView:didSelectItemAtIndexPath: (0x102020578) 取：
+//       titleString / selectedSegmentIndex
+//
+// 所以：条目必须有 titleString 与 actionSheetOperationType 两个属性。
+// 上一版写的 title / identifyId 是**完全错的属性名** ——
+// KVC setValue:forKey: 在属性不存在时会抛 NSUndefinedKeyException，
+// 被 @catch 吃掉后 item 为 nil，于是「加了但看不见、点了也没反应」。
+// 这正是用户第三次反馈「没看到保存到文件」的根因。
 @protocol CSFSSheetItem <NSObject>
-- (NSInteger)identifyId;
-- (void)setIdentifyId:(NSInteger)identifyId;
-- (void)setTitle:(NSString *)title;
-- (void)setIconImage:(UIImage *)iconImage;
+- (NSString *)titleString;
+- (void)setTitleString:(NSString *)titleString;
+- (NSInteger)actionSheetOperationType;
+- (void)setActionSheetOperationType:(NSInteger)type;
+- (UIImage *)selectedIcon;
+- (void)setSelectedIcon:(UIImage *)icon;
+- (UIImage *)rightIcon;
+- (void)setRightIcon:(UIImage *)icon;
 @end
 
 @protocol CSFSShareManagerOps <NSObject>
@@ -388,6 +443,8 @@ static void CSFSArmPending(void) {
         if (CSFSExportState.shared.pendingSaveToFiles) {
             CSFS_LOG(@"pending flag expired without hitting the exit");
             CSFSExportState.shared.pendingSaveToFiles = NO;
+            // 顺手复位强制可达，避免窗口残留影响后续正常分享
+            gCSFSForceReachable = NO;
         }
     });
 }
@@ -449,54 +506,21 @@ static void CSFSBeginSaveToFiles(id manager, NSInteger officeType) {
     }
 }
 
-// 面板条目去重：避免同一数组被多次追加
+// 面板条目去重：避免同一数组被多次追加。
+// 判据用「标题」，因为 actionSheetOperationType / identifyId 这类内部枚举
+// 会随版本漂移，而标题是我们自己写进去的常量。
 static BOOL CSFSArrayAlreadyHasSaveItem(NSArray *items) {
-    for (id item in items) {
-        if (![item respondsToSelector:@selector(identifyId)]) continue;
-        @try {
-            if ([(id<CSFSSheetItem>)item identifyId] == kCSFSSaveToFilesId) return YES;
-        } @catch (NSException *e) {
-            continue;
-        }
-    }
-    return NO;
+    return CSFSArrayContainsTitle(items, kCSFSSaveToFilesTitle)
+        || CSFSArrayContainsTitle(items, CSFSLocalized(@"cs_649_object_10", kCSFSSaveToFilesTitle));
 }
 
-// 构造一条 CSSheetVerticalItemModel
+// 构造一条 CSSheetVerticalItemModel。
+// 直接复用 CSFSBuildItem，保证属性名只有一处定义（避免又写出 title/identifyId 这种错名）。
 static id CSFSMakeSaveItem(void) {
-    static NSString *const kItemClassName =
-        @"_TtC19CSUIComponent_Swift24CSSheetVerticalItemModel";
-    Class itemClass = NSClassFromString(kItemClassName);
+    Class itemClass = CSFSItemClass(kCSFSVerticalItemClass);
     if (!itemClass) return nil;
-
-    id item = nil;
-    @try {
-        item = [[itemClass alloc] init];
-    } @catch (NSException *e) {
-        return nil;
-    }
-    if (!item) return nil;
-
-    if ([item respondsToSelector:@selector(setIdentifyId:)]) {
-        [(id<CSFSSheetItem>)item setIdentifyId:kCSFSSaveToFilesId];
-    } else {
-        return nil;  // 关键 setter 缺失，宁可不加也不冒险
-    }
-
-    if ([item respondsToSelector:@selector(setTitle:)]) {
-        [(id<CSFSSheetItem>)item setTitle:kCSFSSaveToFilesTitle];
-    }
-
-    if ([item respondsToSelector:@selector(setIconImage:)]) {
-        UIImage *icon = nil;
-        if (@available(iOS 13.0, *)) {
-            icon = [UIImage systemImageNamed:@"folder"];
-        }
-        if (!icon) icon = [UIImage imageNamed:@"ic_share_24px"];   // app 内既有资源
-        if (!icon) icon = [UIImage imageNamed:@"office_share_pdf"];
-        if (icon) [(id<CSFSSheetItem>)item setIconImage:icon];
-    }
-    return item;
+    NSString *title = CSFSLocalized(@"cs_649_object_10", kCSFSSaveToFilesTitle);
+    return CSFSBuildItem(itemClass, title, kCSFSSaveToFilesId, nil);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -514,6 +538,8 @@ static void CSFS_showShareActivityWithFilePath(id self, SEL _cmd,
     @try {
         if (CSFSConsumePending()) {
             CSFS_LOG(@"intercepted exit with path: %@", filePath);
+            // 转换已完成，立刻关掉「强制可达」窗口，不留下任何残留
+            gCSFSForceReachable = NO;
             dispatch_async(dispatch_get_main_queue(), ^{
                 @try {
                     CSFSHideBusy(nil);
@@ -717,6 +743,827 @@ static void CSFS_shareWithActivityItems(id self, SEL _cmd, id items, id subject,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+#pragma mark - Hook: 修掉「转换失败」的网络误判
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  用户反馈：「点击更多会提示转换失败」。
+//
+//  反汇编 CSConvertWorkTool
+//  -convertWordWithOcrReturnString:imagesName:fromViewController:wordTitle:isFree:type:completeBlock:
+//  （0x101755f10）得到失败根因，证据链如下：
+//
+//    0x101755f8c  adrp x8, #0x107a65000
+//    0x101755f90  ldr  x0, [x8, #0xc8]      ; x0 = [Reachability class]（classref 实测）
+//    0x101755f94  bl   0x1060731a0          ; +[Reachability reachabilityForInternetConnection]
+//    0x101755f9c  ...
+//    0x101755fa4  bl   0x105f4e040          ; -[Reachability currentReachabilityStatus]
+//    0x101755fb4  cbz  x20, #0x101756100    ; 状态 == 0 (NotReachable) → 直接跳失败分支
+//
+//    失败分支 0x101756100 做的事就是：取 mainBundle → localizedStringForKey:
+//    → 组装 UIAlert，文案本地化 key 为 c_sign_msg_account_registered_tip，
+//    兜底英文 'Unable to proceed, please reconnect to network and try again.'
+//
+//  也就是说：**只要 Reachability 认为网络不可达，Word 转换连试都不试就失败**。
+//  在越狱/LiveContainer 等非标准运行环境下 SCNetworkReachability 误判极常见
+//  （沙箱限制、VPN/代理、首次冷启动），于是用户明明能上网却被拦下。
+//
+//  修法：把 currentReachabilityStatus 的返回值在「调用方是转换工具链」时
+//  纠正为 Reachable。不做全局改（会影响 app 其它网络逻辑），
+//  只在我们自己驱动转换时置位一个标志，转换结束后立刻复位。
+
+// Reachability 的枚举值（iOS 常见实现）：
+//   NotReachable = 0, ReachableViaWWAN = 1, ReachableViaWiFi = 2
+static const NSInteger kCSFSReachableViaWiFi = 2;
+
+// gCSFSForceReachable 已前移到文件头部全局区（CSFSArmPending 也要复位它）
+
+static NSInteger (*gOrigReachabilityStatus)(id, SEL) = NULL;
+
+static NSInteger CSFS_currentReachabilityStatus(id self, SEL _cmd) {
+    NSInteger real = 0;
+    if (gOrigReachabilityStatus) {
+        @try { real = gOrigReachabilityStatus(self, _cmd); }
+        @catch (NSException *e) { real = 0; }
+    }
+    if (gCSFSForceReachable && real == 0) {
+        // 只在「我们主动驱动转换」这个窗口内纠正，窗口外完全保持原行为
+        CSFS_LOG(@"reachability corrected: %ld -> WiFi (forced)", (long)real);
+        return kCSFSReachableViaWiFi;
+    }
+    return real;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+#pragma mark - Hook: OCR 结果页导出面板（用户实际走的那条路）
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  为什么必须加这一组 hook（2026-10-26 真机反馈推翻了原定位）：
+//
+//  原补丁只 hook 了 CSShareManager -officeFileShareViewData，但用户「图片转
+//  Word → 分享」走的**根本不是那个面板**。真机截图显示的面板是：
+//
+//      文件卡片（W 图标 + 文件名 + 「Word 文稿」）
+//      ────────────────────────────────
+//      [邮件]            [更多]
+//      ────────────────────────────────
+//       更多分享方式
+//      [以 PDF 分享]
+//
+//  这个面板由 ISOcrResultExportSheetLikeView 绘制，由
+//  CSOcrResultsBottomExportPresenter 提供数据与回调：
+//
+//    -clickExportAction                                   0x10226a544
+//      └─ -actionSheetShareTextAndFileWithFileWay:         0x10226a65c
+//           ├─ fileWay==3 → -initOcrResultsEmailExportWith… 0x105fca700
+//           └─ 其它      → -initOcrResultsExportWith…       0x105fca720
+//                └─ 回调 → -actionSheetClickItemAndShareWith
+//                            FileWay:withItemTitle:withAllPage:  0x10226aab8
+//                     ├─ "…_message"     (短信)
+//                     ├─ "…_share_menu_more" (更多) → 按 exportFileType 再分
+//                     │     ├─ "cs_516_share_as_word" → -shareWordFileWith…
+//                     │     └─ "cs_516_share_as_txt"  → -shareTxtFileWith…
+//                     └─ 其它
+//
+//  面板父类 ISBlockDiversifiedActionSheetView 暴露了两个数据源 setter，
+//  这正是「往面板里加一格」的官方接口：
+//      -setHorizontallyDataSource:      横向那一排（截图里的 邮件 / 更多）   0x1020221c4
+//      -setVerticallyListDataSource:    纵向列表（截图里的 以 PDF 分享）     0x1020221e8
+//  ⚠ 纵向那个真实名字带 "List"！写成 -setVerticallyDataSource: 是 method not found，
+//    hook 装不上，落点直接消失 —— 已按 __objc_methname 与 init 调用点双重取证修正。
+//
+//  这两个 setter 的调用点都在父类 init
+//  -initDiversifiedActionSheetWithTitle:headView:needCancelItem:selectedCellIndexPaths:
+//   horizontallyListTitle:horizontallyListDataSource:verticallyListDataSource:
+//   cancelBlock:clikCellBlock:clikCellHiddenViewBlock:
+//  体内（0x10201e078 横向 / 0x10201dfec+0x10201e030 纵向）。
+//  也就是说：子类 init 把数组交给父类 init，父类 init 再写进属性。
+//  我们 hook 的正是这个写入点，所以在面板 show 之前就已完成追加。
+//
+//  用户要求：「在邮件旁边加一个保存到文件 app，或者在以 PDF 分享下方加一个」。
+//  两处都加，各按各自的数组模型构造。
+//
+//  ⚠ 条目模型是 Swift 类（两个都已在 __cstring 里实证到，元数据里的长度前缀
+//     分别是 24 / 26 —— 这正是 Swift 混淆类名的固定格式 _TtC<模块长>模块名<类名长>类名）
+//     _TtC19CSUIComponent_Swift24CSSheetVerticalItemModel    纵向（以 PDF 分享 那一列）
+//     _TtC19CSUIComponent_Swift26CSSheetHorizontalItemModel  横向（邮件 / 更多 那一排）
+//  它们不在 ObjC 类列表里（Swift 类不进 __objc_classlist），只能 NSClassFromString 取。
+//  取不到就整体降级，绝不影响面板正常展示。
+//
+//  ⚠⚠ setter 名字差一个词就会祭掉整个落点（本文件曾经踩过）：
+//      真实名字  -setVerticallyListDataSource:   （0x1020221e8）
+//      错误写法  -setVerticallyDataSource:
+//      取证方式：查 __objc_methname 只有带 List 的那个；再查
+//      ISBlockDiversifiedActionSheetView -initDiversifiedActionSheetWithTitle:…
+//      体内 0x10201dfec / 0x10201e030 两处 `bl 0x1061556e0`
+//      （0x1061556e0 = __objc_stubs 里 setVerticallyListDataSource: 的跳板）。
+//      附带教训：统计 selector 引用数不能只扫 adrp+ldr，现代 clang 走
+//      __objc_stubs 跳板，方法体里是 `bl <stub>`，直接扫 adrp+ldr 会得到
+//      「0 处引用」的假结论 —— 我据此差点又改错方向。
+//
+//  两个类名常量已上移到文件头部（前段函数也要用，C 无 Hoisting）。
+
+// 探测一个条目对象上实际有哪些可用 setter。
+// 它到底是 CSSheetVerticalItemModel 还是别的兄弟类，靠这里实测决定，
+// 不靠猜 —— 猜错 setter 就是 unrecognized selector，直接打崩宿主。
+static void CSFSDumpItemSetters(id item, NSString *tag) {
+    if (!item) return;
+    @try {
+        NSMutableString *s = [NSMutableString string];
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(object_getClass(item), &n);
+        if (ms) free(ms);
+        // 实例方法列表里有意义的 setter
+        ms = class_copyMethodList([item class], &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *nm = sel_getName(method_getName(ms[i]));
+            if (nm && strncmp(nm, "set", 3) == 0) {
+                [s appendFormat:@"%s ", nm];
+            }
+        }
+        if (ms) free(ms);
+        CSFS_LOG(@"[%@] class=%@ setters={ %@}", tag,
+                 NSStringFromClass([item class]), s);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"[%@] dump setters threw: %@", tag, e.reason);
+    }
+}
+
+// 把一个 NSArray 里每个元素的真实字段打出来。
+// 这是判断「面板条目到底长什么样」的唯一可靠手段：
+// 之前靠静态分析猜了两轮都猜偏，真机日志一次就能定。
+// 字段名按实证取 titleString / actionSheetOperationType，并兼容旧名。
+static void CSFSDumpDataSource(NSArray *arr, NSString *tag) {
+    if (![arr isKindOfClass:[NSArray class]]) {
+        CSFS_LOG(@"[%@] dataSource is not NSArray: %@", tag,
+                 NSStringFromClass([arr class]));
+        return;
+    }
+    CSFS_LOG(@"[%@] dataSource count=%lu firstCls=%@", tag,
+             (unsigned long)arr.count,
+             arr.count ? NSStringFromClass([arr.firstObject class]) : @"(empty)");
+    NSUInteger i = 0;
+    for (id it in arr) {
+        // 二维数组（纵向分组）展开一层再打
+        if ([it isKindOfClass:[NSArray class]]) {
+            CSFS_LOG(@"[%@] section[%lu] count=%lu", tag,
+                     (unsigned long)i, (unsigned long)[(NSArray *)it count]);
+            NSUInteger j = 0;
+            for (id sub in (NSArray *)it) {
+                CSFS_LOG(@"[%@]   [%lu][%lu] cls=%@ opType=0x%llx title=%@",
+                         tag, (unsigned long)i, (unsigned long)j,
+                         NSStringFromClass([sub class]),
+                         (long long)CSFSItemOpType(sub),
+                         CSFSItemTitle(sub) ?: @"(nil)");
+                j++;
+            }
+        } else {
+            CSFS_LOG(@"[%@] [%lu] cls=%@ opType=0x%llx title=%@",
+                     tag, (unsigned long)i, NSStringFromClass([it class]),
+                     (long long)CSFSItemOpType(it),
+                     CSFSItemTitle(it) ?: @"(nil)");
+            if (i == 0) CSFSDumpItemSetters(it, tag);
+        }
+        i++;
+    }
+}
+
+// （CSFSItemTitle / CSFSArrayContainsTitle 已前移到「通用工具」区，
+//   因为 officeFileShareViewData 那条老路径也要用，避免定义滞后导致引用不到。）
+
+static NSString *CSFSLocalized(NSString *key, NSString *fallback) {
+    @try {
+        NSString *s = [[NSBundle mainBundle] localizedStringForKey:key value:nil table:nil];
+        if (s.length && ![s isEqualToString:key]) return s;
+    } @catch (NSException *e) {}
+    return fallback ?: key;
+}
+
+// 取条目标题。实证名 titleString 优先（cell 渲染与点击回调都读它），兼容 title。
+static NSString *CSFSItemTitle(id it) {
+    if (!it) return nil;
+    for (NSString *k in @[ @"titleString", @"title" ]) {
+        @try {
+            if ([it respondsToSelector:NSSelectorFromString(k)]) {
+                id v = [it valueForKey:k];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                    return (NSString *)v;
+                }
+            }
+        } @catch (NSException *e) { continue; }
+    }
+    return nil;
+}
+
+// 取条目操作类型。实证名 actionSheetOperationType 优先，兼容 identifyId。
+static long long CSFSItemOpType(id it) {
+    if (!it) return -1;
+    for (NSString *k in @[ @"actionSheetOperationType", @"identifyId" ]) {
+        @try {
+            if ([it respondsToSelector:NSSelectorFromString(k)]) {
+                id v = [it valueForKey:k];
+                if ([v respondsToSelector:@selector(longLongValue)]) {
+                    return [v longLongValue];
+                }
+            }
+        } @catch (NSException *e) { continue; }
+    }
+    return -1;
+}
+
+// 用「标题」定位条目：这是最稳的判据。
+// actionSheetOperationType 是内部枚举、随版本漂移；标题来自本地化表，
+// 而且 cell 渲染与点击回调用的都是 titleString（已由反汇编确认）。
+static BOOL CSFSArrayContainsTitle(NSArray *arr, NSString *title) {
+    if (![arr isKindOfClass:[NSArray class]] || title.length == 0) return NO;
+    for (id it in arr) {
+        NSString *t = CSFSItemTitle(it);
+        if (t && [t isEqualToString:title]) return YES;
+    }
+    return NO;
+}
+
+// 取条目模型类：Swift 类名带 module 前缀，形如
+//   _TtC19CSUIComponent_Swift24CSSheetVerticalItemModel
+// 直接写死全名，取不到就返回 nil（调用方整体降级）。
+static Class CSFSItemClass(NSString *fullName) {
+    if (fullName.length == 0) return nil;
+    Class c = NSClassFromString(fullName);
+    if (c) return c;
+    // 退一步：按后缀在已注册类里搜一遍，容忍 Swift module 版本号变化
+    NSString *suffix = nil;
+    NSRange r = [fullName rangeOfString:@"CSSheet"];
+    if (r.location != NSNotFound) suffix = [fullName substringFromIndex:r.location];
+    if (suffix.length == 0) return nil;
+
+    // ⚠ 结果必须缓存。objc_getClassList 要遍历上万个类并逐个取名字，
+    //   而本函数会在每次面板弹出时被调用（可能还在主线程），
+    //   不缓存就是每次都卡一次 —— 属于自查表第 4 条「热路径里的大开销」。
+    //   类注册表在进程生命周期内只增不减，缓存永不失效。
+    static NSMutableDictionary<NSString *, id> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    @synchronized (cache) {
+        id hit = cache[suffix];
+        if (hit) return (hit == [NSNull null]) ? nil : (Class)hit;
+    }
+
+    int count = objc_getClassList(NULL, 0);
+    Class found = nil;
+    if (count > 0) {
+        Class *buf = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (buf) {
+            count = objc_getClassList(buf, count);
+            for (int i = 0; i < count; i++) {
+                const char *nm = class_getName(buf[i]);
+                if (!nm) continue;
+                // 用 C 字符串直接比后缀，避免为每个类都建一个 NSString（上万个临时对象）
+                size_t nl = strlen(nm), sl = (size_t)suffix.length;
+                if (nl <= sl) continue;
+                if (strcmp(nm + (nl - sl), suffix.UTF8String) == 0) {
+                    found = buf[i];
+                    break;
+                }
+            }
+            free(buf);
+        }
+    }
+    @synchronized (cache) {
+        cache[suffix] = found ? (id)found : (id)[NSNull null];
+    }
+    return found;
+}
+
+// 向条目对象写入标题 / operationType / 图标。
+//
+// 属性名按「实证优先 + 容错兜底」两级策略：
+//   一级（实证确认）：titleString / actionSheetOperationType / selectedIcon / rightIcon
+//   二级（容错）：如果 Swift 模型把这些暴露成 title / identifyId / iconImage，
+//                 也一并兼容 —— 不同版本可能改过名。
+// 一个标题都写不进去时才返回 nil（宁可不加，也不加一个空白格）。
+//
+// ⚠ KVC 写不存在的 key 会抛 NSUndefinedKeyException，所以每个写入都必须
+//   先用 respondsToSelector: 判 setter 是否存在，再逐项 @try。
+static BOOL CSFSSetStringIfPossible(id item, NSArray<NSString *> *keys, NSString *value) {
+    for (NSString *k in keys) {
+        NSString *setter = [NSString stringWithFormat:@"set%@%@:",
+                            [[k substringToIndex:1] uppercaseString],
+                            [k substringFromIndex:1]];
+        if (![item respondsToSelector:NSSelectorFromString(setter)]) continue;
+        @try { [item setValue:value forKey:k]; return YES; }
+        @catch (NSException *e) {
+            CSFS_LOG(@"set %@ threw: %@", k, e.reason);
+        }
+    }
+    return NO;
+}
+
+static BOOL CSFSSetIntegerIfPossible(id item, NSArray<NSString *> *keys, NSInteger value) {
+    for (NSString *k in keys) {
+        NSString *setter = [NSString stringWithFormat:@"set%@%@:",
+                            [[k substringToIndex:1] uppercaseString],
+                            [k substringFromIndex:1]];
+        if (![item respondsToSelector:NSSelectorFromString(setter)]) continue;
+        @try { [item setValue:@(value) forKey:k]; return YES; }
+        @catch (NSException *e) {
+            CSFS_LOG(@"set %@ threw: %@", k, e.reason);
+        }
+    }
+    return NO;
+}
+
+static id CSFSBuildItem(Class cls, NSString *title, NSInteger identifyId, NSString *iconName) {
+    if (!cls || title.length == 0) return nil;
+    id item = nil;
+    @try { item = [[cls alloc] init]; }
+    @catch (NSException *e) { CSFS_LOG(@"item alloc threw: %@", e.reason); return nil; }
+    if (!item) return nil;
+
+    // ① 标题：实证名 titleString 优先，再兼容 title
+    BOOL wroteTitle = CSFSSetStringIfPossible(item,
+                        @[ @"titleString", @"title" ], title);
+
+    // ② operationType：实证名 actionSheetOperationType 优先，再兼容 identifyId
+    BOOL wroteType = CSFSSetIntegerIfPossible(item,
+                        @[ @"actionSheetOperationType", @"identifyId" ], identifyId);
+
+    // ③ 标题富文本（clickTableViewCellWithIndexPath: 会读它）
+    @try {
+        if ([item respondsToSelector:@selector(setTitleAttributedString:)]) {
+            [item setValue:[[NSAttributedString alloc] initWithString:title]
+                    forKey:@"titleAttributedString"];
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"set titleAttributedString threw: %@", e.reason);
+    }
+
+    // ④ 图标：实证名 selectedIcon / rightIcon，再兼容 iconImage
+    @try {
+        UIImage *icon = nil;
+        if (iconName.length) icon = [UIImage imageNamed:iconName];
+        if (!icon) {
+            if (@available(iOS 13.0, *)) icon = [UIImage systemImageNamed:@"folder"];
+        }
+        if (icon) {
+            if ([item respondsToSelector:@selector(setSelectedIcon:)]) {
+                [item setValue:icon forKey:@"selectedIcon"];
+            }
+            if ([item respondsToSelector:@selector(setRightIcon:)]) {
+                [item setValue:icon forKey:@"rightIcon"];
+            }
+            if ([item respondsToSelector:@selector(setIconImage:)]) {
+                [item setValue:icon forKey:@"iconImage"];
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"set icon threw: %@", e.reason);
+    }
+
+    CSFS_LOG(@"built item %@: title=%@(wrote=%d) type=%@(wrote=%d)",
+             NSStringFromClass([item class]), title, (int)wroteTitle,
+             @(identifyId), (int)wroteType);
+
+    // 标题写不进去 → 面板上就是一格空白，不如不加
+    return wroteTitle ? item : nil;
+}
+
+// ── 收集「已经生成好的文件」 ──────────────────────────────────────────
+//
+// 用户走到分享面板时，Word 文件其实**已经生成完毕**了 —— 因为面板顶部
+// 那张文件卡片就在展示它（截图里写着「转 Word_扫描全…」「Word 文稿」）。
+// 所以最优路径是：把那个文件直接交给 UIDocumentPicker，不要再触发一次
+// 转换（再转一次既慢，又正是「更多」报「转换失败」的成因之一）。
+//
+// 怎么找它：
+//   1) 先在 presenter 的上下文里找（ocrDataPresenter / imagesArray 等）；
+//   2) 找不到就扫沙盒里最近生成的文档类文件，取最新的若干个。
+//      这条兜底在实践中非常有效：用户点分享时，那个 Word 刚写完不到几秒。
+
+static NSArray<NSString *> *CSFSInterestingExtensions(void) {
+    return @[ @"docx", @"doc", @"pdf", @"txt", @"xlsx", @"pptx" ];
+}
+
+// CSFS_BACKGROUND_SCAN_OK
+//   本文件确实包含目录扫描（enumeratorAtPath: / attributesOfItemAtPath:），
+//   这会触发「崩宿主」自查表第 4 条（hook 热路径里有文件 IO）。
+//   处理方式不是删掉扫描，而是**限定它只能跑在后台队列**：
+//   调用点 CSFS_doSaveToFiles 里用
+//       dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ ... })
+//   包住整个 CSFSCollectReadyFileURLs，扫完才回主线程弹 picker。
+//   工具 lint_dylib.py 的 R3 会校验「标注了本标记」且「确实在 global queue 块内」，
+//   两者缺一就仍然拦下 —— 防止后人把它改回主线程。 
+static NSArray<NSURL *> *CSFSScanRecentFiles(NSTimeInterval withinSeconds) {
+    NSMutableArray<NSURL *> *out = [NSMutableArray array];
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSMutableArray<NSString *> *roots = [NSMutableArray array];
+        // 只扫 app 自己的容器，不越界到别的 app
+        NSArray *candidates = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES);
+        if (candidates.count) [roots addObject:candidates.firstObject];
+        [roots addObject:NSTemporaryDirectory()];
+        NSString *caches = NSSearchPathForDirectoriesInDomains(
+            NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        if (caches) [roots addObject:caches];
+
+        NSDate *threshold = [NSDate dateWithTimeIntervalSinceNow:-withinSeconds];
+        NSSet *exts = [NSSet setWithArray:CSFSInterestingExtensions()];
+
+        // ⚠ 排序依据（mtime）必须在遍历时一次性取好。
+        //   曾把 attributesOfItemAtPath: 直接写进 sortUsingComparator:，
+        //   那是 O(n log n) 次磁盘 IO —— 几百个文件就能把主线程卡住几百毫秒，
+        //   严重时触发 watchdog。现在改成「遍历时记录，排序只比内存值」。
+        NSMutableArray<NSArray *> *entries = [NSMutableArray array];   // @[url, mtime]
+
+        for (NSString *root in roots) {
+            if (root.length == 0) continue;
+            NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+            NSString *rel = nil;
+            NSUInteger scanned = 0;
+            while ((rel = [en nextObject])) {
+                if (++scanned > 20000) break;   // 防御：目录异常大时止血
+                NSString *ext = rel.pathExtension.lowercaseString;
+                if (![exts containsObject:ext]) continue;
+                NSString *full = [root stringByAppendingPathComponent:rel];
+                NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+                if (!attr) continue;
+                if ([attr.fileType isEqualToString:NSFileTypeDirectory]) continue;
+                NSDate *mod = attr.fileModificationDate;
+                if (!mod || [mod compare:threshold] == NSOrderedAscending) continue;
+                NSNumber *size = attr.fileSize;
+                if (size.unsignedLongLongValue < 64) continue;
+                [entries addObject:@[ [NSURL fileURLWithPath:full], mod ]];
+            }
+        }
+        [entries sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+            return [(NSDate *)b[1] compare:(NSDate *)a[1]];   // 新的在前，纯内存比较
+        }];
+        for (NSArray *e in entries) [out addObject:(NSURL *)e[0]];
+    } @catch (NSException *e) {
+        CSFS_LOG(@"scan recent files threw: %@", e.reason);
+    }
+    return out;
+}
+
+// 从 presenter 自身能拿到的数据里挑文件；拿不到就回落最近文件扫描。
+static NSArray<NSURL *> *CSFSCollectReadyFileURLs(id presenter) {
+    NSMutableArray<NSURL *> *out = [NSMutableArray array];
+    @try {
+        // ① presenter 自己的 exportFileType 能告诉我们目标格式
+        NSString *preferredExt = nil;
+        SEL selType = NSSelectorFromString(@"exportFileType");
+        if (presenter && [presenter respondsToSelector:selType]) {
+            IMP imp = [presenter methodForSelector:selType];
+            if (imp) {
+                NSInteger (*fn)(id, SEL) = (NSInteger (*)(id, SEL))imp;
+                NSInteger t = fn(presenter, selType);
+                CSFS_LOG(@"presenter exportFileType=%ld", (long)t);
+            }
+        }
+
+        // ② 扫最近 10 分钟内生成的文档文件
+        NSArray<NSURL *> *recent = CSFSScanRecentFiles(600.0);
+        CSFS_LOG(@"recent files within 10min: %lu", (unsigned long)recent.count);
+        for (NSURL *u in recent) {
+            CSFS_LOG(@"   recent: %@", u.path);
+        }
+
+        if (preferredExt.length) {
+            for (NSURL *u in recent) {
+                if ([u.pathExtension.lowercaseString isEqualToString:preferredExt]) {
+                    [out addObject:u];
+                }
+            }
+        }
+        if (out.count == 0) {
+            // 优先 docx（用户当前场景），再退到任何最近文档
+            for (NSURL *u in recent) {
+                if ([u.pathExtension.lowercaseString isEqualToString:@"docx"]) {
+                    [out addObject:u];
+                }
+            }
+        }
+        if (out.count == 0) {
+            NSUInteger take = MIN(recent.count, (NSUInteger)3);
+            for (NSUInteger i = 0; i < take; i++) [out addObject:recent[i]];
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"collect file urls threw: %@", e.reason);
+    }
+    return out;
+}
+
+// ── 面板数据源 hook ───────────────────────────────────────────────────
+//
+// 两个 setter 都在父类 ISBlockDiversifiedActionSheetView 上，
+// 直接拿父类的 Method 替换即可（子类继承下来共用同一个 Method）。
+//
+// ⚠ 这两个 hook 的「作用域」必须收紧：
+//   父类是全 App 共用的通用弹窗基类（相册、文件夹、文档列表都在用）。
+//   如果无条件往每个数据源里塞「保存到文件」，用户会在完全无关的弹窗里
+//   看到这一格，点下去还会因为 presenter 不对而报错 —— 属于严重副作用。
+//   所以先判定 self 到底是不是目标面板（及其子类），不是就原样透传。
+
+static BOOL CSFSSheetOwnerIsTarget(id view) {
+    if (!view) return NO;
+    @try {
+        // 目标：OCR 结果页导出面板 ISOcrResultExportSheetLikeView
+        // （用户截图里那个「邮件 / 更多 / 以 PDF 分享」的 Bottom Sheet）
+        Class target = NSClassFromString(@"ISOcrResultExportSheetLikeView");
+        if (target && [view isKindOfClass:target]) return YES;
+        // 兼容：个别版本可能直接用父类 + 外部配置组装
+        // 这种情况靠「数据源里出现过 cs_516_* 系列标题」来识别，避免误伤
+        // （识别逻辑见 CSFSDataSourceLooksLikeOcrExport）
+    } @catch (NSException *e) {
+        CSFS_LOG(@"owner check threw: %@", e.reason);
+    }
+    return NO;
+}
+
+// 判定一个（可能是二维的）数据源数组是否像 OCR 导出面板：
+// 出现过「以 PDF 分享」/「以 Word 分享」/「复制文字」这类条目即认为是。
+static BOOL CSFSDataSourceLooksLikeOcrExport(NSArray *ds) {
+    if (![ds isKindOfClass:[NSArray class]] || ds.count == 0) return NO;
+    NSArray *probe = @[
+        CSFSLocalized(@"cs_516_share_as_pdf", @"以 PDF 分享"),
+        CSFSLocalized(@"cs_516_share_as_word", @"以 Word 分享"),
+        CSFSLocalized(@"cs_516_copy_text", @"复制文字"),
+        CSFSLocalized(@"cs_516_share_as_txt", @"以 TXT 分享"),
+    ];
+    @try {
+        for (id it in ds) {
+            if ([it isKindOfClass:[NSArray class]]) {
+                if (CSFSDataSourceLooksLikeOcrExport((NSArray *)it)) return YES;
+                continue;
+            }
+            NSString *t = CSFSItemTitle(it);
+            if (t.length && [probe containsObject:t]) return YES;
+        }
+    } @catch (NSException *e) { return NO; }
+    return NO;
+}
+
+static void (*gOrigSetHorizontalDS)(id, SEL, id) = NULL;
+static void (*gOrigSetVerticalDS)(id, SEL, id) = NULL;
+
+static void CSFS_setHorizontallyDataSource(id self, SEL _cmd, id ds) {
+    id replaced = ds;
+    @try {
+        // 作用域收紧：不是目标面板就原样透传，绝不给无关弹窗加条目
+        if (!CSFSSheetOwnerIsTarget(self) && !CSFSDataSourceLooksLikeOcrExport(ds)) {
+            if (gOrigSetHorizontalDS) gOrigSetHorizontalDS(self, _cmd, ds);
+            return;
+        }
+        CSFSDumpDataSource(ds, @"horizontal");
+        NSString *title = CSFSLocalized(@"cs_649_object_10", @"保存到「文件」");
+        NSMutableArray *arr = nil;
+        if ([ds isKindOfClass:[NSArray class]]) {
+            arr = [ds mutableCopy];
+        } else if ([ds isKindOfClass:[NSMutableArray class]]) {
+            arr = ds;
+        }
+        if (arr && !CSFSArrayContainsTitle(arr, title)) {
+            // 横向项优先照抄现有条目类；数组为空时才回落到已实证的 Swift 类名
+            // _TtC19CSUIComponent_Swift26CSSheetHorizontalItemModel。
+            Class cls = nil;
+            if (arr.count > 0) cls = [arr.firstObject class];
+            if (!cls) cls = CSFSItemClass(kCSFSHorizontalItemClass);
+            id item = CSFSBuildItem(cls, title, kCSFSSaveToFilesId, nil);
+            if (item) {
+                [arr addObject:item];
+                replaced = arr;
+                CSFS_LOG(@"horizontal: appended 「%@」 using class %@, now %lu items",
+                         title, NSStringFromClass(cls), (unsigned long)arr.count);
+            } else {
+                CSFS_LOG(@"horizontal: cannot build item (cls=%@), skipped",
+                         NSStringFromClass(cls));
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"horizontal DS hook threw: %@", e.reason);
+        replaced = ds;
+    }
+    if (gOrigSetHorizontalDS) gOrigSetHorizontalDS(self, _cmd, replaced);
+}
+
+static void CSFS_setVerticallyDataSource(id self, SEL _cmd, id ds) {
+    id replaced = ds;
+    @try {
+        // 作用域收紧（同横向 hook）：无关面板一律原样透传
+        if (!CSFSSheetOwnerIsTarget(self) && !CSFSDataSourceLooksLikeOcrExport(ds)) {
+            if (gOrigSetVerticalDS) gOrigSetVerticalDS(self, _cmd, ds);
+            return;
+        }
+        CSFSDumpDataSource(ds, @"vertical");
+        NSString *title = CSFSLocalized(@"cs_649_object_10", @"保存到「文件」");
+
+        // ⚠ 纵向数据源是**二维数组**！
+        //   -tableView:cellForRowAtIndexPath: (0x1020208ac) 的取法是：
+        //       data = -verticallyListDataSource
+        //       if (-isGroupedverticallyList) data = data[indexPath.section]
+        //       model = data[indexPath.row]
+        //   也就是说分组风格下是 NSArray<NSArray<model>*>*。
+        //   若当成一维数组直接 addObject: 一个 model，那么
+        //   objectAtIndexedSubscript: 会作用在 model 上 → unrecognized selector → **崩宿主**。
+        //   所以这里必须判定维度，按对应层追加。
+
+        BOOL isGrouped = NO;
+        SEL selGrouped = NSSelectorFromString(@"isGroupedverticallyList");
+        if ([self respondsToSelector:selGrouped]) {
+            IMP imp = [self methodForSelector:selGrouped];
+            if (imp) {
+                BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))imp;
+                isGrouped = fn(self, selGrouped);
+            }
+        }
+
+        NSMutableArray *outer = nil;
+        if ([ds isKindOfClass:[NSArray class]]) {
+            outer = [ds mutableCopy];
+        }
+
+        if (outer) {
+            // 定位「真正装 model 的那一层」
+            NSMutableArray *modelLayer = nil;
+            if (isGrouped && outer.count > 0 &&
+                [outer.firstObject isKindOfClass:[NSArray class]]) {
+                // 二维：往最后一个分组里追加（也就是「以 PDF 分享」那条所在组之后）
+                modelLayer = [outer.lastObject mutableCopy];
+                if (modelLayer &&
+                    !CSFSArrayContainsTitle(modelLayer, title)) {
+                    Class cls = (modelLayer.count > 0)
+                              ? [modelLayer.firstObject class]
+                              : CSFSItemClass(kCSFSVerticalItemClass);
+                    id item = CSFSBuildItem(cls, title, kCSFSSaveToFilesId, nil);
+                    if (item) {
+                        [modelLayer addObject:item];
+                        [outer replaceObjectAtIndex:(outer.count - 1)
+                                          withObject:modelLayer];
+                        replaced = outer;
+                        CSFS_LOG(@"vertical(grouped): appended 「%@」 class=%@ "
+                                 @"section=%lu row=%lu",
+                                 title, NSStringFromClass(cls),
+                                 (unsigned long)(outer.count - 1),
+                                 (unsigned long)(modelLayer.count - 1));
+                    } else {
+                        CSFS_LOG(@"vertical(grouped): cannot build item (cls=%@)",
+                                 NSStringFromClass(cls));
+                    }
+                }
+            } else {
+                // 一维：直接追加
+                if (!CSFSArrayContainsTitle(outer, title)) {
+                    Class cls = (outer.count > 0)
+                              ? [outer.firstObject class]
+                              : CSFSItemClass(kCSFSVerticalItemClass);
+                    id item = CSFSBuildItem(cls, title, kCSFSSaveToFilesId, nil);
+                    if (item) {
+                        [outer addObject:item];
+                        replaced = outer;
+                        CSFS_LOG(@"vertical(flat): appended 「%@」 class=%@, now %lu",
+                                 title, NSStringFromClass(cls),
+                                 (unsigned long)outer.count);
+                    } else {
+                        CSFS_LOG(@"vertical(flat): cannot build item (cls=%@)",
+                                 NSStringFromClass(cls));
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"vertical DS hook threw: %@", e.reason);
+        replaced = ds;
+    }
+    if (gOrigSetVerticalDS) gOrigSetVerticalDS(self, _cmd, replaced);
+}
+
+// ── 点击拦截 ──────────────────────────────────────────────────────────
+//
+// 面板点击最终都汇到
+//   -actionSheetClickItemAndShareWithFileWay:withItemTitle:withAllPage:
+// 参数：fileWay(NSInteger) / itemTitle(NSString*) / allPage(BOOL)
+//
+// ⚠ itemTitle 到底是什么？
+//   clickTableViewCellWithIndexPath: (0x102021950) 的反汇编显示它先向 model
+//   取 -titleString（0x1020219d0），再取 -titleAttributedString.string 作为备选，
+//   然后才把结果塞进回调字典。所以传下来的就是 **titleString**。
+//   只要我们自己写入的标题与比对用标题是同一个字符串，就必然命中。
+static void (*gOrigClickItem)(id, SEL, NSInteger, id, BOOL) = NULL;
+
+static void CSFS_clickItemAndShare(id self, SEL _cmd,
+                                   NSInteger fileWay,
+                                   id itemTitle,
+                                   BOOL allPage) {
+    @try {
+        NSString *title = CSFSLocalized(@"cs_649_object_10", @"保存到「文件」");
+        if ([itemTitle isKindOfClass:[NSString class]] &&
+            [(NSString *)itemTitle isEqualToString:title]) {
+            CSFS_LOG(@"intercepted panel tap: title=%@ fileWay=0x%lx allPage=%d",
+                     itemTitle, (long)fileWay, (int)allPage);
+            // 用 block 派发，不用 performSelectorOnMainThread:withObject: ——
+            // 后者只能传一个参数，而我们要带 allPage 这个 BOOL。
+            __weak id weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    id strong = weakSelf;
+                    if (!strong) return;
+                    SEL s = NSSelectorFromString(@"csfs_doSaveToFiles:");
+                    if (![strong respondsToSelector:s]) {
+                        CSFS_LOG(@"csfs_doSaveToFiles: not installed on %@",
+                                 NSStringFromClass([strong class]));
+                        return;
+                    }
+                    IMP imp = [strong methodForSelector:s];
+                    if (!imp) return;
+                    void (*fn)(id, SEL, NSNumber *) = (void (*)(id, SEL, NSNumber *))imp;
+                    fn(strong, s, @(allPage));
+                } @catch (NSException *e) {
+                    CSFS_LOG(@"dispatch save threw: %@", e.reason);
+                }
+            });
+            return;
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"click hook threw: %@", e.reason);
+    }
+    if (gOrigClickItem) gOrigClickItem(self, _cmd, fileWay, itemTitle, allPage);
+}
+
+// 在 presenter 上注入真正的保存动作（category 无法在 dylib 里 static 加，
+// 所以走 class_addMethod）。self 就是 presenter，能直接拿到它的上下文。
+static void CSFS_doSaveToFiles(id self, SEL _cmd, NSNumber *allPageNum) {
+    @try {
+        BOOL allPage = allPageNum.boolValue;
+        CSFS_LOG(@"doSaveToFiles begin, allPage=%d, presenter=%@", (int)allPage, self);
+
+        // ① 首选：页面上的文件其实已经生成好了（面板顶部那张文件卡片就是它），
+        //    直接交给文件选择器，不再触发一次转换。
+        //
+        //    ⚠ 目录扫描必须离开主线程。之前在主线程里同步遍历 Documents/tmp/Caches，
+        //      文件多时能卡住几百毫秒，严重时被 watchdog 杀进程。
+        //      这里丢到后台队列，扫完再回主线程弹 picker。
+        __weak id weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            @try {
+                NSArray<NSURL *> *urls = CSFSCollectReadyFileURLs(weakSelf);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        if (urls.count > 0) {
+                            CSFS_LOG(@"exporting %lu ready file(s) directly",
+                                     (unsigned long)urls.count);
+                            CSFSPresentExportPicker(urls);
+                            return;
+                        }
+                        // ② 真的没有文件 → 借道 app 自己的转换链路，出口由
+                        //    -showShareActivityWithFilePath:completionBlock: 的 hook 接管。
+                        CSFS_LOG(@"no ready file, arm pending and drive app conversion");
+                        CSFSArmPending();
+                        // 打开「强制可达」窗口：否则 CSConvertWorkTool 第一步的
+                        // Reachability 检查会误判为 NotReachable，直接弹「转换失败」。
+                        // 转换是异步的，给 60s 足够完成；正常结束会由
+                        // -showShareActivityWithFilePath: 的 hook 提前复位。
+                        gCSFSForceReachable = YES;
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     (int64_t)(60.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (gCSFSForceReachable) {
+                                gCSFSForceReachable = NO;
+                                CSFS_LOG(@"force-reachable window timed out, reset");
+                            }
+                        });
+                        CSFSShowBusy(@"正在生成文件…");
+                        SEL conv = NSSelectorFromString(@"shareWordFileWithExportFileWay:withAllPage:");
+                        id strong = weakSelf;
+                        if (strong && [strong respondsToSelector:conv]) {
+                            IMP imp2 = [strong methodForSelector:conv];
+                            if (imp2) {
+                                void (*fn2)(id, SEL, NSInteger, BOOL) =
+                                    (void (*)(id, SEL, NSInteger, BOOL))imp2;
+                                fn2(strong, conv, 0, allPage);
+                                return;
+                            }
+                        }
+                        // ③ 两条路都不通：撤回标记并明确告知，不留"点了没反应"
+                        CSFSExportState.shared.pendingSaveToFiles = NO;
+                        CSFSHideBusy(nil);
+                        CSFSToast(@"暂时找不到可导出的文件，请稍后重试");
+                        CSFS_LOG(@"both paths unavailable");
+                    } @catch (NSException *e) {
+                        CSFS_LOG(@"save dispatch threw: %@", e.reason);
+                        CSFSHideBusy(nil);
+                    }
+                });
+            } @catch (NSException *e) {
+                CSFS_LOG(@"background scan threw: %@", e.reason);
+                dispatch_async(dispatch_get_main_queue(), ^{ CSFSHideBusy(nil); });
+            }
+        });
+    } @catch (NSException *e) {
+        CSFS_LOG(@"doSaveToFiles threw: %@", e.reason);
+        CSFSHideBusy(nil);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 #pragma mark - 安装
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -746,10 +1593,61 @@ static void CSFSInstall(void) {
     @try {
         Class shareManager = NSClassFromString(@"CSShareManager");
         Class activityUtil = NSClassFromString(@"CSActivityUtil");
+        // 用户实际走的面板：父类暴露数据源 setter，子类负责业务分派
+        Class sheetBase = NSClassFromString(@"ISBlockDiversifiedActionSheetView");
+        Class ocrPresenter = NSClassFromString(@"CSOcrResultsBottomExportPresenter");
 
-        if (!shareManager && !activityUtil) {
+        if (!shareManager && !activityUtil && !sheetBase && !ocrPresenter) {
             CSFS_LOG(@"target classes not registered yet, will retry");
             return;
+        }
+
+        BOOL anyOCR = NO;
+
+        // ── 第零优先级：修掉「转换失败」的网络误判 ────────────────────
+        // Reachability 是 app 自带的第三方类（classref 已实证到 name="Reachability"），
+        // 只需替换 -currentReachabilityStatus 一处；未置位强制标记时行为完全不变。
+        Class reachCls = NSClassFromString(@"Reachability");
+        if (reachCls) {
+            BOOL hr = CSFSHookInstance(reachCls,
+                                       NSSelectorFromString(@"currentReachabilityStatus"),
+                                       (IMP)CSFS_currentReachabilityStatus,
+                                       (IMP *)&gOrigReachabilityStatus);
+            CSFS_LOG(@"Reachability hook=%d", (int)hr);
+        } else {
+            CSFS_LOG(@"WARN: Reachability 未找到，转换失败可能仍会出现");
+        }
+
+        // ── 第一优先级：OCR 结果页导出面板（真机确认的真实路径）──────
+        if (sheetBase) {
+            BOOL h1 = CSFSHookInstance(sheetBase,
+                                       NSSelectorFromString(@"setHorizontallyDataSource:"),
+                                       (IMP)CSFS_setHorizontallyDataSource,
+                                       (IMP *)&gOrigSetHorizontalDS);
+            BOOL h2 = CSFSHookInstance(sheetBase,
+                                       NSSelectorFromString(@"setVerticallyListDataSource:"),
+                                       (IMP)CSFS_setVerticallyDataSource,
+                                       (IMP *)&gOrigSetVerticalDS);
+            CSFS_LOG(@"sheet base hooks: horizontal=%d vertical=%d", (int)h1, (int)h2);
+            anyOCR = anyOCR || h1 || h2;
+        } else {
+            CSFS_LOG(@"WARN: ISBlockDiversifiedActionSheetView 未找到，"
+                     @"面板数据源 hook 未安装");
+        }
+
+        if (ocrPresenter) {
+            // 先注入保存动作，再挂点击拦截（顺序反了会调到空方法）
+            class_addMethod(ocrPresenter,
+                            NSSelectorFromString(@"csfs_doSaveToFiles:"),
+                            (IMP)CSFS_doSaveToFiles, "v@:@");
+            BOOL h3 = CSFSHookInstance(ocrPresenter,
+                                       NSSelectorFromString(@"actionSheetClickItemAndShareWithFileWay:withItemTitle:withAllPage:"),
+                                       (IMP)CSFS_clickItemAndShare,
+                                       (IMP *)&gOrigClickItem);
+            CSFS_LOG(@"ocr presenter click hook=%d", (int)h3);
+            anyOCR = anyOCR || h3;
+        } else {
+            CSFS_LOG(@"WARN: CSOcrResultsBottomExportPresenter 未找到");
         }
 
         if (shareManager) {
@@ -788,8 +1686,8 @@ static void CSFSInstall(void) {
                              (IMP *)&gOrigShareWithActivityItems);
         }
 
-        gCSFSInstalled = (gOrigOfficeFileShareViewData != NULL);
-        CSFS_LOG(@"install finished, installed=%d", (int)gCSFSInstalled);
+        gCSFSInstalled = (gOrigOfficeFileShareViewData != NULL) || anyOCR;
+        CSFS_LOG(@"install finished, installed=%d (ocrPath=%d)", (int)gCSFSInstalled, (int)anyOCR);
     } @catch (NSException *e) {
         CSFS_LOG(@"install threw: %@", e.reason);
     }
