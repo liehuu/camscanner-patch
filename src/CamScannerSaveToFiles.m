@@ -1968,6 +1968,167 @@ static NSArray *CSFS_channelArray(id self, SEL _cmd) {
 // 原生转换 → 文件生成后由 showShareActivityWithFilePath: hook 改道保存。
 static void (*gOrigDidSelectCell)(id, SEL, id) = NULL;
 
+// ── v12：本地生成 Word 文档 ──────────────────────────────────────────
+// CSFS(8).log 铁证：Document.fileExist=0 / PDFPath=nil —— office 转换在
+// 本环境从未成功（点邮件/更多/原生以Word分享全部「转换失败」）。
+// 但 JSON Word 内容就在本地（编辑页可见，jsonWordCache）。
+// v12：扫描沙盒找 jsonWordCache → 提取文本 → 本地生成最小 .docx → picker。
+// （借道原转换链在 v8-v11 已被三轮真机证伪，不再尝试。）
+static NSString *CSFSXMLEscape(NSString *in) {
+    if (in.length == 0) return in;
+    NSMutableString *m = [in mutableCopy];
+    NSString *ampE = @"&" @"amp;";
+    NSString *ltE  = @"&" @"lt;";
+    NSString *gtE  = @"&" @"gt;";
+    [m replaceOccurrencesOfString:@"&" withString:ampE
+                           options:NSLiteralSearch range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@"<" withString:ltE
+                           options:NSLiteralSearch range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@">" withString:gtE
+                           options:NSLiteralSearch range:NSMakeRange(0, m.length)];
+    return m;
+}
+
+// 递归收集 JSON 里的字符串值；dict 按 key 排序尽量保序，array 保序
+static void CSFSCollectStrings(id obj, NSMutableArray *out2) {
+    if ([obj isKindOfClass:[NSString class]]) {
+        SEL wcsel = NSSelectorFromString(@"whitespaceAndNewlineCharacterSet");
+        id (*wcf)(id, SEL) = (id (*)(id, SEL))[NSCharacterSet methodForSelector:wcsel];
+        NSString *t = [(NSString *)obj stringByTrimmingCharactersInSet:
+                       wcf([NSCharacterSet class], wcsel)];
+        if (t.length > 0) [out2 addObject:t];
+        return;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        for (id e in obj) CSFSCollectStrings(e, out2);
+        return;
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = obj;
+        for (NSString *k in [d.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            CSFSCollectStrings(d[k], out2);
+        }
+    }
+}
+
+// 扫 Documents/Caches 找与 docId 相关的 json 文本
+static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
+    NSString *baseId = docId;
+    if ([baseId hasSuffix:@"_wordj"]) {
+        baseId = [baseId substringToIndex:baseId.length - 6];
+    }
+    NSArray *roots = @[
+        [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
+        [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    __block NSString *best = nil;
+    __block NSString *fallback = nil;
+    for (NSString *root in roots) {
+        if (root.length == 0) continue;
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        NSString *rel;
+        while ((rel = [en nextObject]) != nil) {
+            if (![rel.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
+            BOOL isDir = NO;
+            NSString *full = [root stringByAppendingPathComponent:rel];
+            if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) continue;
+            NSString *name = rel.lastPathComponent;
+            BOOL hitDoc = (baseId.length > 0 && [name containsString:baseId]);
+            BOOL hitWord = ([name.lowercaseString containsString:@"jsonword"] ||
+                            [name.lowercaseString containsString:@"wordj"] ||
+                            [name.lowercaseString containsString:@"jsonWordCache"]);
+            if (hitDoc) { best = full; break; }
+            if (hitWord && !fallback) fallback = full;
+        }
+        if (best) break;
+    }
+    NSString *path = best ?: fallback;
+    if (path.length == 0) return nil;
+    NSError *err = nil;
+    SEL rsel = NSSelectorFromString(@"stringWithContentsOfFile:encoding:error:");
+    NSString *(*rfn)(id, SEL, NSString *, NSUInteger, NSError **) =
+        (NSString *(*)(id, SEL, NSString *, NSUInteger, NSError **))
+        [NSString methodForSelector:rsel];
+    NSString *txt = rfn([NSString class], rsel, path,
+                        NSUTF8StringEncoding, &err);
+    CSFS_LOG(@"v12 json file: %@ (len=%lu err=%@)", path,
+             (unsigned long)txt.length, err.localizedDescription ?: @"nil");
+    return txt;
+}
+
+// 用 App 自带 SSZipArchive 生成最小 .docx；失败返回 NO
+static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
+    Class zipCls = NSClassFromString(@"SSZipArchive");
+    if (!zipCls) {
+        CSFS_LOG(@"v12 WARN: SSZipArchive 未注册");
+        return NO;
+    }
+    SEL initSel = NSSelectorFromString(@"initWithPath:");
+    if (![[zipCls alloc] respondsToSelector:initSel]) return NO;
+    SEL imfsel = NSSelectorFromString(@"instanceMethodForSelector:");
+    IMP (*ifn)(id, SEL, SEL) = (IMP (*)(id, SEL, SEL))[zipCls methodForSelector:imfsel];
+    IMP methodImp = ifn(zipCls, imfsel, initSel);
+    id zip = ((id (*)(id, SEL, NSString *))methodImp)(
+        [[zipCls alloc] init], initSel, outPath);
+    SEL openSel = NSSelectorFromString(@"open");
+    SEL wdSel  = NSSelectorFromString(@"writeData:filename:withPassword:");
+    SEL closeSel = NSSelectorFromString(@"close");
+    if (!zip || ![zip respondsToSelector:openSel] || ![zip respondsToSelector:wdSel]) {
+        CSFS_LOG(@"v12 WARN: SSZipArchive 方法缺失");
+        return NO;
+    }
+    BOOL (*ofn)(id, SEL) = (BOOL (*)(id, SEL))[zip methodForSelector:openSel];
+    if (!ofn(zip, openSel)) return NO;
+    void (*wfn)(id, SEL, NSData *, NSString *, NSString *) =
+        (void (*)(id, SEL, NSData *, NSString *, NSString *))[zip methodForSelector:wdSel];
+
+    NSMutableString *body = [NSMutableString string];
+    for (NSString *line in lines) {
+        [body appendFormat:@"<w:p><w:r><w:t xml:space=\"preserve\">%@</w:t></w:r></w:p>",
+         CSFSXMLEscape(line)];
+    }
+    if (body.length == 0) [body appendString:@"<w:p/>"];
+    NSString *docXml = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        @"<w:body>%@<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>",
+        body];
+    NSString *ctXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        @"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        @"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        @"<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        @"</Types>";
+    NSString *relsXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
+        @"</Relationships>";
+    NSString *docRelsXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        @"</Relationships>";
+
+    wfn(zip, wdSel, [ctXml dataUsingEncoding:NSUTF8StringEncoding], @"[Content_Types].xml", nil);
+    wfn(zip, wdSel, [relsXml dataUsingEncoding:NSUTF8StringEncoding], @"_rels/.rels", nil);
+    wfn(zip, wdSel, [docRelsXml dataUsingEncoding:NSUTF8StringEncoding], @"word/_rels/document.xml.rels", nil);
+    wfn(zip, wdSel, [docXml dataUsingEncoding:NSUTF8StringEncoding], @"word/document.xml", nil);
+    SEL cfn = NSSelectorFromString(@"close");
+    void (*cfn2)(id, SEL) = (void (*)(id, SEL))[zip methodForSelector:cfn];
+    cfn2(zip, cfn);
+
+    NSFileManager *fm2 = [NSFileManager defaultManager];
+    BOOL ok = [fm2 fileExistsAtPath:outPath];
+    NSDictionary *attr = [fm2 attributesOfItemAtPath:outPath error:nil];
+    unsigned long long fsz = 0;
+    NSNumber *szn = [attr objectForKey:NSFileSize];
+    if ([szn isKindOfClass:[NSNumber class]]) fsz = [szn unsignedLongLongValue];
+    CSFS_LOG(@"v12 docx written=%d size=%llu", (int)ok, fsz);
+    return ok;
+}
+
 static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
     @try {
         if (ip) {
@@ -2034,55 +2195,87 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                         }
                         CSFS_LOG(@"v11 diag wordExportUrl=%@ docId=%@",
                                  fileURL.path ?: @"(nil)", docId ?: @"(nil)");
-                        if (!fileURL && docId.length > 0) {
-                            id doc = nil;
-                            Class adCls = NSClassFromString(@"CSIShareCoreDataModelAdapter");
-                            SEL enSel = NSSelectorFromString(@"coreDataDecouplingEnabled");
-                            BOOL useCore = NO;
-                            if (adCls && [adCls respondsToSelector:enSel]) {
-                                BOOL (*efn)(id, SEL) =
-                                    (BOOL (*)(id, SEL))[adCls methodForSelector:enSel];
-                                useCore = efn(adCls, enSel);
-                            }
-                            if (useCore) {
-                                SEL dtoSel = NSSelectorFromString(@"documentDTOWithIdentifier:");
-                                if ([adCls respondsToSelector:dtoSel]) {
-                                    id (*ffn)(id, SEL, id) =
-                                        (id (*)(id, SEL, id))[adCls methodForSelector:dtoSel];
-                                    doc = ffn(adCls, dtoSel, docId);
-                                }
-                            }
-                            if (!doc) {
-                                Class dcCls = NSClassFromString(@"CSDataCenter");
-                                SEL ncSel = NSSelectorFromString(@"normalCenter");
-                                if (dcCls && [dcCls respondsToSelector:ncSel]) {
-                                    id (*nfn)(id, SEL) =
-                                        (id (*)(id, SEL))[dcCls methodForSelector:ncSel];
-                                    id center = nfn(dcCls, ncSel);
-                                    SEL dwSel = NSSelectorFromString(@"documentWithIdentifier:");
-                                    if (center && [center respondsToSelector:dwSel]) {
-                                        id (*dfn2)(id, SEL, id) =
-                                            (id (*)(id, SEL, id))[center methodForSelector:dwSel];
-                                        doc = dfn2(center, dwSel, docId);
-                                    }
-                                }
-                            }
-                            CSFS_LOG(@"v11 diag doc=%@", doc ?: @"(nil)");
-                            if (doc && [doc respondsToSelector:@selector(officeFilePath)]) {
-                                id (*ofn)(id, SEL) =
-                                    (id (*)(id, SEL))[doc methodForSelector:@selector(officeFilePath)];
-                                id op = ofn(doc, @selector(officeFilePath));
-                                if ([op isKindOfClass:[NSString class]] &&
-                                    [(NSString *)op length] > 0) {
-                                    fileURL = [NSURL fileURLWithPath:(NSString *)op];
-                                }
-                            }
-                        }
                         if (fileURL) {
+                            // wordExportUrl 已有（转换成功过）：直接落盘
                             CSFS_LOG(@"v11 save directly: %@", fileURL.path);
                             CSFSPresentExportPicker(@[ fileURL ]);
+                        } else if (docId.length > 0) {
+                            // v12：office 转换链在本环境不可用（fileExist=0 铁证），
+                            // 后台找 jsonWordCache → 提取文本 → 本地生成 .docx
+                            NSString *docIdCopy = [docId copy];
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                                @try {
+                                    NSString *jsonText = CSFSFindJSONTextForDoc(docIdCopy);
+                                    if (jsonText.length == 0) {
+                                        dispatch_async(dispatch_get_main_queue(), ^{
+                                            CSFSToast(@"未找到文档数据，请稍后重试");
+                                        });
+                                        return;
+                                    }
+                                    // 诊断：dump 开头帮下一轮精确定位 JSON 结构
+                                    NSString *head = jsonText.length > 600
+                                        ? [jsonText substringToIndex:600] : jsonText;
+                                    CSFS_LOG(@"v12 json head: %@", head);
+                                    NSMutableArray *lines = [NSMutableArray array];
+                                    id parsed = nil;
+                                    SEL jsel = NSSelectorFromString(
+                                        @"JSONObjectWithData:options:error:");
+                                    id (*jfn)(id, SEL, NSData *, NSUInteger, NSError **) =
+                                        (id (*)(id, SEL, NSData *, NSUInteger, NSError **))
+                                        [NSJSONSerialization methodForSelector:jsel];
+                                    @try {
+                                        parsed = jfn([NSJSONSerialization class], jsel,
+                                                     [jsonText dataUsingEncoding:NSUTF8StringEncoding],
+                                                     0, nil);
+                                    } @catch (NSException *e) {
+                                        CSFS_LOG(@"v12 json parse threw: %@", e.reason);
+                                    }
+                                    if (parsed) {
+                                        CSFSCollectStrings(parsed, lines);
+                                        CSFS_LOG(@"v12 json parsed, %lu strings",
+                                                 (unsigned long)lines.count);
+                                    } else {
+                                        // 非 JSON：原文按行切
+                                        SEL wcsel2 = NSSelectorFromString(
+                                            @"whitespaceAndNewlineCharacterSet");
+                                        id (*wcf2)(id, SEL) =
+                                            (id (*)(id, SEL))[NSCharacterSet methodForSelector:wcsel2];
+                                        id ws2 = wcf2([NSCharacterSet class], wcsel2);
+                                        for (NSString *ln in [jsonText componentsSeparatedByString:@"\n"]) {
+                                            NSString *t = [ln stringByTrimmingCharactersInSet:ws2];
+                                            if (t.length > 0) [lines addObject:t];
+                                        }
+                                    }
+                                    if (lines.count == 0) {
+                                        dispatch_async(dispatch_get_main_queue(), ^{
+                                            CSFSToast(@"文档内容为空，请稍后重试");
+                                        });
+                                        return;
+                                    }
+                                    NSString *out = [NSTemporaryDirectory()
+                                                     stringByAppendingPathComponent:
+                                                     [NSString stringWithFormat:@"导出_%@.docx",
+                                                      [docIdCopy substringToIndex:MIN((NSUInteger)12, docIdCopy.length)]]]
+                                                     ;
+                                    BOOL ok = CSFSWriteDocx(lines, out);
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        if (ok) {
+                                            CSFSToast(@"Word 已生成，请选择保存位置");
+                                            CSFSPresentExportPicker(
+                                                @[ [NSURL fileURLWithPath:out] ]);
+                                        } else {
+                                            CSFSToast(@"生成 Word 文件失败");
+                                        }
+                                    });
+                                } @catch (NSException *e) {
+                                    CSFS_LOG(@"v12 background threw: %@", e.reason);
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        CSFSToast(@"生成 Word 文件失败");
+                                    });
+                                }
+                            });
                         } else {
-                            CSFS_LOG(@"v11 WARN: no file url (转换未完成或属性名不符)");
+                            CSFS_LOG(@"v12 WARN: no file url & no docId");
                             CSFSToast(@"文件尚未生成，请稍后重试");
                         }
                         return;

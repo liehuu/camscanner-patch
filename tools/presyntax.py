@@ -410,6 +410,9 @@ SYSTEM_SELECTORS = {
     # NSLock / NSDateFormatter（Foundation 官方 API，日志串行化用）
     "lock", "unlock", "fileExistsAtPath:", "date",
     "appendFormat:", "appendString:",
+    # NSMutableString / NSString（v12 docx 生成：XML 转义与文本清洗）
+    "replaceOccurrencesOfString:withString:options:range:",
+    "stringByTrimmingCharactersInSet:",
     "string", "absoluteString", "pathExtension", "lastPathComponent",
     "fileModificationDate", "fileType", "fileSize",
     "attributesOfItemAtPath:error:",
