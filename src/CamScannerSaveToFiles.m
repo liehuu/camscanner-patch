@@ -1887,30 +1887,64 @@ static NSArray *CSFS_channelArray(id self, SEL _cmd) {
         if (gOrigChannelArray) orig = gOrigChannelArray(self, _cmd);
         if (orig.count == 0) return orig;
 
-        // 已含「保存到文件」条目则原样返回（防重复追加）
+        // 已含「保存到文件」条目则原样返回（防重复追加：type 或标题任一匹配即算）
         for (id it in orig) {
             if ([it respondsToSelector:@selector(actionSheetOperationType)]) {
-                NSInteger (*fn)(id, SEL) = (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
-                if (fn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
+                NSInteger (*tfn)(id, SEL) =
+                    (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
+                if (tfn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
+                    return orig;
+                }
+            }
+            if ([it respondsToSelector:@selector(titleString)]) {
+                NSString *(*gfn)(id, SEL) =
+                    (NSString *(*)(id, SEL))[it methodForSelector:@selector(titleString)];
+                NSString *t = gfn(it, @selector(titleString));
+                if ([t isEqualToString:kCSFSSaveToFilesTitle]) {
                     return orig;
                 }
             }
         }
 
+        // v8 修正：条目模型类是 **CSActionSheetModel**（setTitleString:/
+        // setActionSheetOperationType:/setIconName: 的唯一实现者，见 implist）。
+        // CSActionSheetOperation 只是**工厂宿主类**（类方法
+        // +shareOtherAppModelArrayWithOperationtype:linkType:useNewIcon: 挂在它上，
+        // loadData 0x1018d6ae0-0x1018d6b20 实证）——alloc 它没有那些属性，
+        // 这正是 v7 日志 title=0 type=0 的原因。
+        //
+        // 首选：调工厂按 0xE5 生产条目（标题/图标原生配置）；
+        // 工厂不认识 0xE5 时回退 alloc CSActionSheetModel 手动填。
+        id item = nil;
         Class opCls = NSClassFromString(@"CSActionSheetOperation");
-        if (!opCls) {
-            CSFS_LOG(@"v7 WARN: CSActionSheetOperation 未注册，条目不追加");
-            return orig;
+        SEL factorySel = NSSelectorFromString(
+            @"shareOtherAppModelArrayWithOperationtype:linkType:useNewIcon:");
+        if (opCls && [opCls respondsToSelector:factorySel]) {
+            IMP fimp = [opCls methodForSelector:factorySel];
+            if (fimp) {
+                NSArray *(*fn)(id, SEL, id, NSInteger, BOOL) =
+                    (NSArray *(*)(id, SEL, id, NSInteger, BOOL))fimp;
+                NSArray *types = @[@(kCSFSSaveToFilesId)];
+                NSArray *made = fn(opCls, factorySel, types, (NSInteger)0, NO);
+                CSFS_LOG(@"v8 factory made=%lu", (unsigned long)made.count);
+                if (made.count > 0) item = made[0];
+            }
         }
-        id item = [[opCls alloc] init];
+        if (!item) {
+            Class modelCls = NSClassFromString(@"CSActionSheetModel");
+            if (!modelCls) {
+                CSFS_LOG(@"v8 WARN: CSActionSheetModel 未注册，条目不追加");
+                return orig;
+            }
+            item = [[modelCls alloc] init];
+        }
         if (!item) return orig;
 
-        // 标题与点击 ID。CSActionSheetOperation 是 ObjC 类，
-        // KVC 优先、失败回退 IMP 直调（复用既有工具，勿再手写 setter 解析）
         BOOL wroteTitle = CSFSSetStringIfPossible(item, @[ @"titleString" ], kCSFSSaveToFilesTitle);
         BOOL wroteType  = CSFSSetIntegerIfPossible(item, @[ @"actionSheetOperationType" ], kCSFSSaveToFilesId);
-        CSFS_LOG(@"v7 channelArray +save-to-files (title=%d type=%d total=%lu)",
-                 (int)wroteTitle, (int)wroteType, (unsigned long)(orig.count + 1));
+        CSFS_LOG(@"v8 +save-to-files cls=%@ title=%d type=%d total=%lu",
+                 NSStringFromClass([item class]), (int)wroteTitle, (int)wroteType,
+                 (unsigned long)(orig.count + 1));
 
         NSMutableArray *out = [orig mutableCopy];
         [out addObject:item];
