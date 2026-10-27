@@ -6,23 +6,37 @@
 补丁形态是**注入式 dylib**。编译在 GitHub Actions 的 macOS runner 上完成（产物仅 ~140KB），
 **注入与重打包在本机用纯 Python 完成**，不需要 Xcode / clang / codesign，也不需要下载 266MB 的成品 ipa。
 
-> **当前产物**：`dist/CamScanner_7.26.5_SaveToFiles_local.ipa`（192.1 MB，2026-10-27 v4）
-> 对应 CI run `40443332968`（commit `8434b9ff`，success）
-> dylib 含 **arm64 + arm64e 双切片**（361,016 B），与主二进制 arm64e 对齐。
+> **当前产物**：`dist/CamScanner_7.26.5_SaveToFiles_v5.ipa`（191.9 MB，2026-10-27 v5）
+> 对应 CI run `40454799418`（commit `eaf4429d`，success）
+> dylib 含 **arm64 + arm64e 双切片**（361,176 B），与主二进制 arm64e 对齐。
 
 ---
 
-## ★ 装完后第一件事：看日志
+## ★★ v5 装完第一件事：看启动 toast（10 秒判定）
+
+前四轮「装上没反应」一直分不清是**dylib 没被加载**还是 **hook 没生效**。
+v5 加了启动自证信号：**App 启动完成 3 秒后，屏幕上会弹一次 toast「[补丁v5] 已加载 ✓」**。
+
+- **看到 toast** → dylib 确定已加载，问题在 hook / 渲染层 → 继续按下面的 CSFS.log 排查
+- **看不到 toast** → dyld 根本没加载本 dylib（签名被拒 / 重签失败 / 装错了包）
+  → hook 代码写得再对也不会执行。此时先检查：导入 LC 时是否成功重签、
+  重装后是否删干净了旧版本、装的是不是 `v5.ipa`
+
+toast 只是诊断开关，确认生效后如嫌打扰可去掉。
+
+---
+
+## ★ 装完后第二件事：看日志
 
 v4 开始有**文件日志**，手机上直接可取，不用连电脑、不用 Xcode：
 
 1. 打开「文件」App → 我的 iPhone → **扫描全能王**（LC 里装的这个 app）
 2. 找到 **`CSFS.log`**，长按 → 共享/拷贝出来
 
-日志开头一定是这三行（确认装的是 v4）：
+日志开头一定是这三行（确认装的是 v5）：
 ```
 ==========================================================
-CamScannerSaveToFiles v4 loaded (build <日期> <时间>)
+CamScannerSaveToFiles v5 loaded (build <日期> <时间>)
 日志位置：App 沙盒 Documents/CSFS.log
 ==========================================================
 ```
