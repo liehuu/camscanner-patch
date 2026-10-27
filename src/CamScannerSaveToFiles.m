@@ -1940,15 +1940,36 @@ static void CSFSRetryInstall(void) {
     }
 }
 
+// ── 自证信号 ─────────────────────────────────────────────────────────
+// 前四轮反馈全是「装上了但完全没反应」，而我一直无法区分：
+//   a) dylib 根本没被 dyld 加载（签名被拒 / 路径解析失败）—— 代码一行都没跑；
+//   b) dylib 加载了，但 hook 挂点 / 条目渲染出了问题。
+// 这两种情况在面板上看起来一模一样，只能靠用户翻沙盒日志区分，成本太高。
+//
+// 所以加这个「启动横幅」：App 启动完成 3 秒后弹一次 toast。
+//   看到 toast   → dylib 确定已加载，问题在 hook / 渲染层，继续看 CSFS.log；
+//   看不到 toast → dyld 压根没加载本 dylib，问题在装载层（签名/路径），
+//                  hook 代码写得再对也不会执行。
+// 每次 App 冷启动都会弹一次。诊断结束后这行可以删掉。
+static void CSFSShowLoadedBanner(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CSFSToast(@"[补丁v5] 已加载 ✓");
+        CSFS_LOG(@"loaded banner shown (启动自证信号已弹出)");
+    });
+}
+
 __attribute__((constructor))
 static void CSFSEntry(void) {
     @try {
         // 版本横幅：装了新版之后，第一件事就是看这行。
         // 日志文件位置见 CSFSLogToFile 内注释（Documents/CSFS.log）。
         CSFS_LOG(@"==========================================================");
-        CSFS_LOG(@"CamScannerSaveToFiles v4 loaded (build %s %s)", __DATE__, __TIME__);
+        CSFS_LOG(@"CamScannerSaveToFiles v5 loaded (build %s %s)", __DATE__, __TIME__);
         CSFS_LOG(@"日志位置：App 沙盒 Documents/CSFS.log（用「文件」App 可取）");
         CSFS_LOG(@"==========================================================");
+        // 启动自证信号：见 CSFSShowLoadedBanner 注释。
+        CSFSShowLoadedBanner();
         CSFSInstall();
         if (!gCSFSInstalled) {
             // 类尚未注册（理论上不会，但防御）：等 App 启动完成再试
