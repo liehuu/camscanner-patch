@@ -1186,11 +1186,24 @@ static NSArray<NSURL *> *CSFSScanRecentFiles(NSTimeInterval withinSeconds) {
                 NSString *full = [root stringByAppendingPathComponent:rel];
                 NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
                 if (!attr) continue;
-                if ([attr.fileType isEqualToString:NSFileTypeDirectory]) continue;
-                NSDate *mod = attr.fileModificationDate;
+                // 统一用 objectForKey: 取属性，不用点语法。
+                // 原因同上：NSDictionary 上对 NSFileAttributeKey 的点语法
+                // 返回值类型推断不稳定，容易把标量当成对象。
+                id typeObj = [attr objectForKey:NSFileType];
+                if ([typeObj isEqualToString:NSFileTypeDirectory]) continue;
+                NSDate *mod = [attr objectForKey:NSFileModificationDate];
+                if (![mod isKindOfClass:[NSDate class]]) continue;
                 if (!mod || [mod compare:threshold] == NSOrderedAscending) continue;
-                NSNumber *size = attr.fileSize;
-                if (size.unsignedLongLongValue < 64) continue;
+                // ⚠ 不要写 `NSNumber *size = attr.fileSize;`
+                //   NSDictionary 的 fileSize 返回值在 SDK 里声明为
+                //   NSFileAttributeKey（NSString*）→ id，经点语法后类型推断会
+                //   落到 unsigned long long，于是被当成标量初始化 NSNumber*，
+                //   ARC 下直接报 "implicit conversion of 'unsigned long long'
+                //   to 'NSNumber *' is disallowed"。CI 首编就是这么挂的。
+                //   显式用 objectForKey: 再判类型，既无歧义也顺带做了防御。
+                id sizeObj = [attr objectForKey:NSFileSize];
+                if (![sizeObj respondsToSelector:@selector(unsignedLongLongValue)]) continue;
+                if ([sizeObj unsignedLongLongValue] < 64) continue;
                 [entries addObject:@[ [NSURL fileURLWithPath:full], mod ]];
             }
         }

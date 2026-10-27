@@ -402,7 +402,7 @@ SYSTEM_SELECTORS = {
     "sortUsingComparator:",
     "compare:",
     "valueForKey:", "setValue:forKey:",
-    "longLongValue", "boolValue",
+    "longLongValue", "unsignedLongLongValue", "integerValue", "intValue", "boolValue",
     "appendFormat:", "appendString:",
     "string", "absoluteString", "pathExtension", "lastPathComponent",
     "fileModificationDate", "fileType", "fileSize",
