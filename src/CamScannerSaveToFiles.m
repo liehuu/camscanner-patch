@@ -1822,7 +1822,7 @@ static BOOL CSFSHookInstance(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
 //   P2 showShareView         —— 验证 CSShareManager 链条第一环
 //   P3 showOfficeShareView   —— 验证第二环（officeFileShareViewData 的直接调用方）
 //   P4 presentViewController —— 广谱：任何模态弹出都记录类名
-static IMP gOrigExportWordAction = NULL;
+static void (*gOrigExportWordAction)(id, SEL) = NULL;
 static void CSFS_exportWordAction(id self, SEL _cmd) {
     @try {
         CSFS_LOG(@"P1 exportWordAction hit (%@)", NSStringFromClass([self class]));
@@ -1832,7 +1832,7 @@ static void CSFS_exportWordAction(id self, SEL _cmd) {
     }
 }
 
-static IMP gOrigShowShareView = NULL;
+static void (*gOrigShowShareView)(id, SEL) = NULL;
 static void CSFS_showShareView(id self, SEL _cmd) {
     @try {
         CSFS_LOG(@"P2 showShareView hit");
@@ -1842,7 +1842,7 @@ static void CSFS_showShareView(id self, SEL _cmd) {
     }
 }
 
-static IMP gOrigShowOfficeShareView = NULL;
+static void (*gOrigShowOfficeShareView)(id, SEL) = NULL;
 static void CSFS_showOfficeShareView(id self, SEL _cmd) {
     @try {
         CSFS_LOG(@"P3 showOfficeShareView hit");
@@ -1983,7 +1983,7 @@ static void CSFSInstall(void) {
                 // exportWordAction 可能是类方法（+），退回 class_getClassMethod
                 Method cm = class_getClassMethod(wordBtn, selEWA);
                 if (cm) {
-                    gOrigExportWordAction = method_setImplementation(cm, (IMP)CSFS_exportWordAction);
+                    gOrigExportWordAction = (void (*)(id, SEL))method_setImplementation(cm, (IMP)CSFS_exportWordAction);
                     CSFS_LOG(@"P1 hooked +[CSJsonWordEditBottomView exportWordAction] orig=%p",
                              gOrigExportWordAction);
                 } else {
