@@ -1989,11 +1989,12 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                         (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
                     if (tfn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
                         CSFS_LOG(@"intercepted panel save-to-files tap (row=%ld)", (long)row);
-                        // v10 修正：v9 把 adapter 当 manager 传给 re-dispatch，
-                        // orig 实现内部按 CSShareManager 读 shareModel → 「无法打开该文档」。
-                        // 正确 receiver 是 [self shareManager]（adapter 属性，方法表实证）；
-                        // 并补原生前置 [shareModel setIsShareStyle:1]
-                        // （didSelect 反汇编 0x1018d79f4 mov w2,#1，常量 1）。
+                        // ── v11：绕开转换链，直接拿文件落盘 ──
+                        // v10 实证：re-dispatch 0x78 后原链路静默死亡（无出口、无报错），
+                        // 环境里 office 转换链不可靠。而用户此时文档已存在——
+                        // ① shareModel.wordExportUrl（didSelect 0x1018d7a48 原生就先读它）
+                        // ② docId → Document/DTO.officeFilePath（原始 Word 文件）
+                        // 导出式 picker asCopy=YES 由系统复制，无需预拷贝。
                         id sm = nil;
                         SEL smsel = NSSelectorFromString(@"shareManager");
                         if ([self respondsToSelector:smsel]) {
@@ -2001,21 +2002,89 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                 (id (*)(id, SEL))[self methodForSelector:smsel];
                             sm = sfn(self, smsel);
                         }
+                        id model = nil;
+                        NSURL *fileURL = nil;
                         if (sm) {
                             SEL stysel = NSSelectorFromString(@"shareModel");
                             if ([sm respondsToSelector:stysel]) {
                                 id (*mfn)(id, SEL) =
                                     (id (*)(id, SEL))[sm methodForSelector:stysel];
-                                id model = mfn(sm, stysel);
-                                if (model && [model respondsToSelector:@selector(setIsShareStyle:)]) {
-                                    void (*ifn)(id, SEL, BOOL) =
-                                        (void (*)(id, SEL, BOOL))[model methodForSelector:@selector(setIsShareStyle:)];
-                                    ifn(model, @selector(setIsShareStyle:), YES);
+                                model = mfn(sm, stysel);
+                            }
+                        }
+                        // ① wordExportUrl
+                        if (model && [model respondsToSelector:@selector(wordExportUrl)]) {
+                            id (*wfn)(id, SEL) =
+                                (id (*)(id, SEL))[model methodForSelector:@selector(wordExportUrl)];
+                            id wu = wfn(model, @selector(wordExportUrl));
+                            if ([wu isKindOfClass:[NSURL class]]) {
+                                fileURL = wu;
+                            } else if ([wu isKindOfClass:[NSString class]] &&
+                                       [(NSString *)wu length] > 0) {
+                                fileURL = [NSURL fileURLWithPath:(NSString *)wu];
+                            }
+                        }
+                        // ② docId → 文档对象 → officeFilePath
+                        NSString *docId = nil;
+                        if (model && [model respondsToSelector:@selector(docId)]) {
+                            id (*dfn)(id, SEL) =
+                                (id (*)(id, SEL))[model methodForSelector:@selector(docId)];
+                            id dv = dfn(model, @selector(docId));
+                            if ([dv isKindOfClass:[NSString class]]) docId = dv;
+                        }
+                        CSFS_LOG(@"v11 diag wordExportUrl=%@ docId=%@",
+                                 fileURL.path ?: @"(nil)", docId ?: @"(nil)");
+                        if (!fileURL && docId.length > 0) {
+                            id doc = nil;
+                            Class adCls = NSClassFromString(@"CSIShareCoreDataModelAdapter");
+                            SEL enSel = NSSelectorFromString(@"coreDataDecouplingEnabled");
+                            BOOL useCore = NO;
+                            if (adCls && [adCls respondsToSelector:enSel]) {
+                                BOOL (*efn)(id, SEL) =
+                                    (BOOL (*)(id, SEL))[adCls methodForSelector:enSel];
+                                useCore = efn(adCls, enSel);
+                            }
+                            if (useCore) {
+                                SEL dtoSel = NSSelectorFromString(@"documentDTOWithIdentifier:");
+                                if ([adCls respondsToSelector:dtoSel]) {
+                                    id (*ffn)(id, SEL, id) =
+                                        (id (*)(id, SEL, id))[adCls methodForSelector:dtoSel];
+                                    doc = ffn(adCls, dtoSel, docId);
+                                }
+                            }
+                            if (!doc) {
+                                Class dcCls = NSClassFromString(@"CSDataCenter");
+                                SEL ncSel = NSSelectorFromString(@"normalCenter");
+                                if (dcCls && [dcCls respondsToSelector:ncSel]) {
+                                    id (*nfn)(id, SEL) =
+                                        (id (*)(id, SEL))[dcCls methodForSelector:ncSel];
+                                    id center = nfn(dcCls, ncSel);
+                                    SEL dwSel = NSSelectorFromString(@"documentWithIdentifier:");
+                                    if (center && [center respondsToSelector:dwSel]) {
+                                        id (*dfn2)(id, SEL, id) =
+                                            (id (*)(id, SEL, id))[center methodForSelector:dwSel];
+                                        doc = dfn2(center, dwSel, docId);
+                                    }
+                                }
+                            }
+                            CSFS_LOG(@"v11 diag doc=%@", doc ?: @"(nil)");
+                            if (doc && [doc respondsToSelector:@selector(officeFilePath)]) {
+                                id (*ofn)(id, SEL) =
+                                    (id (*)(id, SEL))[doc methodForSelector:@selector(officeFilePath)];
+                                id op = ofn(doc, @selector(officeFilePath));
+                                if ([op isKindOfClass:[NSString class]] &&
+                                    [(NSString *)op length] > 0) {
+                                    fileURL = [NSURL fileURLWithPath:(NSString *)op];
                                 }
                             }
                         }
-                        // 场景固定为图片转 Word；officeType 用 0x78(Word) 走原生转换链
-                        CSFSBeginSaveToFiles(sm, 0x78);
+                        if (fileURL) {
+                            CSFS_LOG(@"v11 save directly: %@", fileURL.path);
+                            CSFSPresentExportPicker(@[ fileURL ]);
+                        } else {
+                            CSFS_LOG(@"v11 WARN: no file url (转换未完成或属性名不符)");
+                            CSFSToast(@"文件尚未生成，请稍后重试");
+                        }
                         return;
                     }
                 }
