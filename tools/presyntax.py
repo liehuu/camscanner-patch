@@ -403,6 +403,12 @@ SYSTEM_SELECTORS = {
     "compare:",
     "valueForKey:", "setValue:forKey:",
     "longLongValue", "unsignedLongLongValue", "integerValue", "intValue", "boolValue",
+    # NSFileManager / NSFileHandle / NSDateFormatter（Foundation 官方 API，日志落盘用）
+    "createFileAtPath:contents:attributes:", "fileHandleForWritingAtPath:",
+    "seekToEndOfFile", "writeData:", "closeFile",
+    "stringFromDate:", "dataUsingEncoding:", "data",
+    # NSLock / NSDateFormatter（Foundation 官方 API，日志串行化用）
+    "lock", "unlock", "fileExistsAtPath:", "date",
     "appendFormat:", "appendString:",
     "string", "absoluteString", "pathExtension", "lastPathComponent",
     "fileModificationDate", "fileType", "fileSize",

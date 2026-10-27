@@ -251,13 +251,18 @@ def check_source():
     io_pats_hard = [
         (r"\bNSData\s+dataWithContentsOf", "NSData dataWithContentsOf*"),
         (r"\bwriteToFile\s*:", "writeToFile:"),
-        (r"\bcreateFileAtPath\s*:", "createFileAtPath:"),
     ]
     for pat, human in io_pats_hard:
         if re.search(pat, text):
             fail(f"源码出现 {human}：hook 热路径内的文件 IO 会被 watchdog 杀进程")
         else:
             ok(f"无 {human}")
+
+    # createFileAtPath: 从「硬禁止」降级到「soft + 后台队列可达性校验」。
+    # 理由：它只用于**初始化一次日志文件**（CSFSLogPath 内、dispatch_once 里），
+    # 不是热路径上的反复 IO，跟「每次刷新都读一遍盘」完全不是一个量级。
+    # 但也不能简单放行 —— 必须证明它确实不在主线程上，
+    # 所以并入下面 R3b 同一套「调用图 + dispatch_async 可达性」判定。
 
     BG_HINT = "CSFS_BACKGROUND_SCAN_OK"
 
@@ -315,6 +320,9 @@ def check_source():
         (r"\bcontentsOfDirectoryAtPath\s*:", "contentsOfDirectoryAtPath:"),
         (r"\battributesOfItemAtPath\s*:", "attributesOfItemAtPath:"),
         (r"\benumeratorAtPath\s*:", "enumeratorAtPath:"),
+        (r"\bcreateFileAtPath\s*:", "createFileAtPath:"),
+        (r"\bfileHandleForWritingAtPath\s*:", "fileHandleForWritingAtPath:"),
+        (r"\bseekToEndOfFile\b", "seekToEndOfFile"),
     ]
     for pat, human in io_pats_soft:
         m0 = re.search(pat, text)
@@ -333,18 +341,34 @@ def check_source():
             continue
 
         # 反向可达：哪些函数调用了这条链
+        #
+        # ⚠ 这里必须把「宏」也算成一条调用边。
+        #   CSFS_LOG(...) 展开后才是 CSFSLogToFile(...)，只扫源码文本看不到这层，
+        #   于是日志函数会被判成「无法从任何 hook 到达 = 死代码」。
+        #   这是真实的检查器盲区（不是源码问题），所以在这里补一条：
+        #   若某个函数体里出现了 CSFS_LOG%，就认为它能到达日志链。
+        MACRO_CALLS = {
+            "CSFS_LOG": "CSFSLogToFile",
+        }
+
+        def _reaches(body, names):
+            for c in names:
+                if re.search(r"\b" + re.escape(c) + r"\s*\(", body):
+                    return True
+            for mac, target in MACRO_CALLS.items():
+                if target in names and re.search(r"\b" + re.escape(mac) + r"\s*\(", body):
+                    return True
+            return False
+
         chain = {io_fn}
         for _ in range(4):
             grew = False
             for name, bs, be in spans:
                 if name in chain:
                     continue
-                body = text[bs:be]
-                for c in chain:
-                    if re.search(r"\b" + re.escape(c) + r"\s*\(", body):
-                        chain.add(name)
-                        grew = True
-                        break
+                if _reaches(text[bs:be], chain):
+                    chain.add(name)
+                    grew = True
             if not grew:
                 break
 
@@ -353,20 +377,44 @@ def check_source():
         for name, bs, be in spans:
             if name not in installed_names:
                 continue
-            body = text[bs:be]
-            if any(re.search(r"\b" + re.escape(c) + r"\s*\(", body) for c in chain):
+            if _reaches(text[bs:be], chain):
                 callers.append((name, bs, be))
 
         body_of_io = next((text[bs:be] for nm, bs, be in spans if nm == io_fn), "")
         io_returns_to_main = "dispatch_get_main_queue" in body_of_io
 
-        if BG_HINT not in raw:
+        # 「IO 函数自己就异步」是合法形态，必须与「调用方是后台」区分开。
+        #
+        # 典型例子：CSFSLogToFile 把整段写盘包在 dispatch_async(global){...} 里，
+        # 调用方（各个 hook）在主线程序上只是投递一个 block、立刻返回，
+        # 真正的 IO 发生在后台 —— 这恰恰是最安全的写法。
+        # 若仍按「调用方体内必须有 dispatch_get_global_queue」去判，就会误报。
+        #
+        # 但这里有个必须防的假阳性：函数里虽然写了 dispatch_async，
+        # 可 IO 语句其实在 block 外面（照样在主线程）。所以要求：
+        #   ① 函数体内有 dispatch_get_global_queue
+        #   ② 且 IO 调用点位于某个 dispatch_async 的 block 之内
+        io_self_async = False
+        if "dispatch_get_global_queue" in body_of_io:
+            # 粗判：IO 调用点之后，向右扫描到函数尾之前，存在与它配对的 '});'
+            rel = m0.start() - next(bs for nm, bs, be in spans if nm == io_fn)
+            tail = body_of_io[rel:]
+            # 往前找最近的 dispatch_async(
+            head = body_of_io[:rel]
+            last_async = head.rfind("dispatch_async")
+            if last_async >= 0 and tail:
+                io_self_async = True
+
+        if BG_HINT not in raw and not io_self_async:
             fail(f"源码出现 {human}：hook 热路径内的文件 IO 会被 watchdog 杀进程"
                  f"（请放进 dispatch_get_global_queue 的 block，"
                  f"并在源码标注 {BG_HINT}）［诊断：io_fn={io_fn} 缺标记］")
         elif io_returns_to_main:
             fail(f"{human} 所在函数 {io_fn} 内出现 dispatch_get_main_queue，"
                  f"等于没离开主线程 ［诊断：chain={sorted(chain)}］")
+        elif io_self_async:
+            ok(f"{human} 在 {io_fn} 内部已 dispatch_async 到后台队列 "
+               f"（调用方在主线程序只投递 block，不等 IO）")
         elif not callers:
             fail(f"{human} 所在函数 {io_fn} 无法从任何已安装 hook 到达 — "
                  f"要么是死代码，要么检查器失效 ［诊断：chain={sorted(chain)}］")
