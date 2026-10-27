@@ -563,6 +563,9 @@ static void CSFSArmPending(void) {
             CSFSExportState.shared.pendingSaveToFiles = NO;
             // 顺手复位强制可达，避免窗口残留影响后续正常分享
             gCSFSForceReachable = NO;
+            // v10：转换链若中途死掉（如原生前置失败弹 alert），
+            // 出口永远不会来，必须把「正在生成文件」的 busy 收掉
+            CSFSHideBusy(nil);
         }
     });
 }
@@ -1986,8 +1989,33 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                         (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
                     if (tfn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
                         CSFS_LOG(@"intercepted panel save-to-files tap (row=%ld)", (long)row);
+                        // v10 修正：v9 把 adapter 当 manager 传给 re-dispatch，
+                        // orig 实现内部按 CSShareManager 读 shareModel → 「无法打开该文档」。
+                        // 正确 receiver 是 [self shareManager]（adapter 属性，方法表实证）；
+                        // 并补原生前置 [shareModel setIsShareStyle:1]
+                        // （didSelect 反汇编 0x1018d79f4 mov w2,#1，常量 1）。
+                        id sm = nil;
+                        SEL smsel = NSSelectorFromString(@"shareManager");
+                        if ([self respondsToSelector:smsel]) {
+                            id (*sfn)(id, SEL) =
+                                (id (*)(id, SEL))[self methodForSelector:smsel];
+                            sm = sfn(self, smsel);
+                        }
+                        if (sm) {
+                            SEL stysel = NSSelectorFromString(@"shareModel");
+                            if ([sm respondsToSelector:stysel]) {
+                                id (*mfn)(id, SEL) =
+                                    (id (*)(id, SEL))[sm methodForSelector:stysel];
+                                id model = mfn(sm, stysel);
+                                if (model && [model respondsToSelector:@selector(setIsShareStyle:)]) {
+                                    void (*ifn)(id, SEL, BOOL) =
+                                        (void (*)(id, SEL, BOOL))[model methodForSelector:@selector(setIsShareStyle:)];
+                                    ifn(model, @selector(setIsShareStyle:), YES);
+                                }
+                            }
+                        }
                         // 场景固定为图片转 Word；officeType 用 0x78(Word) 走原生转换链
-                        CSFSBeginSaveToFiles(self, 0x78);
+                        CSFSBeginSaveToFiles(sm, 0x78);
                         return;
                     }
                 }
