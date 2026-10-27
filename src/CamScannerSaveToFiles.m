@@ -2011,40 +2011,54 @@ static void CSFSCollectStrings(id obj, NSMutableArray *out2) {
     }
 }
 
-// 扫 Documents/Caches 找与 docId 相关的 json 文本
+// 扫沙盒找与 docId 相关的缓存文本（v13：放宽扩展名 + 失败时枚举候选）
 static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
     NSString *baseId = docId;
     if ([baseId hasSuffix:@"_wordj"]) {
         baseId = [baseId substringToIndex:baseId.length - 6];
     }
+    NSString *tmpDir = NSTemporaryDirectory();
     NSArray *roots = @[
         [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
         [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject],
+        tmpDir,
     ];
     NSFileManager *fm = [NSFileManager defaultManager];
     __block NSString *best = nil;
     __block NSString *fallback = nil;
+    __block NSMutableArray *jsonSeen = [NSMutableArray array];
     for (NSString *root in roots) {
         if (root.length == 0) continue;
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
         NSString *rel;
         while ((rel = [en nextObject]) != nil) {
-            if (![rel.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
             BOOL isDir = NO;
             NSString *full = [root stringByAppendingPathComponent:rel];
             if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) continue;
-            NSString *name = rel.lastPathComponent;
-            BOOL hitDoc = (baseId.length > 0 && [name containsString:baseId]);
-            BOOL hitWord = ([name.lowercaseString containsString:@"jsonword"] ||
-                            [name.lowercaseString containsString:@"wordj"] ||
-                            [name.lowercaseString containsString:@"jsonWordCache"]);
+            // 深层路径全匹配（不限扩展名）：缓存可能无扩展名
+            BOOL hitDoc = (baseId.length > 4 && [rel containsString:baseId]);
+            BOOL hitWord = ([rel.lowercaseString containsString:@"jsonword"] ||
+                            [rel.lowercaseString containsString:@"wordj"] ||
+                            [rel.lowercaseString containsString:@"jsonwordcache"]);
             if (hitDoc) { best = full; break; }
             if (hitWord && !fallback) fallback = full;
+            // 诊断收集：前 50 个 .json 候选路径
+            if ([rel.pathExtension.lowercaseString isEqualToString:@"json"] &&
+                jsonSeen.count < 50) {
+                [jsonSeen addObject:rel];
+            }
         }
         if (best) break;
     }
+    if (!best && !fallback) {
+        // v13 诊断：列出全部 .json 候选，定位真实缓存位置
+        for (NSString *j in jsonSeen) CSFS_LOG(@"v13 json candidate: %@", j);
+        CSFS_LOG(@"v13 no cache matched (docId=%@, %lu json files in sandbox)",
+                 docId, (unsigned long)jsonSeen.count);
+        return nil;
+    }
     NSString *path = best ?: fallback;
-    if (path.length == 0) return nil;
+    CSFS_LOG(@"v13 cache hit: %@ (by %@)", path, best ? @"docId" : @"keyword");
     NSError *err = nil;
     SEL rsel = NSSelectorFromString(@"stringWithContentsOfFile:encoding:error:");
     NSString *(*rfn)(id, SEL, NSString *, NSUInteger, NSError **) =
