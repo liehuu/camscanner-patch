@@ -6,20 +6,88 @@
 补丁形态是**注入式 dylib**。编译在 GitHub Actions 的 macOS runner 上完成（产物仅 ~140KB），
 **注入与重打包在本机用纯 Python 完成**，不需要 Xcode / clang / codesign，也不需要下载 266MB 的成品 ipa。
 
-> **当前产物**：`dist/CamScanner_7.26.5_SaveToFiles_local.ipa`（192 MB，2026-10-27）
-> 对应 CI run `40439162575`（commit `6bcd9e25`，success）
-> dylib 含 **arm64 + arm64e 双切片**，与主二进制 arm64e 对齐。
+> **当前产物**：`dist/CamScanner_7.26.5_SaveToFiles_local.ipa`（192.1 MB，2026-10-27 v4）
+> 对应 CI run `40443332968`（commit `8434b9ff`，success）
+> dylib 含 **arm64 + arm64e 双切片**（361,016 B），与主二进制 arm64e 对齐。
 
 ---
 
-## 0. v3 版本修了什么（真机反馈驱动）
+## ★ 装完后第一件事：看日志
 
-前两版补丁装上后「完全没反应」。真机反馈推翻静态结论，查出四条根因，
-**全部属于「编译能过、装上无效」类型**，静态检查一条都抓不到：
+v4 开始有**文件日志**，手机上直接可取，不用连电脑、不用 Xcode：
+
+1. 打开「文件」App → 我的 iPhone → **扫描全能王**（LC 里装的这个 app）
+2. 找到 **`CSFS.log`**，长按 → 共享/拷贝出来
+
+日志开头一定是这三行（确认装的是 v4）：
+```
+==========================================================
+CamScannerSaveToFiles v4 loaded (build <日期> <时间>)
+日志位置：App 沙盒 Documents/CSFS.log
+==========================================================
+```
+
+然后关键看这两条：
+```
+★★★ officeFileShareViewData hook=1 ★★★（这是 Word 面板的唯一入口）
+...
+built item ...: title=保存到文件 (wrote=1)
+appended save-to-files entry, total=N
+```
+
+- `hook=1` → 挂点装上了；`hook=0` → 挂点没找到（把日志发我）
+- `wrote=1` → 标题写进去了；`wrote=0` 或出现 `KVC set ... threw` → 是属性名问题
+- `appended ... total=N` → 条目真的进数组了
+- 若点「导出文档」后**完全没有** `officeFileShareViewData` 相关日志
+  → 说明走的是另一个面板，需要重新定位（把日志发我）
+
+---
+
+## 1. 缺陷成因（逆向实证）
+
+---
+
+## 0. 版本演进与根因（四次真机反馈驱动）
+
+### v4（当前）：第四次失败后才找到真正原因 —— hook 挂错了地方
+
+用户第三次反馈仍是「邮件旁边、PDF 分享下方都没有」。把「导出文档」这条路
+完整反汇编一遍后拿到决定性结论：
+
+```
+-exportWordAction 0x1012ee770 → -exportWord 0x1012eea10 → -shareWord 0x1012eec80
+  → -showShareView 0x1018861fc → -showOfficeShareView 0x101888498
+      ├─ -officeFileShareViewData 0x101888534      ← 数据在这里生成
+      └─ +[CSSheetUtil showSingleSheetWithHeadConfig:dataList:...] 0x101888590
+                                          ↑ 数组直接当实参传进去
+```
+
+**这个数组不经过任何 dataSource setter。** 反证：
+
+| selector | 全 App 调用点数 | 调用者 |
+|---|---|---|
+| `setVerticallyListDataSource:` | **2** | 都在 `ISBlockDiversifiedActionSheetView` 的某个 init 内 |
+| `setHorizontallyDataSource:` | **3** | `CSShareHorizontalAdapter` / `CSShareIconItemAdapter` / 同一 init |
+
+**没有一处来自 `CSSheetUtil`。** 所以 v1~v3 一直在 hook 的那两个 setter，
+对这个面板 **100% 不生效**——它们压根不会被调用。
+
+> **最该记住的一句：判断 hook 有没有用，不能只看它「装上了」，要看它「在真实路径上」。**
+> `method_setImplementation` 成功就返回 YES，永远显示成功；
+> 但那条路上可能根本没人走过。前三次失败全部输在这一点。
+
+v4 的三处对应修改：
+
+1. 唯一有效挂点锁定 `-officeFileShareViewData`，并打印 `★★★ hook=1/0 ★★★`
+2. 属性名以**原作者自己的调用**为准（`officeFileShareViewData` 内实证）：
+   `setIdentifyId:`（`w2=0x64`，Swift Int）、`setTitle:`、`setIconImage:`
+3. KVC 失败回退 IMP 直调 —— Swift 类默认不走 `-setValue:forKey:` 自动查找
+
+### v3：真机反馈查出四条根因
 
 | # | 根因 | 为什么查不到 | 后果 |
 |---|---|---|---|
-| A | 条目属性名全错：`title`→**`titleString`**、`identifyId`→**`actionSheetOperationType`**、`iconImage`→**`selectedIcon`/`rightIcon`** | 名字「看着像」，KVC 抛异常被自己 `@catch` 吞掉 | 面板静默不变 |
+| A | 条目属性名写错（KVC 异常被自己 `@catch` 吞掉） | 名字「看着像」 | 面板静默不变 |
 | B | 纵向数据源是**二维数组**，一维 `addObject:` | `cellForRowAtIndexPath:` 分组时走 `data[section][row]` | **崩宿主** |
 | C | 「转换失败」根因是 `Reachability` 误报 `NotReachable` | 转换函数第一步就查网络（`0x101755fb4 cbz`） | 弹「转换失败」 |
 | D | setter 名漏一个 `List`：`setVerticallyDataSource:` 在二进制里**不存在** | 只扫 `adrp+ldr` 得「0 处引用」假结论，实际走 `__objc_stubs` 跳板 | hook 从未装上 |
@@ -28,7 +96,7 @@
 `__objc_stubs` 段里而不在调用点。必须先解析 `__objc_stubs` 建立 `stub地址 → selector名`
 映射，再在 `__text` 找 `bl stub`。我据此差点第二次改错方向。
 
-详见 `扫描全能王_图片转Word_保存到文件_缺陷分析报告.md` 第「三·补」章。
+详见 `扫描全能王_图片转Word_保存到文件_缺陷分析报告.md` 第「三·补」「三·补二」章。
 
 ---
 
