@@ -2034,8 +2034,10 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
         tmpDir,
     ];
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray *cands = [NSMutableArray array];   // @(path)
-    __block NSString *best = nil;
+    NSMutableArray *results = [NSMutableArray array];  // Results 目录候选 @(path)
+    __block NSString *docHit = nil;                    // docId 命中且非图片
+    // 图片扩展：v14 教训——documentThumbnailImages/<docId>.jpg 会抢先命中
+    NSArray *imgExt = @[@"jpg", @"jpeg", @"png", @"gif", @"webp", @"bmp", @"tiff", @"heic"];
     for (NSString *root in roots) {
         if (root.length == 0) continue;
         NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
@@ -2044,27 +2046,31 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
             BOOL isDir = NO;
             NSString *full = [root stringByAppendingPathComponent:rel];
             if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) continue;
-            // ① docId 基段命中（最高优先，立即用）
-            if (baseId.length > 4 && [rel containsString:baseId]) {
-                best = full;
-                break;
+            NSString *ext = rel.pathExtension.lowercaseString;
+            BOOL isImg = [imgExt containsObject:ext];
+            // ① Results 目录下的数据文件（imageToWordResults / imageToExcelResultsNew…）
+            if ([rel containsString:@"Results"] && !isImg) {
+                [results addObject:full];
             }
-            // ② Results 目录下的数据文件（imageToWordResults / imageToExcelResultsNew…）
-            if ([rel containsString:@"Results"]) {
-                [cands addObject:full];
+            // ② docId 基段命中且非图片（备选）
+            if (!docHit && baseId.length > 4 && [rel containsString:baseId] && !isImg) {
+                docHit = full;
             }
         }
-        if (best) break;
     }
-    if (!best && cands.count > 0) {
+    NSString *best = nil;
+    if (results.count > 0) {
         // 按修改时间降序，取最新（用户正在编辑的文档必然是最新生成的）
-        NSArray *sorted = [cands sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSArray *sorted = [results sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
             NSDate *da = [[fm attributesOfItemAtPath:a error:nil] objectForKey:NSFileModificationDate];
             NSDate *db = [[fm attributesOfItemAtPath:b error:nil] objectForKey:NSFileModificationDate];
             return [db compare:da];
         }];
         best = sorted.firstObject;
-        CSFS_LOG(@"v14 candidates=%lu newest=%@", (unsigned long)cands.count, best);
+        CSFS_LOG(@"v15 results=%lu newest=%@", (unsigned long)results.count, best);
+    } else if (docHit) {
+        best = docHit;
+        CSFS_LOG(@"v15 docId hit: %@", best);
     }
     if (!best) {
         CSFS_LOG(@"v13 no cache matched (docId=%@)", docId);
