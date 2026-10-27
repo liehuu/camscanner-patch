@@ -1956,6 +1956,49 @@ static NSArray *CSFS_channelArray(id self, SEL _cmd) {
     }
 }
 
+// ── v9：面板点击拦截 ─────────────────────────────────────────────
+// CSFS(5).log 实证：v8 条目已显示（factory made=1, title=1 type=1），
+// 但点击后零日志 —— 0xE5 在 didSelectCellWithIndexPath: 的原生分派里
+// 被 isSingleOfficeDocument → handleSingleOfficeDocumentShare: 分支吃掉，
+// 根本到不了 shareActionWithOperationTpe:（那里已有 0xE5 拦截却收不到）。
+// 所以在 didSelect 层直接拦：点中 0xE5 → 置 pending → 用 0x78(Word) 走
+// 原生转换 → 文件生成后由 showShareActivityWithFilePath: hook 改道保存。
+static void (*gOrigDidSelectCell)(id, SEL, id) = NULL;
+
+static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
+    @try {
+        if (ip) {
+            NSArray *arr = nil;
+            SEL cas = NSSelectorFromString(@"channelArray");
+            if ([self respondsToSelector:cas]) {
+                NSArray *(*gfn)(id, SEL) =
+                    (NSArray *(*)(id, SEL))[self methodForSelector:cas];
+                arr = gfn(self, cas);
+            }
+            SEL rowsel = NSSelectorFromString(@"row");
+            NSInteger (*rfn)(id, SEL) =
+                (NSInteger (*)(id, SEL))[ip methodForSelector:rowsel];
+            NSInteger row = rfn(ip, rowsel);
+            if (arr && row >= 0 && row < (NSInteger)arr.count) {
+                id it = arr[row];
+                if ([it respondsToSelector:@selector(actionSheetOperationType)]) {
+                    NSInteger (*tfn)(id, SEL) =
+                        (NSInteger (*)(id, SEL))[it methodForSelector:@selector(actionSheetOperationType)];
+                    if (tfn(it, @selector(actionSheetOperationType)) == kCSFSSaveToFilesId) {
+                        CSFS_LOG(@"intercepted panel save-to-files tap (row=%ld)", (long)row);
+                        // 场景固定为图片转 Word；officeType 用 0x78(Word) 走原生转换链
+                        CSFSBeginSaveToFiles(self, 0x78);
+                        return;
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v9 didSelect threw: %@", e.reason);
+    }
+    if (gOrigDidSelectCell) gOrigDidSelectCell(self, _cmd, ip);
+}
+
 static void CSFSInstall(void) {
     if (gCSFSInstalled) return;
 
@@ -2121,6 +2164,15 @@ static void CSFSInstall(void) {
             CSFS_LOG(@"★★★ v7 channelArray hook=%d ★★★（真面板条目来源）", (int)h7);
         } else {
             CSFS_LOG(@"v7 WARN: CSShareCompositionalMainWaysSectionAdapter 未找到");
+        }
+
+        // ── v9 面板点击拦截 ──────────────────────────────────────────
+        if (mainWays) {
+            BOOL h9 = CSFSHookInstance(mainWays,
+                                       NSSelectorFromString(@"didselectCellWithIndexPath:"),
+                                       (IMP)CSFS_didSelectCell,
+                                       (IMP *)&gOrigDidSelectCell);
+            CSFS_LOG(@"v9 didSelectCell hook=%d", (int)h9);
         }
 
         gCSFSInstalled = (gOrigOfficeFileShareViewData != NULL) || anyOCR;
