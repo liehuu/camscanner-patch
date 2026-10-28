@@ -293,6 +293,10 @@ SYSTEM_SELECTORS = {
     "containsObject:", "indexOfObject:", "indexOfObjectIdenticalTo:",
     "firstObject", "lastObject", "componentsJoinedByString:", "sortedArrayUsingSelector:",
     "enumerateObjectsUsingBlock:", "mutableCopy", "arrayByAddingObject:",
+    # v19：CSFSDescribeShape 要把字典的 allKeys 截到前 40 个再拼日志，
+    #      否则 style/attr 的 key 一多日志会爆掉。ks 来自 allKeys，
+    #      静态推断是 id，所以 P5 需要它进白名单。
+    "subarrayWithRange:",
     "objectForKey:", "setObject:forKey:", "removeObjectForKey:", "allKeys", "allValues",
     "length", "UTF8String", "characterAtIndex:", "substringFromIndex:",
     "substringToIndex:", "stringByAppendingString:", "stringByAppendingPathComponent:",

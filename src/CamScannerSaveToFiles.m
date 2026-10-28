@@ -2189,68 +2189,147 @@ static NSString *CSFSNormalizeHexColor(NSString *raw) {
     return s;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// v19：统一取值 + 结构 dump（修 v18 的致命缺陷）
+//
+// v18 为什么什么都没导出来（已用主二进制静态分析证实）：
+//   slice 的 style 属性类型编码是
+//       T@"CSTranslateRawPageSegmentParaSliceStyle",&,N,V_style
+//   即 style 是一个**模型对象**，不是 NSDictionary。
+//   v18 却写 [style objectForKey:@"font_color"] —— 对象上没有
+//   objectForKey:，respondsToSelector 返回 NO，直接走「no style」分支
+//   返回纯文本 run。表现与 v17 一模一样，看不出是两回事。
+//
+//   而 JSON 走 NSJSONSerialization 得到字典，走 YYModel/MJExtension
+//   映射得到对象（二进制里 YYModel 出现 24 次，MJExtension 1 次，
+//   两条路都真实存在）。所以取值必须两态通吃，不能赌其中一种。
+//
+//   [obj valueForKey:] 在 getter 不存在时抛 NSUnknownKeyException，
+//   未捕获即崩宿主 —— 违反本文件设计要点第 2 条。故先 respondsToSelector
+//   再取，外面再包 @try 兜底，双保险。
+// ─────────────────────────────────────────────────────────────────────
+static id CSFSValue(id obj, NSString *key) {
+    if (!obj || key.length == 0) return nil;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        return [(NSDictionary *)obj objectForKey:key];
+    }
+    // 字符串/数字这类叶子节点没有属性可探，直接放弃
+    if ([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]]) {
+        return nil;
+    }
+    SEL sel = NSSelectorFromString(key);
+    if (![obj respondsToSelector:sel]) return nil;
+    @try {
+        return [obj valueForKey:key];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
+// 把任意对象的真实形状写进日志。
+//
+// 这是唯一能在设备上把「style 到底长什么样」定死的手段：
+// 静态分析只能看到全局按字母序合并的属性名池，判不出类归属
+// （font_color / font_face / font_style / font_attribute 在池里相邻，
+//   但相邻只说明名字相近，不说明同属一个类）。
+// 用 class_copyPropertyList 拿的是**这个类自己的**属性表，没有歧义。
+static NSString *CSFSDescribeShape(id obj) {
+    if (!obj) return @"(nil)";
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSArray *ks = [(NSDictionary *)obj allKeys];
+        if (ks.count > 40) ks = [ks subarrayWithRange:NSMakeRange(0, 40)];
+        return [NSString stringWithFormat:@"dict(%lu){%@}",
+                (unsigned long)[(NSDictionary *)obj count],
+                [ks componentsJoinedByString:@","]];
+    }
+    if ([obj isKindOfClass:[NSString class]]) {
+        return [NSString stringWithFormat:@"str(%@)", obj];
+    }
+    if ([obj isKindOfClass:[NSNumber class]]) {
+        return [NSString stringWithFormat:@"num(%@)", obj];
+    }
+    Class cls = [obj class];
+    NSMutableString *out = [NSMutableString stringWithFormat:@"%@{",
+                            NSStringFromClass(cls)];
+    unsigned int n = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &n);
+    unsigned int lim = n < 40 ? n : 40;
+    for (unsigned int i = 0; i < lim; i++) {
+        const char *nm = property_getName(props[i]);
+        const char *at = property_getAttributes(props[i]);
+        if (i) [out appendString:@" "];
+        // 只保留类型编码的 T 段，@ 符号太多会把日志冲爆
+        [out appendFormat:@"%s(%s)", nm ? nm : "?", at ? at : ""];
+    }
+    if (props) free(props);
+    [out appendString:@"}"];
+    return out;
+}
+
 // 把 JSON 里的一个 slice 解析成 run 字典。
 // 解析失败也要返回一个只有文字的 run —— 宁可少格式，不能丢文字。
 //
-// diagnosticPtr：由调用方传入，首次解析到带 style 的 slice 时把它置 YES，
-// 借这一个开关把「真实 JSON 的 style 长什么样」dump 进日志一次。
-// 为什么非要这段：v18 用的字段名（font_color / font_size / font_attribute…）
-// 是从 Mach-O 的 objc 元数据 + ivar 类型编码反推的，**没有经过真实样本确认**。
-// 一旦实际键名不同，格式会静默丢失 —— 表现与 v17 完全一样，无从区分。
-// 有了这段 dump，下一轮能直接看真名，不用再猜。
+// diagnosticPtr：由调用方传入，首次解析时置 YES，把「真实结构」dump 一次。
+// 为什么非要这段：字段名来自 Mach-O objc 元数据反推，键名已证实存在
+// （font_color / font_face / font_style 是 T@"NSString",C,N；
+//   font_attribute 是 T@"CSTranslateRawPageFont"），
+// 但**层级归属**（谁挂在谁下面）无法靠静态分析确定。
+// 这段 dump 一旦拿到日志，就能一次性定死，不用再猜。
 static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
-    if (![sl respondsToSelector:@selector(objectForKey:)]) return nil;
-
-    id t = [sl objectForKey:@"text"];
+    id t = CSFSValue(sl, @"text");
     if (![t isKindOfClass:[NSString class]] || [(NSString *)t length] == 0) return nil;
 
     NSMutableDictionary *run = [NSMutableDictionary dictionaryWithCapacity:8];
     [run setObject:(NSString *)t forKey:kCSFSRunText];
 
-    id style = [sl objectForKey:@"style"];
-    if (![style respondsToSelector:@selector(objectForKey:)]) {
-        if (diagnosticPtr && !*diagnosticPtr) {
-            *diagnosticPtr = YES;
-            CSFS_LOG(@"v18 DIAG no style on slice, keys=%@",
-                     [sl respondsToSelector:@selector(allKeys)] ? [sl allKeys] : @"(n/a)");
-        }
-        return run;
-    }
+    id style = CSFSValue(sl, @"style");
 
     if (diagnosticPtr && !*diagnosticPtr) {
         *diagnosticPtr = YES;
-        CSFS_LOG(@"v18 DIAG first styled slice: text=%@ style=%@",
-                 [(NSString *)t length] > 20
-                    ? [(NSString *)t substringToIndex:20] : (NSString *)t,
-                 [style respondsToSelector:@selector(description)]
-                    ? [style description] : @"(no desc)");
+        CSFS_LOG(@"v19 DIAG slice %@", CSFSDescribeShape(sl));
+        CSFS_LOG(@"v19 DIAG style %@", CSFSDescribeShape(style));
     }
 
-    id c = [style objectForKey:@"font_color"];
+    // 两路候选：style 优先，slice 自己兜底（万一 JSON 是扁平结构）。
+    // style 若是字符串（样式名如 "body"）则不能当取值源，跳过。
+    id sources[2];
+    int nSrc = 0;
+    if (style && ![style isKindOfClass:[NSString class]]) sources[nSrc++] = style;
+    sources[nSrc++] = sl;
+
+    id c = nil, f = nil, szObj = nil, attr = nil;
+    for (int i = 0; i < nSrc; i++) {
+        if (!c)     c     = CSFSValue(sources[i], @"font_color");
+        if (!f)     f     = CSFSValue(sources[i], @"font_face");
+        if (!szObj) szObj = CSFSValue(sources[i], @"font_size");
+        if (!attr)  attr  = CSFSValue(sources[i], @"font_attribute");
+    }
+
     if ([c isKindOfClass:[NSString class]]) {
         NSString *hex = CSFSNormalizeHexColor((NSString *)c);
         if (hex) [run setObject:hex forKey:kCSFSRunColor];
     }
-    id f = [style objectForKey:@"font_face"];
     if ([f isKindOfClass:[NSString class]] && [(NSString *)f length] > 0) {
         [run setObject:(NSString *)f forKey:kCSFSRunFace];
     }
     // 字号合理性检查：OCR 偶尔给出 0 或离谱值（如 1000），
     // 越界的字号在 Word 里会被当成损坏样式，宁可不设。
-    double sz = CSFSDoubleValue([style objectForKey:@"font_size"]);
+    double sz = CSFSDoubleValue(szObj);
     if (sz > 2.0 && sz < 200.0) {
         [run setObject:[NSNumber numberWithDouble:sz] forKey:kCSFSRunSize];
     }
 
-    id attr = [style objectForKey:@"font_attribute"];
-    if ([attr respondsToSelector:@selector(objectForKey:)]) {
-        if (CSFSBoolValue([attr objectForKey:@"bold"])) {
+    // font_attribute 是 CSTranslateRawPageFont 对象（也可能被序列化成字典），
+    // 同样两态通吃。bold/italic/underline 三项的声明类型都是 NSString，
+    // 实际值可能是 "1"/"0"/"true"/"false"，CSFSBoolValue 都已覆盖。
+    if (attr) {
+        if (CSFSBoolValue(CSFSValue(attr, @"bold"))) {
             [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunBold];
         }
-        if (CSFSBoolValue([attr objectForKey:@"italic"])) {
+        if (CSFSBoolValue(CSFSValue(attr, @"italic"))) {
             [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunItalic];
         }
-        if (CSFSBoolValue([attr objectForKey:@"underline"])) {
+        if (CSFSBoolValue(CSFSValue(attr, @"underline"))) {
             [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunUnderline];
         }
     }
@@ -2739,7 +2818,7 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     CSFSCrashTrace("docx18: eocd done");
 
     BOOL ok = [zipData writeToFile:outPath atomically:YES];
-    CSFS_LOG(@"v18 docx written=%d paras=%lu defPt=%.1f size=%lu",
+    CSFS_LOG(@"v19 docx written=%d paras=%lu defPt=%.1f size=%lu",
              (int)ok, (unsigned long)paras.count, defaultPt,
              (unsigned long)zipData.length);
     return ok;
@@ -3043,7 +3122,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             // 保底：通用递归收集
                                             CSFSCollectStrings(parsed, lines);
                                         }
-                                        CSFS_LOG(@"v18 json parsed, %lu 段带样式",
+                                        CSFS_LOG(@"v19 json parsed, %lu 段带样式",
                                                  (unsigned long)styledParas.count);
                                     } else {
                                         // 非 JSON：原文按行切，生成无样式段落
@@ -3130,7 +3209,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             }
                                         }
                                         if (bestCnt > 0) defaultPt = (double)bestKey;
-                                        CSFS_LOG(@"v18 defaultPt=%.1f (样本 %ld 个 run)",
+                                        CSFS_LOG(@"v19 defaultPt=%.1f (样本 %ld 个 run)",
                                                  defaultPt, bestCnt);
                                     }
 
@@ -3139,6 +3218,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     // 若这三个数都是 0，说明字段名对不上，需要看上面的 DIAG dump。
                                     {
                                         long nColor = 0, nBold = 0, nSize = 0, nRun = 0;
+                                        NSDictionary *firstStyled = nil;
                                         for (NSDictionary *pp in styledParas) {
                                             id rs = [pp objectForKey:kCSFSParaRuns];
                                             if (![rs isKindOfClass:[NSArray class]]) continue;
@@ -3147,11 +3227,24 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                 if ([rr objectForKey:kCSFSRunColor]) nColor++;
                                                 if ([[rr objectForKey:kCSFSRunBold] boolValue]) nBold++;
                                                 if ([rr objectForKey:kCSFSRunSize]) nSize++;
+                                                // 留一个「确实带格式」的 run 当样本，
+                                                // 一旦格式仍然丢失，这行日志能直接看出
+                                                // 是「压根没提取到」还是「提取到了但没渲染」。
+                                                if (!firstStyled && [rr count] > 1) {
+                                                    firstStyled = rr;
+                                                }
                                             }
                                         }
-                                        CSFS_LOG(@"v18 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
+                                        CSFS_LOG(@"v19 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
                                                  (unsigned long)styledParas.count,
                                                  nRun, nColor, nBold, nSize);
+                                        if (firstStyled) {
+                                            CSFS_LOG(@"v19 sample run: %@", firstStyled);
+                                        } else {
+                                            // 一个带格式的 run 都没有 —— 字段名或层级对不上，
+                                            // 去看上面的 "v19 DIAG slice / style" 两行。
+                                            CSFS_LOG(@"v19 stats: NO styled run at all");
+                                        }
                                     }
 
                                     // 文件名前缀：取 docId 前 12 字符。
