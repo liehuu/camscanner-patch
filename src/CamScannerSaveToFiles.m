@@ -2079,6 +2079,46 @@ static void (*gOrigDidSelectCell)(id, SEL, id) = NULL;
 // （借道原转换链在 v8-v11 已被三轮真机证伪，不再尝试。）
 static NSString *CSFSXMLEscape(NSString *in) {
     if (in.length == 0) return in;
+
+    // v17：先剔除 XML 1.0 不允许的控制字符，再做实体转义。
+    //
+    // 为什么必须做这一步：XML 1.0 规范（第五版）规定 Char 的合法范围是
+    //   #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    // 也就是说 0x00-0x08 / 0x0B / 0x0C / 0x0E-0x1F 这些字节**根本不能出现在
+    // XML 文档里**，连 &#xB; 这种字符引用都不合法。OCR 出来的文本混进
+    // 一个 0x0C（分页符）或 0x1B，整个 document.xml 就变成非法 XML ——
+    // Word 打开时提示「发现无法读取的内容」，与 ZIP 结构损坏的表现一模一样。
+    //
+    // 只转义 & < > 是不够的：那两个是「必须转义的合法字符」，这里是
+    // 「无论怎么转义都不合法」的字符，唯一办法是丢掉。
+    NSUInteger n = in.length;
+    unichar *buf = (unichar *)malloc(n * sizeof(unichar));
+    if (buf) {
+        [in getCharacters:buf range:NSMakeRange(0, n)];
+        NSUInteger w = 0;
+        for (NSUInteger i = 0; i < n; i++) {
+            unichar c = buf[i];
+            // 丢掉：C0 控制字符（除 \t \n \r）、0x7F、U+FFFE/U+FFFF 等非字符
+            if (c < 0x20) {
+                if (c == 0x09 || c == 0x0A || c == 0x0D) buf[w++] = c;
+            } else if (c == 0x7F) {
+                // DEL，XML 1.0 允许但 Word 会当作乱码，一并丢掉
+            } else if (c == 0xFFFE || c == 0xFFFF) {
+                // Unicode 非字符，XML 不允许
+            } else {
+                buf[w++] = c;
+            }
+        }
+        in = [NSString stringWithCharacters:buf length:w];
+        free(buf);
+    }
+    if (in.length == 0) return in;
+
+    // 把 \r\n / \r 统一成 \n：w:t 里的裸 \r 会被 Word 渲染成方块，
+    // 而 \n 在多行文本里应当由外层拆成独立的 <w:p/>（见 CSFSWriteDocx）。
+    in = [in stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
+    in = [in stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+
     NSMutableString *m = [in mutableCopy];
     NSString *ampE = @"&" @"amp;";
     NSString *ltE  = @"&" @"lt;";
@@ -2254,38 +2294,119 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
     return bestText;
 }
 
+// ── v17：自写 ZIP 写出器（放弃 SSZipArchive）────────────────────────────
+//
+// 【为什么必须换掉 SSZipArchive】
+// CSFS(12) 真机反馈：文档能导出，但 Word 打开弹「发现无法读取的内容，
+// 是否恢复？」，点「是」之后只剩纯文本、格式全丢。
+//
+// 把真机产物逐字节拆开，问题根本不在 XML（XML 完全合规），而在 ZIP 封装层：
+//     每个条目：version=45(Zip64)、flag=0x0808、crc=0、
+//               csize/usize=0xFFFFFFFF、带 Zip64 extra 但里面是 0
+//     整个文件：**没有** Zip64 EOCD record (PK\x06\x06)
+//               **没有** Zip64 EOCD locator (PK\x06\x07)
+// 也就是说：声明用了 Zip64，却没有 Zip64 的收尾结构，这个包自身是矛盾的。
+//
+// 这是 SSZipArchive 流式 API（writeData:filename:withPassword:）的固有行为 ——
+// 它边写边压，写之前不知道最终大小和 CRC，只能先写占位符 + data descriptor
+// 事后回填。库内部按 Zip64 路径走，大小却回填成 0。
+// Word 的 OPC 解析器对 Zip64 支持很弱，一遇到就判损坏 → 走「修复」流程 →
+// 修复只抢救得出文字，格式（样式/段落属性）全部丢失。
+//
+// docx 只有 4 个部件、总计几 KB，根本不需要 Zip64，也不需要压缩。
+// 所以这里直接按 ZIP 规范手写：store（不压缩）+ 32 位大小 + 无 data descriptor。
+// 每写一个部件前，数据已经在内存里，CRC 和长度都是已知的，不需要任何占位回填。
+//
+// 为什么用 store 而不是 deflate：
+//   · 省掉 zlib 调用，不会引入 zlib 依赖；
+//   · docx 总大小几 KB，压不压无所谓；
+//   · store 没有压缩流状态，出错面最小。
+//   Word / WPS / Pages / LibreOffice 都接受 store 型 docx（EPUB 同理）。
+
+// ZIP 用的 CRC-32（IEEE 802.3，多项式 0xEDB88320 的反序查表实现）。
+// 手写而不是调 zlib crc32()：避免为一个 20 行的函数引入 libz 链接。
+static unsigned long CSFSCrc32(const unsigned char *buf, size_t len) {
+    static unsigned long table[256];
+    static BOOL inited = NO;
+    if (!inited) {
+        for (unsigned long i = 0; i < 256; i++) {
+            unsigned long c = i;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xEDB88320UL ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        inited = YES;
+    }
+    unsigned long crc = 0xFFFFFFFFUL;
+    for (size_t i = 0; i < len; i++) {
+        crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFUL;
+}
+
+// 小端写入辅助（ZIP 全部是小端）
+static void CSFSWriteLE16(NSMutableData *d, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+    [d appendBytes:b length:2];
+}
+static void CSFSWriteLE32(NSMutableData *d, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF),
+                     (uint8_t)((v >> 16) & 0xFF), (uint8_t)((v >> 24) & 0xFF) };
+    [d appendBytes:b length:4];
+}
+
+// 往 ZIP 里追加一个 store 条目。
+//   zipData : 累积的 ZIP 字节
+//   name    : 条目路径（必须用 '/' 分隔，不能以 '/' 开头）
+//   content : 原始字节
+// 同时把 central directory 记录追加到 cd 里。
+static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
+                            NSString *name, NSData *content) {
+    NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
+    const unsigned char *bytes = (const unsigned char *)content.bytes;
+    uint32_t crc = (uint32_t)CSFSCrc32(bytes, (size_t)content.length);
+    uint32_t usize = (uint32_t)content.length;
+    uint32_t offset = (uint32_t)zipData.length;
+
+    // ── Local file header ──
+    CSFSWriteLE32(zipData, 0x04034b50);   // signature "PK\3\4"
+    CSFSWriteLE16(zipData, 20);           // version needed = 2.0（**不用 45/Zip64**）
+    CSFSWriteLE16(zipData, 0);            // flags = 0（无 data descriptor、无加密）
+    CSFSWriteLE16(zipData, 0);            // method = 0 (store)
+    CSFSWriteLE16(zipData, 0);            // mod time（固定值，避免引入时间依赖）
+    CSFSWriteLE16(zipData, 0x21);         // mod date = 1980-01-01（DOS 纪元最小值）
+    CSFSWriteLE32(zipData, crc);
+    CSFSWriteLE32(zipData, usize);        // csize == usize（store）
+    CSFSWriteLE32(zipData, usize);
+    CSFSWriteLE16(zipData, (uint16_t)nameData.length);
+    CSFSWriteLE16(zipData, 0);            // extra len = 0（**关键：不带 Zip64 extra**）
+    [zipData appendData:nameData];
+    [zipData appendData:content];
+
+    // ── Central directory record ──
+    CSFSWriteLE32(cd, 0x02014b50);        // signature "PK\1\2"
+    CSFSWriteLE16(cd, 20);                // version made by
+    CSFSWriteLE16(cd, 20);                // version needed
+    CSFSWriteLE16(cd, 0);                 // flags
+    CSFSWriteLE16(cd, 0);                 // method = store
+    CSFSWriteLE16(cd, 0);                 // mod time
+    CSFSWriteLE16(cd, 0x21);              // mod date
+    CSFSWriteLE32(cd, crc);
+    CSFSWriteLE32(cd, usize);
+    CSFSWriteLE32(cd, usize);
+    CSFSWriteLE16(cd, (uint16_t)nameData.length);
+    CSFSWriteLE16(cd, 0);                 // extra len
+    CSFSWriteLE16(cd, 0);                 // comment len
+    CSFSWriteLE16(cd, 0);                 // disk number start
+    CSFSWriteLE16(cd, 0);                 // internal attrs
+    CSFSWriteLE32(cd, 0);                 // external attrs
+    CSFSWriteLE32(cd, offset);            // local header offset
+    [cd appendData:nameData];
+}
+
 static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
     CSFSCrashTrace("docx: enter");
-    Class zipCls = NSClassFromString(@"SSZipArchive");
-    if (!zipCls) {
-        CSFS_LOG(@"v12 WARN: SSZipArchive 未注册");
-        return NO;
-    }
-    // v16：这里不再走 methodForSelector: + IMP 直调。
-    // 原写法 `((id(*)(id,SEL,NSString*))methodImp)([[zipCls alloc] init], initSel, outPath)`
-    // 把 +1 的临时对象当实参传，没有任何强引用持有它，ARC 在语句结束即释放，
-    // initWithPath: 返回的仍是同一个对象 → zip 变悬空指针 →
-    // 下一行 respondsToSelector: 直接 EXC_BAD_ACCESS（这就是 v15 闪退）。
-    // 改成协议消息发送后，init 语义由编译器识别，生命周期正确。
-    id<CSFSZipArchive> zip = nil;
-    if ([zipCls instancesRespondToSelector:NSSelectorFromString(@"initWithPath:")]) {
-        zip = [(id<CSFSZipArchive>)[zipCls alloc] initWithPath:outPath];
-    }
-    if (!zip) {
-        CSFS_LOG(@"v12 WARN: SSZipArchive alloc 失败");
-        return NO;
-    }
-    CSFSCrashTrace("docx: zip obj created");
-    if (![zip respondsToSelector:NSSelectorFromString(@"open")] ||
-        ![zip respondsToSelector:NSSelectorFromString(@"writeData:filename:withPassword:")]) {
-        CSFS_LOG(@"v12 WARN: SSZipArchive 方法缺失");
-        return NO;
-    }
-    if (![zip open]) {
-        CSFS_LOG(@"v12 WARN: SSZipArchive open 失败 path=%@", outPath);
-        return NO;
-    }
-    CSFSCrashTrace("docx: zip opened");
 
     NSMutableString *body = [NSMutableString string];
     for (NSString *line in lines) {
@@ -2304,41 +2425,79 @@ static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
         @"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
         @"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
         @"<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        @"<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
         @"</Types>";
     NSString *relsXml =
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
         @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
         @"</Relationships>";
+    // word/document.xml 的 rels：把 styles.xml 挂上去。
+    //
+    // 为什么必须有：不给 document.xml 挂 styles 关系、不给默认字体，
+    // Word 会认为这份文档「没有任何样式信息」——这正是用户反馈的
+    // 「点『是』恢复之后只剩纯文本、格式全丢」的观感来源。
+    // 一份最小可用的 docx 应当带上 Normal 样式与默认字号字体。
     NSString *docRelsXml =
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
         @"</Relationships>";
+    // 最小样式表：docDefaults 定默认字号/字体（小四 12pt、宋体+等线回退），
+    // 再定义 Normal。没有 docDefaults 时不同 Word 版本回退行为不一致，
+    // 中文可能被渲染成日文字形或丢掉中文字体。
+    NSString *stylesXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        @"<w:docDefaults><w:rPrDefault><w:rPr>"
+        @"<w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\" w:eastAsia=\"宋体\" w:cs=\"Calibri\"/>"
+        @"<w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/>"
+        @"<w:lang w:val=\"en-US\" w:eastAsia=\"zh-CN\" w:bidi=\"ar-SA\"/>"
+        @"</w:rPr></w:rPrDefault>"
+        @"<w:pPrDefault><w:pPr><w:spacing w:after=\"80\" w:line=\"300\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault>"
+        @"</w:docDefaults>"
+        @"<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        @"<w:name w:val=\"Normal\"/><w:qFormat/>"
+        @"<w:pPr><w:spacing w:after=\"80\" w:line=\"300\" w:lineRule=\"auto\"/></w:pPr>"
+        @"</w:style>"
+        @"</w:styles>";
 
-    [zip writeData:[ctXml dataUsingEncoding:NSUTF8StringEncoding]
-          filename:@"[Content_Types].xml"
-      withPassword:nil];
-    CSFSCrashTrace("docx: wrote [Content_Types].xml");
-    [zip writeData:[relsXml dataUsingEncoding:NSUTF8StringEncoding]
-          filename:@"_rels/.rels"
-      withPassword:nil];
-    [zip writeData:[docRelsXml dataUsingEncoding:NSUTF8StringEncoding]
-          filename:@"word/_rels/document.xml.rels"
-      withPassword:nil];
-    [zip writeData:[docXml dataUsingEncoding:NSUTF8StringEncoding]
-          filename:@"word/document.xml"
-      withPassword:nil];
-    CSFSCrashTrace("docx: wrote all parts, closing");
-    [zip close];
-    CSFSCrashTrace("docx: closed");
+    // 部件顺序有讲究：OPC 规范建议 [Content_Types].xml 放第一个（不是强制，
+    // 但所有主流实现都这么做，放第一个对宽松解析器更友好）。
+    NSMutableData *zipData = [NSMutableData dataWithCapacity:4096];
+    NSMutableData *cd = [NSMutableData dataWithCapacity:512];
+    CSFSZipAddEntry(zipData, cd, @"[Content_Types].xml",
+                    [ctXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSCrashTrace("docx: ct added");
+    CSFSZipAddEntry(zipData, cd, @"_rels/.rels",
+                    [relsXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/_rels/document.xml.rels",
+                    [docRelsXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/styles.xml",
+                    [stylesXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/document.xml",
+                    [docXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSCrashTrace("docx: parts added");
 
-    NSFileManager *fm2 = [NSFileManager defaultManager];
-    BOOL ok = [fm2 fileExistsAtPath:outPath];
-    NSDictionary *attr = [fm2 attributesOfItemAtPath:outPath error:nil];
-    unsigned long long fsz = 0;
-    NSNumber *szn = [attr objectForKey:NSFileSize];
-    if ([szn isKindOfClass:[NSNumber class]]) fsz = [szn unsignedLongLongValue];
-    CSFS_LOG(@"v12 docx written=%d size=%llu", (int)ok, fsz);
+    // ── End of central directory ──
+    uint32_t cdSize = (uint32_t)cd.length;
+    uint32_t cdOffset = (uint32_t)zipData.length;
+    NSUInteger entryCount = 5;
+    [zipData appendData:cd];
+    CSFSWriteLE32(zipData, 0x06054b50);              // "PK\5\6"
+    CSFSWriteLE16(zipData, 0);                       // this disk
+    CSFSWriteLE16(zipData, 0);                       // disk with CD
+    CSFSWriteLE16(zipData, (uint16_t)entryCount);    // entries on this disk
+    CSFSWriteLE16(zipData, (uint16_t)entryCount);    // total entries
+    CSFSWriteLE32(zipData, cdSize);
+    CSFSWriteLE32(zipData, cdOffset);
+    CSFSWriteLE16(zipData, 0);                       // comment length
+    CSFSCrashTrace("docx: eocd done");
+
+    // 一次性写出：不用 NSFileHandle 分段写，避免半成品文件
+    BOOL ok = [zipData writeToFile:outPath atomically:YES];
+    CSFS_LOG(@"v17 docx store-zip written=%d entries=%lu size=%lu",
+             (int)ok, (unsigned long)entryCount, (unsigned long)zipData.length);
     return ok;
 }
 

@@ -250,7 +250,6 @@ def check_source():
     # 「默认禁止，后台队列显式豁免」。
     io_pats_hard = [
         (r"\bNSData\s+dataWithContentsOf", "NSData dataWithContentsOf*"),
-        (r"\bwriteToFile\s*:", "writeToFile:"),
     ]
     for pat, human in io_pats_hard:
         if re.search(pat, text):
@@ -258,15 +257,29 @@ def check_source():
         else:
             ok(f"无 {human}")
 
-    # createFileAtPath: 从「硬禁止」降级到「soft + 后台队列可达性校验」。
-    # 理由：它只用于**初始化一次日志文件**（CSFSLogPath 内、dispatch_once 里），
-    # 不是热路径上的反复 IO，跟「每次刷新都读一遍盘」完全不是一个量级。
-    # 但也不能简单放行 —— 必须证明它确实不在主线程上，
-    # 所以并入下面 R3b 同一套「调用图 + dispatch_async 可达性」判定。
+    # writeToFile: 从「硬禁止」降级到「soft + 后台队列可达性校验」（v17）。
+    #
+    # 历史：这条规则原本是无条件禁止，抓的是「hook 里直接往磁盘写」这种
+    # 必然拖死主线程的写法。但 v17 要在内存里拼好整个 docx 后一次性落盘
+    # （`[zipData writeToFile:atomically:YES]`），这是**最安全**的写法 ——
+    # 一次系统调用写完，不会产生半成品文件。v17 之前用 SSZipArchive
+    # 分段写，产物是 Zip64 残包，Word 打不开，问题更大。
+    #
+    # 所以改成与 createFileAtPath: 同一套判定：不无条件放行，
+    # 而是要求「从已安装 hook 到它这条链上，hook 体内必须有
+    # dispatch_get_global_queue」—— 用检查器证明它确实在后台跑。
+    #
+    # ⚠ 教训（2026-10-28）：这段注释下方原本还写了一份 io_pats_soft 列表，
+    #   与 R3b 里那份重名，Python 后赋值覆盖前者 → writeToFile: 规则实际
+    #   从未执行，却一直显示 47 项 OK。**检查器自己静默失效**是最危险的情况：
+    #   它给出的「通过」是假的，比不检查更有害。
+    #   现在全文只允许存在一份列表定义，位置在 R3b 段内。
 
+    # 后台队列豁免标记：源码里显式标注后，检查器可跳过「必须可达
+    # dispatch_get_global_queue」这一条（仅用于确有正当理由的特例）。
     BG_HINT = "CSFS_BACKGROUND_SCAN_OK"
 
-    # ── R3b: 目录扫描类 IO 的「必须在后台队列」校验 ────────────────────
+    # ── R3b: 目录扫描 / 文件写出类 IO 的「必须在后台队列」校验 ────────────
     #
     # 这段逻辑前后重写了四遍，前几版都是「往回看 N 个字符找 dispatch_async」，
     # 全部失败。失败原因值得记下来，因为它是这类静态检查的通病：
@@ -323,6 +336,7 @@ def check_source():
         (r"\bcreateFileAtPath\s*:", "createFileAtPath:"),
         (r"\bfileHandleForWritingAtPath\s*:", "fileHandleForWritingAtPath:"),
         (r"\bseekToEndOfFile\b", "seekToEndOfFile"),
+        (r"\bwriteToFile\s*:", "writeToFile:"),
     ]
     for pat, human in io_pats_soft:
         m0 = re.search(pat, text)

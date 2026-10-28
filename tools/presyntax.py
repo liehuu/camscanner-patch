@@ -299,6 +299,9 @@ SYSTEM_SELECTORS = {
     "stringByAppendingPathExtension:", "stringByDeletingLastPathComponent",
     "stringByDeletingPathExtension", "hasPrefix:", "hasSuffix:", "containsString:",
     "rangeOfString:", "stringByReplacingOccurrencesOfString:withString:",
+    # v17：XML 非法控制字符过滤需要按 unichar 批量读写，
+    #      比逐字符 substringWithRange: 快一个数量级（OCR 文本动辄上万字）。
+    "getCharacters:range:", "stringWithCharacters:length:",
     "lowercaseString", "uppercaseString", "dataUsingEncoding:", "writeToFile:atomically:",
     "writeToURL:atomically:", "fileExistsAtPath:", "isEqualToString:",
     "componentsSeparatedByString:", "pathExtension", "stringValue", "integerValue",
@@ -426,6 +429,8 @@ SYSTEM_SELECTORS = {
     # v16：mtime 排序用（平行数组 + 选择排序，规避 block 参数类型不兼容）
     "timeIntervalSince1970", "numberWithDouble:", "doubleValue",
     "exchangeObjectAtIndex:withObjectAtIndex:", "arrayWithCapacity:",
+    # v17：自写 store 型 ZIP（NSMutableData 字节级拼装）
+    "dataWithCapacity:", "appendBytes:length:", "appendData:", "bytes",
     "initForExportingURLs:asCopy:", "allowsMultipleSelection",
     # NSAttributedString / NSMutableString 的标准初始化与构造（Foundation 官方 API）
     "initWithString:", "attributedStringWithString:",
