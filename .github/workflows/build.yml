@@ -95,6 +95,12 @@ jobs:
           # 声明顺序：C 无 Hoisting，定义晚于使用就是编译错误。
           # 单独一项，因为上面 6 项都查不到它（括号是平的、块是配的、selector 也是可知的）。
           python3 tools/decl_order.py src/CamScannerSaveToFiles.m
+          # 生成的 docx 能否被 Word 打开，是这套 dylib 唯一真正的交付判据。
+          # v18/v19 两轮都编译通过、lint 全绿、特征串全中，真机导出的文件
+          # 却打不开 —— 因为缺陷在 XML 结构层，编译器看不见。
+          # 本项直接读 .m 里的字符串字面量，断言 <w:p> 包裹、rPr 顺序、
+          # pgMar 必需属性。放这里，编不过的东西不许编。
+          python3 tools/check_render_c.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |
