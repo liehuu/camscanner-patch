@@ -378,6 +378,10 @@ SYSTEM_SELECTORS = {
     # 字典字面量 / 数字
     "dictionaryWithObjects:forKeys:count:", "arrayWithObjects:count:",
     "numberWithInteger:", "numberWithBool:", "numberWithDouble:", "boolValue",
+    # v18：带样式段落用 NSMutableDictionary 承载（不用 C struct 装箱，
+    # 理由见源码 v18 注释：ARC 管不到 NSValue 缓冲区里的对象指针）
+    "dictionaryWithCapacity:", "arrayWithObject:",
+    "numberWithLong:", "longValue", "doubleValue",
     # 其它常用
     "hideAnimated:afterDelay:", "systemImageNamed:", "array", "arrayWithCapacity:",
     "addObserverForName:object:queue:usingBlock:", "addObserverForName:",

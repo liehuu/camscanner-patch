@@ -2077,6 +2077,186 @@ static void (*gOrigDidSelectCell)(id, SEL, id) = NULL;
 // 但 JSON Word 内容就在本地（编辑页可见，jsonWordCache）。
 // v12：扫描沙盒找 jsonWordCache → 提取文本 → 本地生成最小 .docx → picker。
 // （借道原转换链在 v8-v11 已被三轮真机证伪，不再尝试。）
+
+// ── v18：保留排版 ────────────────────────────────────────────────────
+//
+// v17 的 docx 能用 Word 正常打开了，但内容全是一个格式（默认宋体小四）。
+// 用户对比截图指出：原文里「刚刚」是蓝色、「国家统计局官网」是大号加粗、
+// 「我收入没达标，得加油」是红色加粗、表格数字分列 —— 导出后全变黑体小字。
+//
+// 根因不在 docx 生成，而在**解析阶段就丢了信息**：
+//   v14~v17 的解析只取 slices[].text，slice 里的 style 对象整个扔掉，
+//   到 CSFSWriteDocx 时手上只剩一串 NSString，格式早已不存在。
+//
+// 样式字段是从二进制里反查出来的（objc 元数据 + ivar 类型编码），
+// 不是猜的：
+//   CSTranslateRawPageSegmentParaSlice
+//     ├ text            NSString   文本
+//     ├ stype           NSString   片段类型
+//     ├ style           CSTranslateRawPageSegmentParaSliceStyle
+//     │   ├ font_color      NSString   颜色（如 "#FF0000"）
+//     │   ├ font_face       NSString   字体名
+//     │   ├ font_size       NSNumber   字号（pt）
+//     │   └ font_attribute  CSTranslateRawPageFont
+//     │        ├ bold       NSString   "1"/"true" 等
+//     │        ├ italic     NSString
+//     │        └ underline  NSString
+//     └ break_line      long       是否换行
+//   CSTranslateRawPageSegmentPara
+//     ├ justification   NSString   对齐（left/center/right/justify）
+//     ├ line_gap        float      行距
+//     └ paragraph_gap   float      段距
+//
+// 所以 v18 把中间表示从「NSString 数组」换成「字典组成的段落结构」，
+// 解析时把 style 一并带出来，生成时按 run 逐个写 <w:rPr>。
+//
+// ⚠ 为什么用 NSDictionary 而不是 C struct：
+//   最初写成 `typedef struct { NSString *text; ... } CSFSStyleRun`，
+//   再用 `[NSValue valueWithBytes:&r objCType:@encode(...)]` 装箱。问题是：
+//     ① ARC 只管 struct **局部变量**里的对象字段，一旦 memcpy 进 NSValue
+//        的缓冲区，ARC 就看不见这些引用 - 理论上存在被提前释放的风险；
+//     ② 要额外声明 getValue: / valueWithBytes:objCType: 等一串白名单，
+//        每加一个字段就要多维护一行，容易漏。
+//   这是注入 dylib，崩宿主是不可接受的结果，所以宁可多几个字典开销，
+//   换成全 ARC 管理的 NSDictionary。段落本身用 NSMutableDictionary，
+//   run 数组存 NSMutableDictionary，键名常量集中定义（见下）。
+
+// run 的键
+static NSString *const kCSFSRunText      = @"t";
+static NSString *const kCSFSRunColor     = @"c";
+static NSString *const kCSFSRunFace      = @"f";
+static NSString *const kCSFSRunSize      = @"s";
+static NSString *const kCSFSRunBold      = @"b";
+static NSString *const kCSFSRunItalic    = @"i";
+static NSString *const kCSFSRunUnderline = @"u";
+// 段落的键
+static NSString *const kCSFSParaRuns     = @"runs";
+static NSString *const kCSFSParaAlign    = @"jc";
+
+// 从 JSON 的布尔字段取值。
+// 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
+// 但也可能是 NSNumber。两种都吃，避免因类型判断写死而在某版本静默失效。
+static BOOL CSFSBoolValue(id v) {
+    if (!v) return NO;
+    if ([v isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)v boolValue];
+    }
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v lowercaseString];
+        return ([s isEqualToString:@"1"] || [s isEqualToString:@"true"] ||
+                [s isEqualToString:@"yes"]);
+    }
+    return NO;
+}
+
+// 从 JSON 取 double。字段可能是 NSNumber，也可能是数字字符串。
+static double CSFSDoubleValue(id v) {
+    if (!v) return 0;
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v doubleValue];
+    if ([v isKindOfClass:[NSString class]]) return [(NSString *)v doubleValue];
+    return 0;
+}
+
+// 颜色归一化：把各种可能的写法统一成 6 位大写 RRGGBB。
+// 支持 #RRGGBB / #RGB / 0xRRGGBB / RRGGBB / RRGGBBAA / AARRGGBB。
+// 返回 nil 表示"没有可用颜色"，调用方应回退到默认黑色。
+static NSString *CSFSNormalizeHexColor(NSString *raw) {
+    if (raw.length == 0) return nil;
+    NSString *s = raw;
+    // 去前缀
+    if ([s hasPrefix:@"#"]) s = [s substringFromIndex:1];
+    else if ([s hasPrefix:@"0x"] || [s hasPrefix:@"0X"]) s = [s substringFromIndex:2];
+    s = [s uppercaseString];
+    if (s.length == 3) {
+        // #RGB → RRGGBB
+        unichar a = [s characterAtIndex:0], b = [s characterAtIndex:1], c = [s characterAtIndex:2];
+        return [NSString stringWithFormat:@"%c%c%c%c%c%c", a, a, b, b, c, c];
+    }
+    if (s.length == 8) {
+        // 两种排布都可能：RRGGBBAA 或 AARRGGBB。
+        // 判断依据：如果前两位是 FF 且后六位不是 FF...FF，多半是 AARRGGBB；
+        // 但这不可靠。这里采用更常见的 AARRGGBB（Android/服务端惯例）。
+        // 若首位 alpha 为 FF（不透明），取后 6 位；否则也取后 6 位（忽略透明度）。
+        s = [s substringFromIndex:2];
+    }
+    if (s.length != 6) return nil;
+    // 只接受十六进制字符；有非法字符就判定无效，交给调用方回退
+    for (NSUInteger i = 0; i < 6; i++) {
+        unichar ch = [s characterAtIndex:i];
+        BOOL hex = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F');
+        if (!hex) return nil;
+    }
+    return s;
+}
+
+// 把 JSON 里的一个 slice 解析成 run 字典。
+// 解析失败也要返回一个只有文字的 run —— 宁可少格式，不能丢文字。
+//
+// diagnosticPtr：由调用方传入，首次解析到带 style 的 slice 时把它置 YES，
+// 借这一个开关把「真实 JSON 的 style 长什么样」dump 进日志一次。
+// 为什么非要这段：v18 用的字段名（font_color / font_size / font_attribute…）
+// 是从 Mach-O 的 objc 元数据 + ivar 类型编码反推的，**没有经过真实样本确认**。
+// 一旦实际键名不同，格式会静默丢失 —— 表现与 v17 完全一样，无从区分。
+// 有了这段 dump，下一轮能直接看真名，不用再猜。
+static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
+    if (![sl respondsToSelector:@selector(objectForKey:)]) return nil;
+
+    id t = [sl objectForKey:@"text"];
+    if (![t isKindOfClass:[NSString class]] || [(NSString *)t length] == 0) return nil;
+
+    NSMutableDictionary *run = [NSMutableDictionary dictionaryWithCapacity:8];
+    [run setObject:(NSString *)t forKey:kCSFSRunText];
+
+    id style = [sl objectForKey:@"style"];
+    if (![style respondsToSelector:@selector(objectForKey:)]) {
+        if (diagnosticPtr && !*diagnosticPtr) {
+            *diagnosticPtr = YES;
+            CSFS_LOG(@"v18 DIAG no style on slice, keys=%@",
+                     [sl respondsToSelector:@selector(allKeys)] ? [sl allKeys] : @"(n/a)");
+        }
+        return run;
+    }
+
+    if (diagnosticPtr && !*diagnosticPtr) {
+        *diagnosticPtr = YES;
+        CSFS_LOG(@"v18 DIAG first styled slice: text=%@ style=%@",
+                 [(NSString *)t length] > 20
+                    ? [(NSString *)t substringToIndex:20] : (NSString *)t,
+                 [style respondsToSelector:@selector(description)]
+                    ? [style description] : @"(no desc)");
+    }
+
+    id c = [style objectForKey:@"font_color"];
+    if ([c isKindOfClass:[NSString class]]) {
+        NSString *hex = CSFSNormalizeHexColor((NSString *)c);
+        if (hex) [run setObject:hex forKey:kCSFSRunColor];
+    }
+    id f = [style objectForKey:@"font_face"];
+    if ([f isKindOfClass:[NSString class]] && [(NSString *)f length] > 0) {
+        [run setObject:(NSString *)f forKey:kCSFSRunFace];
+    }
+    // 字号合理性检查：OCR 偶尔给出 0 或离谱值（如 1000），
+    // 越界的字号在 Word 里会被当成损坏样式，宁可不设。
+    double sz = CSFSDoubleValue([style objectForKey:@"font_size"]);
+    if (sz > 2.0 && sz < 200.0) {
+        [run setObject:[NSNumber numberWithDouble:sz] forKey:kCSFSRunSize];
+    }
+
+    id attr = [style objectForKey:@"font_attribute"];
+    if ([attr respondsToSelector:@selector(objectForKey:)]) {
+        if (CSFSBoolValue([attr objectForKey:@"bold"])) {
+            [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunBold];
+        }
+        if (CSFSBoolValue([attr objectForKey:@"italic"])) {
+            [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunItalic];
+        }
+        if (CSFSBoolValue([attr objectForKey:@"underline"])) {
+            [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunUnderline];
+        }
+    }
+    return run;
+}
+
 static NSString *CSFSXMLEscape(NSString *in) {
     if (in.length == 0) return in;
 
@@ -2405,6 +2585,166 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
     [cd appendData:nameData];
 }
 
+// v18：把一段段落字典渲染成 <w:p>…</w:p>。
+//
+// Word 的字号单位是「半磅」(half-point)，所以 pt × 2。
+// 颜色写成 <w:color w:val="FF0000"/>，不带 # 号，否则 Word 会忽略这个属性。
+static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
+    NSMutableString *out = [NSMutableString string];
+
+    // 段落属性：对齐。
+    // 只在确有必要时写 <w:pPr>，避免产出大量空属性块。
+    id align = [para objectForKey:kCSFSParaAlign];
+    if ([align isKindOfClass:[NSString class]] && [(NSString *)align length] > 0) {
+        [out appendFormat:@"<w:pPr><w:jc w:val=\"%@\"/></w:pPr>", align];
+    }
+
+    id runs = [para objectForKey:kCSFSParaRuns];
+    if (![runs isKindOfClass:[NSArray class]] || [(NSArray *)runs count] == 0) {
+        [out appendString:@"<w:r><w:t xml:space=\"preserve\"></w:t></w:r>"];
+        return out;
+    }
+
+    for (NSDictionary *r in (NSArray *)runs) {
+        NSString *text = [r objectForKey:kCSFSRunText];
+        if (text.length == 0) continue;
+
+        NSMutableString *rPr = [NSMutableString string];
+        if ([[r objectForKey:kCSFSRunBold] boolValue])      [rPr appendString:@"<w:b/><w:bCs/>"];
+        if ([[r objectForKey:kCSFSRunItalic] boolValue])    [rPr appendString:@"<w:i/><w:iCs/>"];
+        if ([[r objectForKey:kCSFSRunUnderline] boolValue]) [rPr appendString:@"<w:u w:val=\"single\"/>"];
+
+        NSString *color = [r objectForKey:kCSFSRunColor];
+        if (color.length == 6) {
+            [rPr appendFormat:@"<w:color w:val=\"%@\"/>", color];
+        }
+        // 字体：同时写 ascii/hAnsi/eastAsia。
+        // 中文文档只写 hAnsi 不起作用，Word 会按 eastAsia 走。
+        NSString *face = [r objectForKey:kCSFSRunFace];
+        if (face.length > 0) {
+            NSString *fe = CSFSXMLEscape(face);
+            [rPr appendFormat:
+                @"<w:rFonts w:ascii=\"%@\" w:hAnsi=\"%@\" w:eastAsia=\"%@\" w:cs=\"%@\"/>",
+                fe, fe, fe, fe];
+        }
+        // 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
+        // 否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
+        id szObj = [r objectForKey:kCSFSRunSize];
+        if (szObj) {
+            double sz = [szObj doubleValue];
+            if (sz > 0 && fabs(sz - defaultPt) > 0.5) {
+                long hp = (long)(sz * 2.0 + 0.5);
+                [rPr appendFormat:@"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>", hp, hp];
+            }
+        }
+
+        if (rPr.length > 0) {
+            [out appendFormat:@"<w:r><w:rPr>%@</w:rPr><w:t xml:space=\"preserve\">%@</w:t></w:r>",
+                rPr, CSFSXMLEscape(text)];
+        } else {
+            [out appendFormat:@"<w:r><w:t xml:space=\"preserve\">%@</w:t></w:r>",
+                CSFSXMLEscape(text)];
+        }
+    }
+    return out;
+}
+
+// v18：正文由段落字典数组渲染。
+// 每个元素是 NSMutableDictionary：
+//   kCSFSParaRuns  → NSArray<NSMutableDictionary*> 文本片段
+//   kCSFSParaAlign → NSString 可选，w:jc 取值（center/right/both）
+// defaultPt 取全文出现最多的字号，作为 Normal 的基准，
+// 这样「标题比正文大」这件事在 Word 里能被体现出来（标题写 sz，正文继承）。
+static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outPath) {
+    CSFSCrashTrace("docx18: enter");
+
+    NSMutableString *body = [NSMutableString string];
+    for (NSDictionary *p in paras) {
+        [body appendString:CSFSRenderPara(p, defaultPt)];
+    }
+    if (body.length == 0) [body appendString:@"<w:p/>"];
+
+    long defHalfPt = (long)(defaultPt * 2.0 + 0.5);
+    if (defHalfPt < 4 || defHalfPt > 400) defHalfPt = 24;   // 兜底 12pt
+
+    NSString *docXml = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        @"<w:body>%@<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
+        @"<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/>"
+        @"</w:sectPr></w:body></w:document>",
+        body];
+    NSString *ctXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        @"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        @"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        @"<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        @"<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
+        @"</Types>";
+    NSString *relsXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
+        @"</Relationships>";
+    NSString *docRelsXml =
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+        @"</Relationships>";
+    // 默认字号改成动态值：原本文本占多数时是 12pt，但若整篇都是大标题，
+    // 固定 12pt 会让所有文字都带 sz 覆盖，反而失真。
+    NSString *stylesXml = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
+        @"<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        @"<w:docDefaults><w:rPrDefault><w:rPr>"
+        @"<w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\" w:eastAsia=\"宋体\" w:cs=\"Calibri\"/>"
+        @"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>"
+        @"<w:lang w:val=\"en-US\" w:eastAsia=\"zh-CN\" w:bidi=\"ar-SA\"/>"
+        @"</w:rPr></w:rPrDefault>"
+        @"<w:pPrDefault><w:pPr><w:spacing w:after=\"80\" w:line=\"300\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault>"
+        @"</w:docDefaults>"
+        @"<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        @"<w:name w:val=\"Normal\"/><w:qFormat/>"
+        @"<w:pPr><w:spacing w:after=\"80\" w:line=\"300\" w:lineRule=\"auto\"/></w:pPr>"
+        @"</w:style>"
+        @"</w:styles>", defHalfPt, defHalfPt];
+
+    NSMutableData *zipData = [NSMutableData dataWithCapacity:8192];
+    NSMutableData *cd = [NSMutableData dataWithCapacity:512];
+    CSFSZipAddEntry(zipData, cd, @"[Content_Types].xml",
+                    [ctXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"_rels/.rels",
+                    [relsXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/_rels/document.xml.rels",
+                    [docRelsXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/styles.xml",
+                    [stylesXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSZipAddEntry(zipData, cd, @"word/document.xml",
+                    [docXml dataUsingEncoding:NSUTF8StringEncoding]);
+    CSFSCrashTrace("docx18: parts added");
+
+    uint32_t cdSize = (uint32_t)cd.length;
+    uint32_t cdOffset = (uint32_t)zipData.length;
+    NSUInteger entryCount = 5;
+    [zipData appendData:cd];
+    CSFSWriteLE32(zipData, 0x06054b50);
+    CSFSWriteLE16(zipData, 0);
+    CSFSWriteLE16(zipData, 0);
+    CSFSWriteLE16(zipData, (uint16_t)entryCount);
+    CSFSWriteLE16(zipData, (uint16_t)entryCount);
+    CSFSWriteLE32(zipData, cdSize);
+    CSFSWriteLE32(zipData, cdOffset);
+    CSFSWriteLE16(zipData, 0);
+    CSFSCrashTrace("docx18: eocd done");
+
+    BOOL ok = [zipData writeToFile:outPath atomically:YES];
+    CSFS_LOG(@"v18 docx written=%d paras=%lu defPt=%.1f size=%lu",
+             (int)ok, (unsigned long)paras.count, defaultPt,
+             (unsigned long)zipData.length);
+    return ok;
+}
+
 static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
     CSFSCrashTrace("docx: enter");
 
@@ -2590,6 +2930,12 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     CSFS_LOG(@"v12 json head: %@", head);
                                     CSFSCrashTrace("json: loaded, before parse");
                                     NSMutableArray *lines = [NSMutableArray array];
+                                    // v18：带样式的段落数组。元素是 NSMutableDictionary，
+                                    // 键见 kCSFSParaRuns / kCSFSParaAlign。
+                                    // 全 ARC 管理，无手动内存操作（理由见 v18 结构定义处注释）。
+                                    NSMutableArray *styledParas = [NSMutableArray array];
+                                    // v18 诊断开关：只 dump 一次真实 style，见 CSFSParseSlice 注释
+                                    BOOL diagDone = NO;
                                     id parsed = nil;
                                     SEL jsel = NSSelectorFromString(
                                         @"JSONObjectWithData:options:error:");
@@ -2629,21 +2975,63 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                             }
                                                             id paras = [block objectForKey:@"paras"];
                                                             if (![paras isKindOfClass:[NSArray class]]) continue;
-                                                            NSMutableString *line = [NSMutableString string];
+
+                                                            // v18：每个 para 生成一个独立段落，
+                                                            // 并把每个 slice 的 style 一并带出来。
                                                             for (id para in paras) {
                                                                 if (![para respondsToSelector:@selector(objectForKey:)]) continue;
                                                                 id slices = [para objectForKey:@"slices"];
                                                                 if (![slices isKindOfClass:[NSArray class]]) continue;
+
+                                                                NSMutableArray *runs =
+                                                                    [NSMutableArray arrayWithCapacity:[(NSArray *)slices count]];
+                                                                BOOL hasText = NO;
                                                                 for (id sl in slices) {
-                                                                    if (![sl respondsToSelector:@selector(objectForKey:)]) continue;
-                                                                    id t = [sl objectForKey:@"text"];
-                                                                    if ([t isKindOfClass:[NSString class]]) {
-                                                                        [line appendString:t];
+                                                                    NSMutableDictionary *run = CSFSParseSlice(sl, &diagDone);
+                                                                    if (!run) continue;
+                                                                    NSString *tt = [run objectForKey:kCSFSRunText];
+                                                                    NSString *trimmed =
+                                                                        [tt stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
+                                                                    if (trimmed.length == 0) continue;
+                                                                    hasText = YES;
+                                                                    [runs addObject:run];
+                                                                }
+                                                                // 全空白段落直接丢掉（原实现靠 trim 达到同一效果）
+                                                                if (!hasText) continue;
+
+                                                                NSMutableDictionary *p =
+                                                                    [NSMutableDictionary dictionaryWithCapacity:4];
+                                                                [p setObject:runs forKey:kCSFSParaRuns];
+
+                                                                // 段落级对齐
+                                                                id just = [para objectForKey:@"justification"];
+                                                                if ([just isKindOfClass:[NSString class]]) {
+                                                                    NSString *j = [(NSString *)just lowercaseString];
+                                                                    // CamScanner 的值可能是枚举名也可能是数值，
+                                                                    // 只映射能明确识别的，其余留给 Word 默认。
+                                                                    //
+                                                                    // 注意 w:jc 的合法取值：
+                                                                    //   left / center / right / both / distribute
+                                                                    // 不存在 "justify"，写成 justify 会被 Word 忽略。
+                                                                    NSString *mapped = nil;
+                                                                    if ([j isEqualToString:@"center"] ||
+                                                                        [j isEqualToString:@"1"]) {
+                                                                        mapped = @"center";
+                                                                    } else if ([j isEqualToString:@"right"] ||
+                                                                               [j isEqualToString:@"right_align"] ||
+                                                                               [j isEqualToString:@"2"]) {
+                                                                        mapped = @"right";
+                                                                    } else if ([j isEqualToString:@"both"] ||
+                                                                               [j isEqualToString:@"justify"] ||
+                                                                               [j isEqualToString:@"3"]) {
+                                                                        mapped = @"both";
+                                                                    }
+                                                                    if (mapped) {
+                                                                        [p setObject:mapped forKey:kCSFSParaAlign];
                                                                     }
                                                                 }
+                                                                [styledParas addObject:p];
                                                             }
-                                                            NSString *trimmed = [line stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
-                                                            if (trimmed.length > 0) [lines addObject:trimmed];
                                                         }
                                                     }
                                                 }
@@ -2655,10 +3043,10 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             // 保底：通用递归收集
                                             CSFSCollectStrings(parsed, lines);
                                         }
-                                        CSFS_LOG(@"v12 json parsed, %lu strings",
-                                                 (unsigned long)lines.count);
+                                        CSFS_LOG(@"v18 json parsed, %lu 段带样式",
+                                                 (unsigned long)styledParas.count);
                                     } else {
-                                        // 非 JSON：原文按行切
+                                        // 非 JSON：原文按行切，生成无样式段落
                                         SEL wcsel2 = NSSelectorFromString(
                                             @"whitespaceAndNewlineCharacterSet");
                                         id (*wcf2)(id, SEL) =
@@ -2666,16 +3054,98 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         id ws2 = wcf2([NSCharacterSet class], wcsel2);
                                         for (NSString *ln in [jsonText componentsSeparatedByString:@"\n"]) {
                                             NSString *t = [ln stringByTrimmingCharactersInSet:ws2];
-                                            if (t.length > 0) [lines addObject:t];
+                                            if (t.length == 0) continue;
+                                            NSMutableDictionary *run =
+                                                [NSMutableDictionary dictionaryWithCapacity:2];
+                                            [run setObject:t forKey:kCSFSRunText];
+                                            NSMutableDictionary *p =
+                                                [NSMutableDictionary dictionaryWithCapacity:2];
+                                            [p setObject:[NSMutableArray arrayWithObject:run]
+                                                  forKey:kCSFSParaRuns];
+                                            [styledParas addObject:p];
+                                            [lines addObject:t];   // 仅用于计数/日志
                                         }
                                     }
-                                    if (lines.count == 0) {
+                                    if (styledParas.count == 0) {
+                                        // 极少数情况：JSON 结构不认识，但文本确实存在。
+                                        // 退回 v17 的通用递归收集，保证「至少能导出文字」。
+                                        if (lines.count == 0) CSFSCollectStrings(parsed, lines);
+                                        for (NSString *t in lines) {
+                                            if (t.length == 0) continue;
+                                            NSMutableDictionary *run =
+                                                [NSMutableDictionary dictionaryWithCapacity:2];
+                                            [run setObject:t forKey:kCSFSRunText];
+                                            NSMutableDictionary *p =
+                                                [NSMutableDictionary dictionaryWithCapacity:2];
+                                            [p setObject:[NSMutableArray arrayWithObject:run]
+                                                  forKey:kCSFSParaRuns];
+                                            [styledParas addObject:p];
+                                        }
+                                    }
+                                    if (styledParas.count == 0) {
                                         dispatch_async(dispatch_get_main_queue(), ^{
                                             CSFSToast(@"文档内容为空，请稍后重试");
                                         });
                                         return;
                                     }
                                     CSFSCrashTrace("json: lines collected");
+
+                                    // v18：统计默认字号。
+                                    // 做法：把所有 run 的字号按 1pt 取整做频次统计，取众数。
+                                    // 不用「平均值」—— 一篇图文里标题只有几个 run、
+                                    // 正文有几十个，平均值会被标题拉高，导致正文被压小。
+                                    double defaultPt = 12.0;
+                                    {
+                                        // 频次表：字号键 → 次数。键用 NSString 存，避免浮点做字典键。
+                                        NSMutableDictionary *freq = [NSMutableDictionary dictionary];
+                                        for (NSDictionary *pp in styledParas) {
+                                            id rs = [pp objectForKey:kCSFSParaRuns];
+                                            if (![rs isKindOfClass:[NSArray class]]) continue;
+                                            for (NSDictionary *rr in (NSArray *)rs) {
+                                                id szObj = [rr objectForKey:kCSFSRunSize];
+                                                if (!szObj) continue;
+                                                long key = (long)([szObj doubleValue] + 0.5);
+                                                if (key < 3 || key > 200) continue;
+                                                NSString *k = [NSString stringWithFormat:@"%ld", key];
+                                                long cnt = [[freq objectForKey:k] longValue] + 1;
+                                                [freq setObject:[NSNumber numberWithLong:cnt]
+                                                         forKey:k];
+                                            }
+                                        }
+                                        long bestCnt = 0; long bestKey = 12;
+                                        for (NSString *k in freq) {
+                                            long c = [[freq objectForKey:k] longValue];
+                                            long key = [k longValue];
+                                            // 同票时取更小的字号：正文通常是小的那个
+                                            if (c > bestCnt || (c == bestCnt && key < bestKey)) {
+                                                bestCnt = c; bestKey = key;
+                                            }
+                                        }
+                                        if (bestCnt > 0) defaultPt = (double)bestKey;
+                                        CSFS_LOG(@"v18 defaultPt=%.1f (样本 %ld 个 run)",
+                                                 defaultPt, bestCnt);
+                                    }
+
+                                    // v18：格式提取统计。
+                                    // 这是判断「格式有没有真的提取到」的唯一直接依据：
+                                    // 若这三个数都是 0，说明字段名对不上，需要看上面的 DIAG dump。
+                                    {
+                                        long nColor = 0, nBold = 0, nSize = 0, nRun = 0;
+                                        for (NSDictionary *pp in styledParas) {
+                                            id rs = [pp objectForKey:kCSFSParaRuns];
+                                            if (![rs isKindOfClass:[NSArray class]]) continue;
+                                            for (NSDictionary *rr in (NSArray *)rs) {
+                                                nRun++;
+                                                if ([rr objectForKey:kCSFSRunColor]) nColor++;
+                                                if ([[rr objectForKey:kCSFSRunBold] boolValue]) nBold++;
+                                                if ([rr objectForKey:kCSFSRunSize]) nSize++;
+                                            }
+                                        }
+                                        CSFS_LOG(@"v18 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
+                                                 (unsigned long)styledParas.count,
+                                                 nRun, nColor, nBold, nSize);
+                                    }
+
                                     // 文件名前缀：取 docId 前 12 字符。
                                     // v16 修正：原写法在 docIdCopy 为空时 MIN(12,0)=0，
                                     // substringToIndex:0 虽不崩但不该走到这里；
@@ -2686,7 +3156,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     NSString *out = [NSTemporaryDirectory()
                                                      stringByAppendingPathComponent:
                                                      [NSString stringWithFormat:@"导出_%@.docx", prefix]];
-                                    BOOL ok = CSFSWriteDocx(lines, out);
+                                    BOOL ok = CSFSWriteDocxStyled(styledParas, defaultPt, out);
                                     CSFSCrashTrace("json: docx returned");
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         if (ok) {
