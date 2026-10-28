@@ -87,6 +87,15 @@ def inj_d7(src):
     return src.replace('v22 stats: types=', 'v21 stats: types=', 1)
 
 
+def inj_d9(src):
+    """去掉延后判定的条件 —— 退化成「抠不出文字就照旧出图」。"""
+    old = 'if (imgTextCount > 0 || sliceTextWinCount > 0) {'
+    new = 'if (0) {'
+    if old not in src:
+        return src
+    return src.replace(old, new, 1)
+
+
 def main():
     print('=== 注入式反向验证 ===')
     results = [
@@ -94,6 +103,7 @@ def main():
         case('D5 顺序（取图提前）', inj_d5, 'D5 顺序错'),
         case('D4 白名单过滤回归', inj_d4, 'D4 仍存在'),
         case('D7 统计行缺失', inj_d7, 'D7 缺少'),
+        case('D9 延后判定失效', inj_d9, 'D9 缺少'),
     ]
     bad = results.count(False)
     print('\n通过 %d / 失败 %d' % (len(results) - bad, bad))

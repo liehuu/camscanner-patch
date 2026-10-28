@@ -308,7 +308,8 @@ SYSTEM_SELECTORS = {
     # v22：文字优先需要两个集合
     #   +[NSMutableSet set]      —— 块类型观测表、已入列段落文本去重表
     #   -[NSSet allObjects]      —— 把块类型集合拼成日志里的一行
-    "set", "allObjects",
+    #   -[NSMutableArray setArray:] —— 延后过滤可疑手写图时整体替换数组内容
+    "set", "allObjects", "setArray:",
     "stringWithUTF8String:", "hasSuffix:", "hasPrefix:", "isEqualToString:",
     "numberWithLong:", "numberWithBool:", "numberWithDouble:",
     "objectAtIndex:", "count", "lowercaseString", "doubleValue", "longValue",

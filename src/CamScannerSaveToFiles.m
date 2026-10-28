@@ -2142,6 +2142,22 @@ static NSString *const kCSFSImgPxW       = @"w";   // 像素宽（NSNumber）
 static NSString *const kCSFSImgPxH       = @"h";   // 像素高（NSNumber）
 static NSString *const kCSFSImgName      = @"n";   // media/imageN.ext 里的 N
 
+// v22：可疑图片段标记。
+//
+// 场景：手写转文字之后，识别结果可能**不在**图块里，而是落在隔壁的文字块上。
+// 此时图块自身抠不出文字，按「无文字就出图」的规则仍会把手写图片贴进去 ——
+// 用户看到的就是「文字有了，手写图还在」。
+//
+// 处理办法是**延后判定**：先把这类图块标成可疑、照常入列，
+// 等全文解析完再问一句「本文档到底有没有手写识别成果」
+// （imgText>0 或 sliceTextWin>0）。有 → 证明用户开了手写转文字，
+// 这些可疑图就是与该文字重复的底图，丢掉；没有 → 用户没识别，
+// 图本身就是内容，保留。
+//
+// 用「本文档有没有识别成果」来推断模式，比猜 image_category 的取值稳，
+// 也不需要知道导出面板上那个开关到底是什么。
+static NSString *const kCSFSParaImgSuspect = @"hws";
+
 // 从 JSON 的布尔字段取值。
 // 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
 // 但也可能是 NSNumber。两种都吃，避免因类型判断写死而在某版本静默失效。
@@ -3754,6 +3770,9 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                       [catStr containsString:@"text"] ||
                                                                       [catStr containsString:@"ocr"]));
                                                                 BOOL hasParaTree = (CSFSValue(block, @"paras") != nil);
+                                                                // v22：这个图块是不是「可能是重复的手写底图」。
+                                                                // 在 if 内被置 YES，出图时据此打标记。
+                                                                BOOL suspectHandwriteImg = NO;
                                                                 if (catStr.length > 0 && imgDiagDone == NO) {
                                                                     CSFS_LOG(@"v22 IMAGE block category=%@ handwriteLike=%d paraTree=%d",
                                                                              catStr, (int)handwriteLike, (int)hasParaTree);
@@ -3779,6 +3798,9 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                         continue;
                                                                     }
                                                                     CSFS_LOG(@"v22 WARN IMAGE block handwrite-like but no text, fall back to image");
+                                                                    // v22：先别信这个判断，延后到全文解析完再定。
+                                                                    // 见 kCSFSParaImgSuspect 的注释。
+                                                                    suspectHandwriteImg = YES;
                                                                 }
 
                                                                 NSDictionary *found = CSFSFindImage(block, 0);
@@ -3810,6 +3832,12 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     NSMutableDictionary *ip =
                                                                         [NSMutableDictionary dictionaryWithCapacity:1];
                                                                     [ip setObject:info forKey:kCSFSParaImage];
+                                                                    // v22：手写类但没文字的图块先打标记，
+                                                                    // 全文解析完再决定去留（见 kCSFSParaImgSuspect）。
+                                                                    if (suspectHandwriteImg) {
+                                                                        [ip setObject:[NSNumber numberWithBool:YES]
+                                                                               forKey:kCSFSParaImgSuspect];
+                                                                    }
                                                                     [styledParas addObject:ip];
                                                                 }
                                                                 continue;
@@ -4026,6 +4054,33 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                  defaultPt, bestCnt);
                                     }
 
+                                    // v22：延后判定「可疑手写图」的去留。
+                                    //
+                                    // 为什么不在遇到图块时就决定：那一刻还不知道
+                                    // 整个文档有没有识别成果。等全文解析完，
+                                    // 用「有没有识别出文字」反推用户开的模式，
+                                    // 判定才有依据。
+                                    //   imgText>0 或 sliceTextWin>0 → 开了手写转文字，
+                                    //     抠不出文字的手写图就是与文字重复的底图 → 丢
+                                    //   两者都是 0 → 没识别，图本身就是内容 → 留
+                                    long imgSuspectDropped = 0;
+                                    if (imgTextCount > 0 || sliceTextWinCount > 0) {
+                                        NSMutableArray *kept =
+                                            [NSMutableArray arrayWithCapacity:styledParas.count];
+                                        for (NSDictionary *pp2 in styledParas) {
+                                            if ([pp2 objectForKey:kCSFSParaImgSuspect]) {
+                                                imgSuspectDropped++;
+                                                continue;
+                                            }
+                                            [kept addObject:pp2];
+                                        }
+                                        if (imgSuspectDropped > 0) {
+                                            CSFS_LOG(@"v22 dropped %ld duplicate handwrite images",
+                                                     imgSuspectDropped);
+                                            [styledParas setArray:kept];
+                                        }
+                                    }
+
                                     // v18：格式提取统计。
                                     // 这是判断「格式有没有真的提取到」的唯一直接依据：
                                     // 若这三个数都是 0，说明字段名对不上，需要看上面的 DIAG dump。
@@ -4061,11 +4116,11 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         // 应当去看 "v22 new block type: ..." 与
                                         // "v22 IMAGE block category=..." 两行。
                                         CSFS_LOG(@"v22 stats: types=[%@] imgText=%ld imgDup=%ld"
-                                                 @" sliceTextWin=%ld firstSliceImgSType=%@",
+                                                 @" sliceTextWin=%ld dropHW=%ld firstSliceImgSType=%@",
                                                  [[blockTypeSet allObjects]
                                                   componentsJoinedByString:@","],
                                                  imgTextCount, imgDupCount,
-                                                 sliceTextWinCount,
+                                                 sliceTextWinCount, imgSuspectDropped,
                                                  firstSliceImgSType ?: @"(none)");
                                         if (firstStyled) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);

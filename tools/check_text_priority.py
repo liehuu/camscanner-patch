@@ -196,6 +196,21 @@ def main():
     else:
         ok("D8 CSFSBlockTextParas 只负责文字")
 
+    # ── D9：可疑手写图的「延后判定」 ──
+    # 场景：识别结果不在图块里，而在隔壁文字块上。此时图块自身抠不出文字，
+    # 按「无文字就出图」仍会得到「文字 + 手写图」各一份。
+    # 正确做法是延后到全文解析完，用「有没有识别成果」反推模式再决定去留。
+    for needle, label in [
+            ('kCSFSParaImgSuspect', '可疑图标记'),
+            ('imgTextCount > 0 || sliceTextWinCount > 0', '延后判定条件'),
+            ('setArray:kept', '过滤动作')]:
+        if needle not in src:
+            fail("D9 缺少 %s（源码里找不到 %r）" % (label, needle))
+    if all(n in src for n in ('kCSFSParaImgSuspect',
+                              'imgTextCount > 0 || sliceTextWinCount > 0',
+                              'setArray:kept')):
+        ok("D9 可疑手写图有延后判定（标记 → 全文解析后按识别成果决定去留）")
+
     print('=== check_text_priority ===')
     for m in oks:
         print('  [ OK ] ' + m)
