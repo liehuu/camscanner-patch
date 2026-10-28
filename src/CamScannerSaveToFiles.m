@@ -2454,6 +2454,95 @@ static NSDictionary *CSFSFindImage(id obj, int depth) {
     return nil;
 }
 
+// 把一个值压成一行短描述。
+// 关键作用是让 NSData 现形：CSFSDescribeShape 只打 key 名和类型，
+// 看不到某个键下面是不是挂着几 MB 的图片字节。
+static NSString *CSFSBriefValue(id v, int depth) {
+    if (!v) return @"nil";
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        if (s.length > 90) {
+            return [NSString stringWithFormat:@"str(%lu)\"%@...\"",
+                    (unsigned long)s.length, [s substringToIndex:90]];
+        }
+        return [NSString stringWithFormat:@"str\"%@\"", s];
+    }
+    if ([v isKindOfClass:[NSNumber class]]) {
+        return [NSString stringWithFormat:@"num(%@)", v];
+    }
+    if ([v isKindOfClass:[NSData class]]) {
+        NSData *d = (NSData *)v;
+        const unsigned char *p = (const unsigned char *)d.bytes;
+        NSUInteger n = d.length < 8 ? d.length : 8;
+        NSMutableString *hx = [NSMutableString stringWithCapacity:16];
+        for (NSUInteger i = 0; i < n; i++) [hx appendFormat:@"%02x", p[i]];
+        return [NSString stringWithFormat:@"data(%lu hex:%@)",
+                (unsigned long)d.length, hx];
+    }
+    if ([v isKindOfClass:[NSArray class]]) {
+        return [NSString stringWithFormat:@"array(%lu)", (unsigned long)[(NSArray *)v count]];
+    }
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        return [NSString stringWithFormat:@"dict(%lu)", (unsigned long)[(NSDictionary *)v count]];
+    }
+    return NSStringFromClass([v class]);
+}
+
+// 递归描述一个块：key = 值摘要。
+// 只在图片「没找到」时调用一次 —— 那时唯一的线索就是这块到底装了什么。
+static NSString *CSFSDescribeDeep(id obj, int depth) {
+    if (!obj) return @"(nil)";
+    if (depth > 2) return @"...";
+    if (![obj isKindOfClass:[NSDictionary class]] &&
+        ![obj isKindOfClass:[NSArray class]]) {
+        // 模型对象：先取属性名，再逐个取值
+        unsigned int n = 0;
+        objc_property_t *props = class_copyPropertyList([obj class], &n);
+        NSMutableArray *names = [NSMutableArray arrayWithCapacity:8];
+        unsigned int lim = n < 14 ? n : 14;
+        for (unsigned int i = 0; i < lim; i++) {
+            const char *nm = property_getName(props[i]);
+            if (nm) [names addObject:[NSString stringWithUTF8String:nm]];
+        }
+        if (props) free(props);
+        if (names.count == 0) return NSStringFromClass([obj class]);
+        NSMutableString *o = [NSMutableString string];
+        for (NSString *k in names) {
+            if (o.length) [o appendString:@" "];
+            id v = CSFSValue(obj, k);
+            if ([v isKindOfClass:[NSArray class]] || [v isKindOfClass:[NSDictionary class]]) {
+                [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
+            } else {
+                [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
+            }
+        }
+        return o;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)obj;
+        NSUInteger cap = a.count < 6 ? a.count : 6;
+        NSMutableString *o = [NSMutableString stringWithFormat:@"[%lu]{", (unsigned long)a.count];
+        for (NSUInteger i = 0; i < cap; i++) {
+            if (i) [o appendString:@", "];
+            [o appendFormat:@"%s", [CSFSBriefValue([a objectAtIndex:i], depth) UTF8String]];
+        }
+        [o appendString:@"}"];
+        return o;
+    }
+    NSDictionary *d = (NSDictionary *)obj;
+    NSArray *ks = [d allKeys];
+    NSUInteger cap = ks.count < 14 ? ks.count : 14;
+    NSMutableString *o = [NSMutableString stringWithFormat:@"{%lu ", (unsigned long)ks.count];
+    for (NSUInteger i = 0; i < cap; i++) {
+        NSString *k = [ks objectAtIndex:i];
+        id v = [d objectForKey:k];
+        if (i) [o appendString:@" "];
+        [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
+    }
+    [o appendString:@"}"];
+    return o;
+}
+
 // 把图片信息渲染成一个居中的内联图片段落。
 // seq 只用于生成不重复的 rId / 文件名，必须调用方保证唯一。
 //
@@ -3419,9 +3508,16 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 NSDictionary *found = CSFSFindImage(block, 0);
                                                                 if (imgDiagDone == NO) {
                                                                     imgDiagDone = YES;
-                                                                    CSFS_LOG(@"v21 DIAG image block %@ -> %@",
-                                                                             CSFSDescribeShape(block),
-                                                                             found ? @"FOUND" : @"NOT FOUND");
+                                                                    // 找到时只打形状（短）；
+                                                                    // 没找到时打深度内容 —— 那一行是
+                                                                    // 下一轮唯一能定位「图藏哪了」的线索。
+                                                                    if (found) {
+                                                                        CSFS_LOG(@"v21 DIAG image block -> FOUND shape=%@",
+                                                                                 CSFSDescribeShape(block));
+                                                                    } else {
+                                                                        CSFS_LOG(@"v21 DIAG image block -> NOT FOUND deep=%@",
+                                                                                 CSFSDescribeDeep(block, 0));
+                                                                    }
                                                                 }
                                                                 if (found) {
                                                                     imgSeq++;

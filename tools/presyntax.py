@@ -309,6 +309,8 @@ SYSTEM_SELECTORS = {
     "numberWithLong:", "numberWithBool:", "numberWithDouble:",
     "objectAtIndex:", "count", "lowercaseString", "doubleValue", "longValue",
     "dataWithContentsOfFile:", "bytes", "length",
+    # v21 诊断：CSFSBriefValue 用 stringWithCapacity: 拼十六进制头
+    "stringWithCapacity:", "appendFormat:", "appendString:",
     "objectForKey:", "setObject:forKey:", "removeObjectForKey:", "allKeys", "allValues",
     "length", "UTF8String", "characterAtIndex:", "substringFromIndex:",
     "substringToIndex:", "stringByAppendingString:", "stringByAppendingPathComponent:",
