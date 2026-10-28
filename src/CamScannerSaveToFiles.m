@@ -2761,6 +2761,17 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
         if (!attr)  attr  = CSFSValue(sources[i], @"font_attribute");
     }
 
+    // v23：font_attribute 才是字体属性的真正载体（类型就是
+    // CSTranslateRawPageFont），上面只从它身上取了 bold/italic/underline，
+    // 漏了字号和字体名。
+    // 取值顺序 style → font_attribute → slice：前两者是专门的对象，
+    // 比 slice 上的散字段更可能是权威值。
+    if (!szObj) szObj = CSFSValue(attr, @"font_size");
+    if (!szObj) szObj = CSFSValue(attr, @"size");
+    if (!szObj) szObj = CSFSValue(attr, @"fontSize");
+    if (!f)     f     = CSFSValue(attr, @"font_face");
+    if (!c)     c     = CSFSValue(attr, @"font_color");
+
     if ([c isKindOfClass:[NSString class]]) {
         NSString *hex = CSFSNormalizeHexColor((NSString *)c);
         if (hex) [run setObject:hex forKey:kCSFSRunColor];
@@ -3241,10 +3252,40 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 
     NSMutableString *out = [NSMutableString stringWithString:@"<w:p>"];
 
-    // 段落属性：对齐。只在确有必要时写 <w:pPr>，避免产出大量空属性块。
+    // 段落属性。
+    //
+    // v23：加首行缩进两字符。
+    //
+    // 依据是量出来的，不是拍出来的：把手机预览截图逐行取墨迹边界，
+    // 正文续行左边界恒为 x=64，而每个段落首行的左边界是 99~107 ——
+    // 差 36px，字高 19px，即 1.9 字 ≈ 两字符。也就是说 App 自己渲染时
+    // 每个自然段都首行缩进两字，而本 dylib 之前一个 <w:ind> 都不写，
+    // 22 段全部顶格。这是「导出和预览不像」最直观的一条。
+    //
+    // 只在 left/both 时缩进：center/right 的段落（合同标题就是 right）
+    // 加缩进会把整行推歪，反而制造新的不一致。
+    //
+    // firstLineChars 是 Word 扩展（按字符数算，随字号自适应），
+    // firstLine 是标准属性（按 twips 算）。两个都写：
+    // Word 优先 firstLineChars，LibreOffice/WPS 只认 firstLine。
+    // 注意 w:ind 必须排在 w:jc **之前** —— CT_PPrBase 是 sequence。
     id align = [para objectForKey:kCSFSParaAlign];
+    NSMutableString *pPr = [NSMutableString string];
+    BOOL alignLeftish = (align == nil) ||
+                        ([align isKindOfClass:[NSString class]] &&
+                         ([(NSString *)align isEqualToString:@"both"] ||
+                          [(NSString *)align isEqualToString:@"left"]));
+    if (alignLeftish) {
+        // 两字符 = 2 × 字号(pt) × 20 twips/pt。defaultPt 已在 2..200 之间。
+        long fl = (long)(defaultPt * 40.0 + 0.5);
+        if (fl < 20) fl = 20;
+        [pPr appendFormat:@"<w:ind w:firstLineChars=\"200\" w:firstLine=\"%ld\"/>", fl];
+    }
     if ([align isKindOfClass:[NSString class]] && [(NSString *)align length] > 0) {
-        [out appendFormat:@"<w:pPr><w:jc w:val=\"%@\"/></w:pPr>", align];
+        [pPr appendFormat:@"<w:jc w:val=\"%@\"/>", align];
+    }
+    if (pPr.length > 0) {
+        [out appendFormat:@"<w:pPr>%@</w:pPr>", pPr];
     }
 
     id runs = [para objectForKey:kCSFSParaRuns];
@@ -3282,9 +3323,21 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         }
         // 5) 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
         //    否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
+        //
+        //    v23：先把「与基准差 20% 以内」的字号归并到基准。
+        //    实测真机导出的 docx：124 个 run 里 7 个是 10pt、其余 11pt，
+        //    而这 7 个恰好整段落在第五条、第六条、第十二条上 ——
+        //    Word 里看到的就是「这几条字小一圈」，用户一眼就发现了。
+        //    10% 级别的抖动来自 OCR 的逐行度量误差，不是排版意图：
+        //    同一份合同的正文不可能忽大忽小。
+        //    阈值 20% 卡得很宽裕：标题（25pt）离基准 11pt 有 127%，
+        //    不会被误并；脚注（8pt）离 27%，也不会被并。
         id szObj = [r objectForKey:kCSFSRunSize];
-        if (szObj) {
+        if (szObj && defaultPt > 2.0 && defaultPt < 200.0) {
             double sz = [szObj doubleValue];
+            if (sz > 2.0 && sz < 200.0 && fabs(sz - defaultPt) <= defaultPt * 0.2) {
+                sz = defaultPt;      // 归并到基准
+            }
             if (sz > 0 && fabs(sz - defaultPt) > 0.5) {
                 long hp = (long)(sz * 2.0 + 0.5);
                 // 越界字号 Word 会当损坏处理，直接钳进合法区间
@@ -4052,6 +4105,25 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         if (bestCnt > 0) defaultPt = (double)bestKey;
                                         CSFS_LOG(@"v21 defaultPt=%.1f (样本 %ld 个 run)",
                                                  defaultPt, bestCnt);
+                                        // v23：把完整字号分布打出来。
+                                        // 只有众数看不出「有几档字号、各占多少」，
+                                        // 而「同一篇里字大忽小」正是靠这个才能定位：
+                                        //   只有一档 → 本来就是统一的，别动
+                                        //   两档且差距 <20% → OCR 逐行度量抖动，归并
+                                        //   两档且差距 >50% → 真的是标题/正文，保留
+                                        {
+                                            NSArray *ks = [[freq allKeys]
+                                                sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+                                                    return [[NSNumber numberWithLong:(long)[(NSString *)a integerValue]]
+                                                            compare:[NSNumber numberWithLong:(long)[(NSString *)b integerValue]]];
+                                                }];
+                                            NSMutableString *ds = [NSMutableString string];
+                                            for (NSString *k in ks) {
+                                                [ds appendFormat:@"%@pt×%ld ",
+                                                 k, (long)[[freq objectForKey:k] longValue]];
+                                            }
+                                            CSFS_LOG(@"v23 font size histogram: %@", ds);
+                                        }
                                     }
 
                                     // v22：延后判定「可疑手写图」的去留。

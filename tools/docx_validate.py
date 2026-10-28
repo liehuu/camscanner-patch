@@ -83,10 +83,17 @@ def tag_of(e):
 
 
 class Checker(object):
-    def __init__(self):
+    def __init__(self, def_half_pt=None):
         self.errors = []
         self.embeds = []        # [(where, rId)] 正文里的 r:embed 引用
         self.doc_pr_ids = []    # wp:docPr 的 id，整篇必须唯一
+        self.ind_first_line = 0 # 带 firstLineChars 的段落数
+        # v23：字号追踪。
+        #   self.sizes   [(段落序号, 半磅值)] —— 用于「全文正文只能有一档字号」
+        #   def_half_pt  docDefaults 的 sz，无显式 sz 的 run 落回它
+        self.sizes = []
+        self.def_half_pt = def_half_pt
+        self.cur_para = 0
 
     def err(self, where, msg):
         self.errors.append("%s: %s" % (where, msg))
@@ -158,6 +165,8 @@ class Checker(object):
                         if v is not None and v not in JC_ALLOWED:
                             self.err(where, "<w:jc w:val=\"%s\"> 非法（合法值：%s）"
                                      % (v, ", ".join(sorted(JC_ALLOWED))))
+                    elif st == "ind":
+                        self.check_ind(sub, where)
             elif t in ("r", "hyperlink", "fldSimple", "subDoc", "smartTag",
                        "ins", "del", "bookmarkStart", "bookmarkEnd", "sdt",
                        "proofErr", "commentRangeStart", "commentRangeEnd",
@@ -168,13 +177,42 @@ class Checker(object):
                 self.err(where, "<w:p> 内出现非法子元素 <%s>" % t)
             first = False
 
+    def check_ind(self, ind, where):
+        """<w:ind> 的属性检查。
+
+        为什么要单独查：Word 对 ind 的非法值一律**静默忽略** ——
+        不报错、不提示，只是不缩进。所以「导出的文档没有首行缩进」
+        这种问题，只有主动断言才看得见。
+        """
+        for a in ("firstLine", "firstLineChars", "left", "leftChars",
+                  "right", "rightChars", "hanging", "hangingChars"):
+            v = ind.get(W + a)
+            if v is None:
+                continue
+            try:
+                n = int(v)
+            except ValueError:
+                self.err(where, "<w:ind w:%s=\"%s\"> 不是整数" % (a, v))
+                continue
+            if n < 0:
+                self.err(where, "<w:ind w:%s=\"%s\"> 为负" % (a, v))
+            # hanging 与 firstLine 互斥，同时出现时 Word 认 hanging
+            if a == "firstLineChars" and n > 0:
+                self.ind_first_line += 1
+        if ind.get(W + "hanging") is not None and ind.get(W + "firstLine") is not None:
+            self.err(where, "<w:ind> 同时设置了 hanging 与 firstLine（互斥）")
+
     def check_r(self, r, where):
         # CT_R: rPr?, EG_RunInnerContent*
         first = True
+        run_sz = None
+        has_text = False
         for ch in r:
             t = tag_of(ch)
             if t is None:
                 continue
+            if t == "t":
+                has_text = True
             if t == "rPr":
                 if not first:
                     self.err(where, "<w:rPr> 不是 <w:r> 的第一个子元素")
@@ -190,6 +228,8 @@ class Checker(object):
                             continue
                         if n < 1 or n > 3276:
                             self.err(where, "<w:%s w:val=%d> 越界（半磅，合法 1..3276）" % (st, n))
+                        if st == "sz":
+                            run_sz = n
                     if st == "color":
                         v = sub.get(W + "val") or ""
                         if v != "auto" and not (len(v) == 6 and all(c in "0123456789ABCDEFabcdef" for c in v)):
@@ -202,6 +242,52 @@ class Checker(object):
                 if t in ("p", "pPr", "tbl", "sectPr", "body"):
                     self.err(where, "<w:r> 内出现块级元素 <%s>" % t)
             first = False
+
+        # v23：记录正文 run 的实际字号。
+        # 图片段的 run 只有 drawing、没有 <w:t>，不参与字号统计 ——
+        # 否则一张图就是一个「无字号 run」，把正文样本冲稀。
+        if has_text:
+            eff = run_sz if run_sz else self.def_half_pt
+            if eff:
+                self.sizes.append((self.cur_para, eff))
+
+    def check_font_uniformity(self):
+        """全文正文字号必须只有一档。
+
+        为什么这条是硬要求（2026-10-28 实测）：
+            真机导出的 导出_E0Y2LWVgWE07.docx，124 个 run 里 7 个被识别成
+            10pt、其余 11pt，而这 7 个恰好整段落在第五条、第六条、第十二条上。
+            Word 里看到的就是「这几条字小一圈」——用户一眼就指出来了。
+            同一份合同正文不可能忽大忽小，这是 OCR 的逐行度量误差。
+
+        判据分两步，缺一不可：
+          1) 先按「相邻字号比值 > 1.35」分簇 —— 标题(25pt)/正文(11pt) 自然分到
+             不同簇，不会被误判成「不统一」。
+          2) 同一簇内出现多个不同取值 → 报错。簇内差 10% 就是抖动，不是排版意图。
+        """
+        if not self.sizes:
+            return
+        pts = {}
+        for _, v in self.sizes:
+            pts[v] = pts.get(v, 0) + 1
+        keys = sorted(pts)
+        clusters = [[keys[0]]]
+        for k in keys[1:]:
+            if k / float(clusters[-1][-1]) > 1.35:
+                clusters.append([k])
+            else:
+                clusters[-1].append(k)
+        for c in clusters:
+            total = sum(pts[k] for k in c)
+            # 少于 3 个 run 的簇多半是零星特例（脚注、编号），不据此判错
+            if len(c) > 1 and total >= 3:
+                self.err("font",
+                         "同一档正文字号出现 %d 种取值：%s（各 %s 次）—— "
+                         "Word 里会表现为「部分段落字小一圈」。"
+                         "OCR 的逐行度量误差应在渲染前归并到基准字号"
+                         % (len(c),
+                            " / ".join("%.1fpt" % (k / 2.0) for k in c),
+                            " / ".join(str(pts[k]) for k in c)))
 
     def check_sectpr(self, s, where):
         self.ordered(s, SECTPR_ORDER, where, "w:sectPr")
@@ -281,7 +367,19 @@ def main():
     path = sys.argv[1]
     zf = zipfile.ZipFile(path)
     names = set(zf.namelist())
-    ck = Checker()
+
+    # v23：先取 docDefaults 的 sz。
+    # 没有显式 <w:sz> 的 run 落回它，字号一致性判断必须把这一档算进去 ——
+    # 否则「大部分 run 不写 sz、少数写 sz」这种形态会被漏掉，
+    # 而真机那个 docx 恰恰就是这种形态（124 个 run 只有 8 个带 sz）。
+    def_half = None
+    if "word/styles.xml" in names:
+        sx = zf.read("word/styles.xml").decode("utf-8")
+        m = re.search(r'<w:docDefaults>.*?<w:sz w:val="(\d+)"', sx, re.S)
+        if m:
+            def_half = int(m.group(1))
+
+    ck = Checker(def_half)
 
     # 1) 必需部件
     for n in ("[Content_Types].xml", "_rels/.rels", "word/document.xml"):
@@ -331,6 +429,7 @@ def main():
                 t = tag_of(ch)
                 if t == "p":
                     pi += 1
+                    ck.cur_para = pi
                     ck.check_p(ch, "document.xml/body/p[%d]" % pi, "")
                 elif t == "sectPr":
                     ck.check_sectpr(ch, "document.xml/body/sectPr")
@@ -365,12 +464,22 @@ def main():
     import xml.etree.ElementTree as ET
     if "word/document.xml" in names:
         d = zf.read("word/document.xml").decode("utf-8")
-        print("段落数 <w:p></w:p> :", d.count("<w:p>") + d.count("<w:p "))
+        npara = d.count("<w:p>") + d.count("<w:p ")
+        print("段落数 <w:p></w:p> :", npara)
+        print("首行缩进段落     :", ck.ind_first_line, "/", npara,
+              "" if ck.ind_first_line else "  ← 一个都没有，导出会全部顶格")
         nimg = d.count("<w:drawing>")
         if nimg:
             print("图片 <w:drawing> :", nimg)
             media = [n for n in names if n.startswith("word/media/")]
             print("media 部件       :", len(media), media)
+
+    # 6) 字号一致性（v23）
+    #
+    # 这条放在结构校验之后单独跑：结构对不对和「看起来像不像」是两件事，
+    # 而后者恰恰是用户唯一能感知的。字号散成两档时，结构校验全绿、Word 也能打开，
+    # 但打开就是「有的段落字小一圈」。
+    ck.check_font_uniformity()
 
     print()
     if ck.errors:

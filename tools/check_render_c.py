@@ -96,6 +96,26 @@ def tags_in(s):
     return re.findall(r"<w:([A-Za-z]+)", s)
 
 
+# 匹配 [var appendFormat:@"..." / [var appendString:@"..."
+#
+# 为什么要按「接收者变量」分组，而不是像 v20 那样把整函数的字面量串起来看：
+#   v23 把段落属性改成了「先在 pPr 变量里拼内容，再 <w:pPr>%@</w:pPr> 包壳」。
+#   串起来看时，<w:ind> 的字面量出现在 <w:pPr> 模板之前，
+#   C3 于是报「pPr 之前出现了 ind」，C2 把 ind 当成 rPr 子元素报未定义标签 ——
+#   两条都是**假 FAIL**，而它们要找的真缺陷（pPr 不是首个、rPr 顺序错）并没有发生。
+#   检查器的判断依据必须跟代码结构同步，否则它只是制造噪音；
+#   一百条噪音里真问题就没人看了。
+APPEND_RE = re.compile(r'\[\s*(\w+)\s+append(?:Format|String):\s*@"((?:[^"\\]|\\.)*)"', re.S)
+
+
+def appends(func):
+    """按源码顺序返回 [(接收者变量, 字面量内容)]。"""
+    out = []
+    for m in APPEND_RE.finditer(func):
+        out.append((m.group(1), m.group(2).replace('\\"', '"')))
+    return out
+
+
 def main():
     path = sys.argv[1]
     src = io.open(path, encoding='utf-8').read()
@@ -121,26 +141,191 @@ def main():
             ok("C1 CSFSRenderPara 输出含 '</w:p>'")
 
         # C3: pPr 必须最先
-        tl = tags_in(joined)
-        if 'pPr' in tl:
-            # 找出第一次出现的非 pPr、非 p 标签，看它是否在 pPr 之前
-            for t in tl:
-                if t == 'p':
+        #
+        # 判据改成「按接收者变量分组」后，语义才真的被验证到：
+        #   a) 段落变量（首个以 <w:p> 开头的接收者）第一次 append 是 <w:p>
+        #   b) 段落变量上 <w:r 的出现必须晚于 <w:pPr> 的出现
+        #   c) 段落变量不能直接 append pPr 的子元素（<w:ind>/<w:jc>/<w:spacing>），
+        #      否则说明它跑到 pPr 外面去了 —— 这正是 v19 的真缺陷形态
+        apps = appends(fn)
+        ppr_tags = set(PPR_ORDER) - {'rPr', 'sectPr', 'pPrChange'}
+        out_var = None
+
+        # 段落变量有两种起手式，都要认：
+        #   NSMutableString *out = [NSMutableString stringWithString:@"<w:p>"];   ← 现用
+        #   [out appendString:@"<w:p>"];                                          ← 可能改成
+        m_init = re.search(
+            r'NSMutableString\s*\*\s*(\w+)\s*=\s*\[\s*NSMutableString\s+stringWithString:\s*@"<w:p>"',
+            fn)
+        if m_init:
+            out_var = m_init.group(1)
+        else:
+            for var, lit in apps:
+                if lit.startswith('<w:p>'):
+                    out_var = var
+                    break
+
+        if out_var is None:
+            fail("C3 找不到以 '<w:p>' 开头的段落构建语句")
+        else:
+            seq = [lit for var, lit in apps if var == out_var]
+            # a) 段落必须以 <w:p> 起手。
+            #    用 stringWithString:@"<w:p>" 初始化的，起手式已在初始化语句里
+            #    体现（m_init 已断言），首个 append 自然就轮到 pPr，
+            #    这时再要求 "首个 append 是 <w:p>" 就是又一条假检查。
+            if m_init:
+                ok("C3 段落变量以 stringWithString:@\"<w:p>\" 起手")
+            elif not seq or not seq[0].startswith('<w:p>'):
+                fail("C3 段落既没有 <w:p> 初始化，首个 append 也不是 '<w:p>'（实际 %r）"
+                     % (seq[0][:30] if seq else None))
+            else:
+                ok("C3 段落变量首个 append 是 '<w:p>'")
+
+            # c) pPr 子元素不能直接挂在段落变量上
+            leaked = []
+            for var, lit in apps:
+                if var != out_var:
                     continue
-                if t == 'pPr':
-                    ok("C3 <w:pPr> 是 <w:p> 的首个有效子元素")
-                else:
-                    fail("C3 <w:pPr> 之前出现了 <%s>，pPr 必须是首个" % t)
-                break
+                if lit.startswith('<w:pPr>'):
+                    continue        # 包裹模板本身是合法的
+                for t in tags_in(lit):
+                    if t in ppr_tags:
+                        leaked.append(t)
+            if leaked:
+                fail("C3 段落变量上直接输出了 pPr 子元素 %s —— 它们必须包在 <w:pPr> 里"
+                     % ", ".join(sorted(set(leaked))))
+            else:
+                ok("C3 pPr 子元素全部出自 pPr 构建（或单条 <w:pPr> 模板）")
+
+            # d) 有段落属性字面量，就**必须**有 <w:pPr> 包裹模板。
+            #    否则属性会被输出到 pPr 外面，Word 直接忽略（不报错、不生效）。
+            #    之前这条写成「没有 pPr 就跳过」，等于给"根本没有 pPr"开了通行证 ——
+            #    反向验证时把包裹模板删掉，检查器照样全绿，说明那条判据是空的。
+            has_ppr_child = any(t in ppr_tags for _, lit in apps for t in tags_in(lit))
+            has_ppr_wrap = any('<w:pPr>' in lit for _, lit in apps)
+            if has_ppr_child and not has_ppr_wrap:
+                fail("C3 出现了段落属性字面量，但没有任何 <w:pPr> 包裹模板 —— "
+                     "属性会落在 pPr 外面，被 Word 静默忽略")
+            elif has_ppr_wrap:
+                ok("C3 存在 <w:pPr> 包裹模板")
+
+            # b) <w:pPr> 必须出现在任何 <w:r 之前
+            i_ppr, i_run = -1, -1
+            for n, lit in enumerate(seq):
+                if i_ppr < 0 and '<w:pPr>' in lit:
+                    i_ppr = n
+                if i_run < 0 and '<w:r' in lit:
+                    i_run = n
+            if i_ppr < 0:
+                # 全篇没有 pPr 也是合法的（无属性段落）
+                ok("C3 未输出 <w:pPr>（该函数可能不含段落属性，跳过先后比较）")
+            elif i_run >= 0 and i_ppr > i_run:
+                fail("C3 <w:pPr> 出现在 <w:r> 之后 —— pPr 必须是段落首个元素")
+            else:
+                ok("C3 <w:pPr> 出现在所有 <w:r> 之前")
+
+        # C9: pPr 内部标签顺序必须符合 CT_PPrBase sequence
+        #
+        # <w:ind> 排在 <w:jc> 之后是 Word 常见的静默失败点：
+        # 文件能打开、不报错，但缩进/对齐其中一项不生效。
+        # v23 新增了 <w:ind>，所以这条必须在 CI 里卡住。
+        ppr_seq = []
+        for var, lit in apps:
+            if var == out_var and not lit.startswith('<w:pPr>'):
+                continue
+            if '<w:pPr>' in lit:
+                # 内联形态 @"<w:pPr><w:ind/><w:jc/></w:pPr>"
+                for t in tags_in(lit):
+                    if t in ppr_tags:
+                        ppr_seq.append(t)
+            elif var != out_var:
+                # 变量形态：只要这个变量里出现了 pPr 专属标签，就整段参与排序
+                hits = [t for t in tags_in(lit) if t in ppr_tags]
+                if hits:
+                    ppr_seq.extend(hits)
+        if ppr_seq:
+            idxs = [PPR_ORDER.index(t) for t in ppr_seq]
+            if idxs != sorted(idxs):
+                bad = None
+                for a in range(len(ppr_seq)):
+                    for b in range(a + 1, len(ppr_seq)):
+                        if PPR_ORDER.index(ppr_seq[a]) > PPR_ORDER.index(ppr_seq[b]):
+                            bad = (ppr_seq[a], ppr_seq[b])
+                            break
+                    if bad:
+                        break
+                fail("C9 pPr 顺序违规：<%s> 排在 <%s> 之后。实际顺序 %s"
+                     % (bad[0], bad[1], " → ".join(ppr_seq)))
+            else:
+                ok("C9 pPr 顺序合规：%s" % " → ".join(ppr_seq))
+
+        # C10: 正文段落必须带首行缩进
+        #
+        # 量出来的事实：手机预览里正文续行左边界 x=64、段落首行 x=99~107，
+        # 差 36px / 字高 19px ≈ 两字符。而 v22 及之前的产物 22 段全部顶格，
+        # <w:ind> 出现 0 次 —— 这是「导出和预览不像」最直观的一条。
+        #
+        # ⚠ 这里必须用正则**精确匹配属性值**，不能写
+        #   `'firstLineChars' in joined`。反向验证时把属性名改成
+        #   firstLineCharsX，子串判断照样命中 —— 那就成了一条永远通过的假检查。
+        #   「属性名错了」和「属性名对但值是 0」是两种不同缺陷，都得报。
+        m_fl = re.search(r'w:firstLineChars="([^"]+)"', joined)
+        m_ft = re.search(r'w:firstLine="([^"]+)"', joined)
+
+        def val_or_fmt(m):
+            """返回 (是否合法, 说明)。占位符（%ld / %@）算合法 ——
+            模板层只看「有没有写、名字对不对」，具体数值由产物级
+            docx_validate.py 校验，两层分工不重叠。"""
+            if m is None:
+                return False, '缺失'
+            v = m.group(1)
+            if v.startswith('%'):
+                return True, v
+            try:
+                return (int(v) >= 100), v
+            except ValueError:
+                return False, v
+
+        okfl, vfl = val_or_fmt(m_fl)
+        okft, vft = val_or_fmt(m_ft)
+        if not m_fl:
+            fail("C10 没有首行缩进：w:firstLineChars 缺失或属性名不对，导出会全部顶格")
+        elif not okfl:
+            fail("C10 firstLineChars=%s 太小（<1 字符），等于没有缩进" % vfl)
+        elif not m_ft or not okft:
+            # 只写 firstLineChars 的话，LibreOffice / WPS 这些只认 firstLine 的
+            # 实现会完全不缩进；双写才两边都生效。
+            fail("C10 缺 w:firstLine（twips）兜底，只写 firstLineChars 在 WPS/LO 里不生效")
+        else:
+            ok("C10 正文段落带首行缩进（firstLineChars=%s / firstLine=%s）" % (vfl, vft))
 
         # C2: rPr 子元素顺序。
         #
-        # CSFSRenderPara 的输出里，除 rPr 的格式化标签外，只有纯结构标签
-        # （p / pPr / jc / r / rPr / t）。所以把 joined 的全部标签按序取出、
-        # 剔掉结构标签，剩下的就是 rPr 子元素的真实输出顺序。
-        # —— 这样不需要理解 append 的分支逻辑，只看字面量的排列。
-        STRUCT = {'p', 'pPr', 'jc', 'r', 'rPr', 't', 'sectPr', 'body', 'document'}
-        c2_tags = [t for t in tags_in(joined) if t not in STRUCT]
+        # 只取「rPr 变量」里的标签，不再全函数扫。
+        # 识别方式：接收者不是段落变量，且字面量里出现了 rPr 专属标签
+        # （在 RPR_ORDER 里、且不在 PPR_ORDER 里 —— 如 rFonts / b / color / sz / u）。
+        rpr_only = set(RPR_ORDER) - set(PPR_ORDER)
+        rpr_vars = set()
+        for var, lit in apps:
+            if var == out_var:
+                continue
+            if any(t in rpr_only for t in tags_in(lit)):
+                rpr_vars.add(var)
+
+        c2_tags = []
+        for var, lit in apps:
+            if var in rpr_vars:
+                c2_tags.extend([t for t in tags_in(lit) if t in RPR_ORDER])
+            elif var == out_var and '<w:rPr>' in lit:
+                inner = lit.split('<w:rPr>', 1)[1].split('</w:rPr>', 1)[0]
+                c2_tags.extend([t for t in tags_in(inner) if t in RPR_ORDER])
+
+        # 去重相邻重复（同一标签由 addObject/多个分支重复 append 时会出现）
+        dedup = []
+        for t in c2_tags:
+            if not dedup or dedup[-1] != t:
+                dedup.append(t)
+        c2_tags = dedup
 
         if not c2_tags:
             fail("C2 无法从 CSFSRenderPara 提取 rPr 子元素序列（模板结构变了，需人工复核）")

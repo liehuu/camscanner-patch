@@ -109,6 +109,17 @@ jobs:
           # 确保它真的在比顺序，而不是只检查关键字存在。
           python3 tools/rev_check_text_priority.py
           python3 tools/check_text_priority.py src/CamScannerSaveToFiles.m
+          # v23：排版一致性（首行缩进 + 字号归并）。
+          # 用户拿手机预览截图当标准，说「还是不一致」。逐行量墨迹边界后发现两条：
+          #   预览里每个段落首行缩进约两字符（续行 x=64、段首 x=99~107），
+          #     而在此之前产物里 <w:ind> 出现 0 次，23 段全部顶格；
+          #   预览正文字号统一，而产物里 10pt/11pt 各占 7/115，
+          #     恰好整段落在第五条、第六条、第十二条上 —— 看起来就是「这几条字小一圈」。
+          # 这两条编译器和 lint 都看不见：XML 完全合法，Word 也能打开，只是不像。
+          # 先跑反向验证再跑正检 —— v23 升级 C3/C2 判据时它连报两条假 FAIL，
+          # 说明「当前代码能过」并不等于「这条检查在检查东西」。
+          python3 tools/rev_check_render_c.py
+          python3 tools/check_render_c.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |
