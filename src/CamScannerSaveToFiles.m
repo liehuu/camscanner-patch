@@ -3115,7 +3115,15 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         long bestCnt = 0; long bestKey = 12;
                                         for (NSString *k in freq) {
                                             long c = [[freq objectForKey:k] longValue];
-                                            long key = [k longValue];
+                                            // 频次表的键是 NSString（避免浮点做字典键），
+                                            // 所以这里必须用 integerValue 把它转回来。
+                                            // ⚠ 不能用 longValue：那是 NSNumber 的方法，
+                                            //    NSString 只有 integerValue / longLongValue /
+                                            //    intValue / doubleValue，没有 longValue。
+                                            //    CI 第 3118 行就是这么报的：
+                                            //    no visible @interface for 'NSString'
+                                            //    declares the selector 'longValue'
+                                            long key = (long)[k integerValue];
                                             // 同票时取更小的字号：正文通常是小的那个
                                             if (c > bestCnt || (c == bestCnt && key < bestKey)) {
                                                 bestCnt = c; bestKey = key;

@@ -641,6 +641,168 @@ def check_hook_table(cleaned, src):
     return proto_sels
 
 
+def check_receiver_selector_type(cleaned, src):
+    """P7：接收者类型 ↔ selector 归属校验。
+
+    为什么必须加这一条（真实事故，2026-10-28 v18）：
+      统计字号众数时写了 `long key = [k longValue];`，而 k 是
+      `NSString *`。`longValue` 是 NSNumber 的方法，NSString 只有
+      integerValue / longLongValue / intValue / doubleValue。
+      UI 侧 P5 只校验「selector 名在不在白名单里」——`longValue` 确实
+      在白名单（作为 NSNumber 方法），于是 P5 判它 OK。
+      结果 CI 首编报：
+        error: no visible @interface for 'NSString' declares
+               the selector 'longValue'
+      也就是说：**P5 把 selector 名字当全局命名空间用，忽略了它属于谁。**
+
+    做法：
+      扫 `[<简单标识符> <selector>]` 这种单层消息发送，若接收者是
+      NSArray / NSDictionary / NSString 这类已知类型，就把 selector 拿去
+      与该类型的已知方法集求交；命中不了但属于「别的类型的方法」→ FAIL。
+
+    只处理能静态确定类型的简单情形（变量名前后文里有声明）。
+    复杂表达式一律跳过 —— 宁可漏报，不要误报把正常代码拦下来。
+    """
+    # 各 Foundation 类型的方法集（只收高频易混的，不追求完备）
+    NSSTRING = {
+        "length", "UTF8String", "characterAtIndex:", "substringFromIndex:",
+        "substringToIndex:", "substringWithRange:", "stringByAppendingString:",
+        "stringByAppendingPathComponent:", "stringByDeletingLastPathComponent",
+        "stringByDeletingPathExtension", "hasPrefix:", "hasSuffix:",
+        "containsString:", "rangeOfString:", "lowercaseString", "uppercaseString",
+        "capitalizedString", "dataUsingEncoding:", "componentsSeparatedByString:",
+        "pathExtension", "lastPathComponent", "pathComponents", "path",
+        "integerValue", "intValue", "longLongValue", "floatValue", "doubleValue",
+        "boolValue", "stringByTrimmingCharactersInSet:",
+        "stringByReplacingOccurrencesOfString:withString:",
+        "stringByReplacingOccurrencesOfString:withString:options:range:",
+        "writeToFile:atomically:", "writeToFile:atomically:encoding:error:",
+        "writeToURL:atomically:", "isEqualToString:", "mutableCopy",
+        "stringByExpandingTildeInPath", "stringByStandardizingPath",
+        "getCharacters:range:", "stringWithCharacters:length:",
+        "stringByReplacingPercentEscapesUsingEncoding:",
+        "stringByAddingPercentEscapesUsingEncoding:",
+        "fileSystemRepresentation", "cStringUsingEncoding:", "description",
+        "stringValue", "compare:", "localizedStandardCompare:",
+    }
+    NSARRAY = {
+        "count", "objectAtIndex:", "firstObject", "lastObject",
+        "componentsJoinedByString:", "sortedArrayUsingSelector:",
+        "arrayByAddingObject:", "containsObject:", "indexOfObject:",
+        "enumerateObjectsUsingBlock:", "mutableCopy", "addObject:",
+        "removeObject:", "removeObjectAtIndex:", "removeAllObjects",
+        "objectAtIndexedSubscript:", "insertObject:atIndex:",
+        "reverseObjectEnumerator", "objectEnumerator", "subarrayWithRange:",
+        "arrayByAddingObjectsFromArray:", "sortedArrayUsingComparator:",
+        "indexOfObjectPassingTest:", "filteredArrayUsingPredicate:",
+    }
+    NSDICT = {
+        "objectForKey:", "setObject:forKey:", "removeObjectForKey:", "allKeys",
+        "allValues", "count", "setObject:forKeyedSubscript:",
+        "objectForKeyedSubscript:", "enumerateKeysAndObjectsUsingBlock:",
+        "mutableCopy", "addEntriesFromDictionary:", "removeAllObjects",
+        "keysSortedByValueUsingSelector:", "objectsForKeys:notFoundMarker:",
+        "description", "dictionaryWithCapacity:", "dictionaryWithObjects:forKeys:count:",
+    }
+    NSNUMBER = {
+        "integerValue", "intValue", "longValue", "longLongValue", "unsignedLongValue",
+        "unsignedIntegerValue", "doubleValue", "floatValue", "boolValue",
+        "stringValue", "compare:", "isEqualToNumber:", "description",
+        "numberWithLong:", "numberWithInt:", "numberWithDouble:",
+        "numberWithInteger:", "numberWithBool:", "numberWithUnsignedLong:",
+    }
+    # 冒号不区分地做名字匹配：需要按 selector 全名比对
+    TYPES = {
+        "NSString": NSSTRING,
+        "NSMutableString": NSSTRING | {"appendString:", "appendFormat:", "setString:"},
+        "NSArray": NSARRAY,
+        "NSMutableArray": NSARRAY,
+        "NSDictionary": NSDICT,
+        "NSMutableDictionary": NSDICT,
+        "NSNumber": NSNUMBER,
+    }
+    # 全表方法名 → 所属类型（用于反向判定「这是别人的方法」）
+    OWNER = {}
+    for tn, methods in TYPES.items():
+        for meth in methods:
+            OWNER.setdefault(meth, set()).add(tn)
+
+    # 建一张变量名 → 静态类型表。
+    # 三种声明形态都要认：
+    #   NSString *k = ...
+    #   for (NSString *k in freq)
+    #   NSString *k, *j;
+    #
+    # ⚠ 关键：C 的变量名**不是全局唯一**的，不同函数里同名变量可以是不同类型。
+    #   第一版直接用 `var_type[name] = type` 覆盖，等价于「最后一个声明说了算」，
+    #   于是把 A 函数里的 NSMutableArray *out 的类型套到了 B 函数里的
+    #   NSString *out 上，一次跑出 14 条误报（全部是把 addObject:/appendFormat:
+    #   报成「发给了 NSString」）。**误报比漏报更致命**：一旦检查器开始瞎报，
+    #   人就会习惯性忽略它，等于回到没有检查器的状态。
+    #   所以这里改成「同名多类型 → 记成歧义，整条跳过」。
+    var_types = {}
+    # 声明后可能跟的字符：
+    #   =  赋值        ; / ,  多变量       )  宏/参数
+    #   in for-in 循环   （最初漏了这一项，导致 `for (NSString *d in dirs)`
+    #                      没被识别成 NSString 声明，于是同一个 d 在别处被
+    #                      声明成 NSDictionary 时没有形成「歧义」，误报一路
+    #                      漏到 P7 输出里 —— 详细排查见 2026-10-28 记录）
+    #   {  紧跟块
+    #   \n 只写声明不初始化
+    decl_re = re.compile(
+        r"\b(NS(?:Mutable)?(?:String|Array|Dictionary|Number))\s*\*+\s*(\w+)\s*"
+        r"(?=[=;,)\{\n]|\bin\b)")
+    for m in decl_re.finditer(cleaned):
+        tn, name = m.group(1), m.group(2)
+        var_types.setdefault(name, set()).add(tn)
+    # 只保留类型唯一的变量
+    var_type = {k: list(v)[0] for k, v in var_types.items() if len(v) == 1}
+    ambiguous = {k for k, v in var_types.items() if len(v) > 1}
+
+    # 扫单层消息发送 [recv selector]
+    # 只处理 recv 是纯标识符的情形，避免把嵌套表达式/函数调用误判
+    fails = 0
+    msg_re = re.compile(r"\[\s*(\w+)\s+(\w+)\s*")
+    for m in msg_re.finditer(cleaned):
+        recv, sel_name = m.group(1), m.group(2)
+        tn = var_type.get(recv)
+        if not tn or tn not in TYPES:
+            continue
+        # 取完整 selector（含冒号）
+        tail = cleaned[m.start(2):m.start(2) + 200]
+        sm = re.match(r"(\w+(?:\s*:\s*)?)", tail)
+        if not sm:
+            continue
+        full = re.sub(r"\s+", "", sm.group(1))
+        if not full.endswith(":"):
+            has_args = re.match(r"\w+\s*:", tail)
+            if has_args:
+                full = has_args.group(0).replace(" ", "").rstrip()
+        if full.endswith(":"):
+            # 多段 selector 需要拼接，这里只处理单段，避免误判
+            if tail.count(":", 0, min(len(tail), 60)) > 1:
+                pass
+        if not full.endswith(":"):
+            full_sels = {full}
+        else:
+            full_sels = {full}
+
+        methods = TYPES[tn]
+        if any(s in methods for s in full_sels):
+            continue
+        # 名字不在该类型方法集里 —— 但它可能在别的类型里，那就是类型用错
+        owners = OWNER.get(full, set()) - {tn}
+        if owners:
+            fails += 1
+            fail(f"P7 第 {line_of(cleaned, m.start())} 行把 "
+                 f"'{full}' 发给了 {tn} — 该 selector 属于 "
+                 f"{'/'.join(sorted(owners))}，clang 会报 "
+                 f"'no visible @interface for {tn} declares the selector'")
+    if fails == 0:
+        ok("P7 接收者类型 ↔ selector 归属一致（未发现跨类型误用）")
+    return fails
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "src/CamScannerSaveToFiles.m"
     print("=" * 66)
@@ -667,6 +829,7 @@ def main():
     check_blocks(cleaned)
     check_selectors(cleaned, src)
     check_hook_table(cleaned, src)
+    check_receiver_selector_type(cleaned, src)
 
     print("\n" + "=" * 66)
     if FAILS:
