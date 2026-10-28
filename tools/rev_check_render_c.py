@@ -66,19 +66,26 @@ def main():
 
     cases = []
 
-    # 1) <w:ind> 排到 <w:jc> 后面 —— CT_PPrBase 是 sequence，顺序错一项静默失效
+    # v24 起缩进语句变成
+    #   [pPr appendFormat:@"<w:ind%@ w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
+    #       ind, chars, flT];
+    # 锚点必须跟着实现走。这里统一取行首那段，不依赖后面的实参列表 ——
+    # 实参名一改（v23 是 fl，v24 是 flT）锚点就失效，用例会静默 SKIP。
+    IND_ANCHOR = '[pPr appendFormat:@"<w:ind%@ w:firstLineChars='
+
+    # 1) <w:jc> 排到 <w:ind> 前面 —— CT_PPrBase 是 sequence，顺序错一项静默失效
     def c1(t):
-        return inject('ind 后置',
+        return inject('jc 前置',
                       t,
-                      '[pPr appendFormat:@"<w:ind w:firstLineChars=\\"200\\" w:firstLine=\\"%ld\\"/>", fl];',
-                      '[pPr appendFormat:@"<w:jc w:val=\\"both\\"/>"];\n        [pPr appendFormat:@"<w:ind w:firstLineChars=\\"200\\" w:firstLine=\\"%ld\\"/>", fl];')
+                      '            ' + IND_ANCHOR,
+                      '            [pPr appendString:@"<w:jc w:val=\\"both\\"/>"];\n            ' + IND_ANCHOR)
     cases.append(('C9 pPr 顺序', c1, 'C9 pPr 顺序违规'))
 
     # 2) 删掉首行缩进 —— 正是 v22 及之前的真实状态。
     #    两种删法都要试：属性名写错（子串仍含 firstLineChars）和整条删掉。
     def c2a(t):
         return inject('缩进属性名错', t,
-                      'w:firstLineChars=\\"200\\"', 'w:firstLineCharsX=\\"200\\"')
+                      'w:firstLineChars=\\"%ld\\"', 'w:firstLineCharsX=\\"%ld\\"')
     cases.append(('C10 属性名写错', c2a, 'C10 没有首行缩进'))
 
     def c2b(t):
@@ -89,8 +96,8 @@ def main():
     # 3) 缩进 append 到段落变量上（不经过 pPr 变量）—— v19 的真缺陷形态
     def c3(t):
         return inject('缩进落到 pPr 外', t,
-                      '[pPr appendFormat:@"<w:ind w:firstLineChars=\\"200\\" w:firstLine=\\"%ld\\"/>", fl];',
-                      '[out appendFormat:@"<w:ind w:firstLineChars=\\"200\\" w:firstLine=\\"%ld\\"/>", fl];')
+                      IND_ANCHOR,
+                      '[out appendFormat:@"<w:ind%@ w:firstLineChars=')
     cases.append(('C3 缩进跑到 pPr 外', c3, 'C3 段落变量上直接输出了 pPr 子元素'))
 
     # 4) <w:pPr> 包裹模板被去掉（属性变成裸输出）

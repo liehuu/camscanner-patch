@@ -58,10 +58,28 @@ def fail(msg):
 
 
 def extract_func(src, sig):
-    """从签名起截到列 0 的 '}' 为止。"""
-    i = src.find(sig)
+    """从**函数定义**处截到花括号配平为止。
+
+    ⚠ 必须按定义形式定位，不能裸 src.find(sig)：
+    注释里经常提到函数名（例如「v23 的错就在 CSFSRenderPara 里」），
+    裸查找会从注释那一行开始配平，抓到的是一段完全无关的代码。
+    这种「假提取」最阴险 —— 它让检查既不会报错也不会真正生效：
+    抓空的检查永远 FAIL（吵），抓错段的检查可能永远 OK（更糟）。
+    """
+    name = sig.split('(')[0].strip()
+    pat = re.compile(r'^static[^\n{]*\b' + re.escape(name) + r'\s*\(', re.M)
+    i = -1
+    for m in pat.finditer(src):
+        eol = src.find('\n', m.start())
+        head = src[m.start():eol if eol > 0 else len(src)]
+        if head.rstrip().endswith(';'):
+            continue          # 前置声明，不是定义
+        i = m.start()
+        break
     if i < 0:
-        return None
+        i = src.find(sig)     # 退回旧行为，兼容非 static 函数
+        if i < 0:
+            return None
     depth = 0
     j = i
     started = False

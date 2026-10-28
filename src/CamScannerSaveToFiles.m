@@ -1929,9 +1929,18 @@ static BOOL CSFSHookInstance(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
 //   P3 showOfficeShareView   —— 验证第二环（officeFileShareViewData 的直接调用方）
 //   P4 presentViewController —— 广谱：任何模态弹出都记录类名
 static void (*gOrigExportWordAction)(id, SEL) = NULL;
+// v24：前置声明。
+// 读取导出面板开关的实现放在文件后半（它依赖 CSFSValue / CSFSBoolValue），
+// 而 exportWordAction 的 hook 在更早的位置 —— C 没有 hoisting，必须先声明。
+static void CSFSReadOptionsFromBottomView(id bottomView);
+
 static void CSFS_exportWordAction(id self, SEL _cmd) {
     @try {
         CSFS_LOG(@"P1 exportWordAction hit (%@)", NSStringFromClass([self class]));
+        // v24：在这里读三个开关。
+        // 这是唯一能拿到面板 _originalData（CSOcrPage）的时机 ——
+        // 后续解析在后台线程跑，那时面板可能已经销毁。
+        CSFSReadOptionsFromBottomView(self);
         if (gOrigExportWordAction) gOrigExportWordAction(self, _cmd);
     } @catch (NSException *e) {
         CSFS_LOG(@"P1 threw: %@", e.reason);
@@ -2157,6 +2166,47 @@ static NSString *const kCSFSImgName      = @"n";   // media/imageN.ext 里的 N
 // 用「本文档有没有识别成果」来推断模式，比猜 image_category 的取值稳，
 // 也不需要知道导出面板上那个开关到底是什么。
 static NSString *const kCSFSParaImgSuspect = @"hws";
+
+// ── v24：段落版式（全部来自 JSON 自己的 para 字段，不再拍脑袋）
+//
+// 实证来源是类和 ivars，不是我猜的：
+//   CSOcrPageSegmentPara  → _indent_first_line / _indent_left / _indent_right
+//                           _indent_hanging / _tabs / _line_gap
+//                           _paragraph_gap / _paragraph_gap_before
+//                           _justification / _mostFrequentFontSize
+//   CSOcrPageSegmentParaSlice → _add_tabstop / _position
+// 这些名字就是 JSON 键名（snake_case），和已经验证过的
+// paras / slices / stype / text / image_category 同一套命名。
+//
+// v23 的错误正是忽略了它们：自己硬编码 200 字符缩进，
+// 又把 slice 首尾直接相接 —— 于是「每段都缩进」且「字段全粘连」。
+static NSString *const kCSFSParaIndFL    = @"fl";    // 首行缩进（原始值，单位待定）
+static NSString *const kCSFSParaIndL     = @"il";    // 左缩进
+static NSString *const kCSFSParaIndR     = @"ir";    // 右缩进
+static NSString *const kCSFSParaIndH     = @"ih";    // 悬挂缩进
+static NSString *const kCSFSParaTabs     = @"tabs";  // 制表位数组（已归一为 twips）
+static NSString *const kCSFSParaLineGap  = @"lg";    // 行距
+static NSString *const kCSFSParaGapBef   = @"gb";    // 段前
+static NSString *const kCSFSParaBasePt   = @"bp";    // mostFrequentFontSize
+static NSString *const kCSFSParaRenderL  = @"rl";    // para_render_left（横向基准）
+static NSString *const kCSFSRunTab       = @"tab";   // 该 run 前要插 <w:tab/>
+
+// ── v24：导出面板三个开关
+//
+// 实证：CSOcrPage 的 ivars 里正好有这三个 BOOL，
+// 而 CSJsonWordEditBottomView._originalData 的类型就是 CSOcrPage：
+//   _hideWrittenImage    B   → 面板「去除手写」
+//   _hideStampImage      B   → 面板「去除印章」
+//   _handWrittenToImage  B   → 面板「手写转文字」（YES=保留成图）
+// 文案侧也一一对应：cs_651_handwrite_01/02/03。
+//
+// 以前完全没读这三个值，所以用户勾了「去除手写 / 去除印章」也照样输出，
+// 这就是「选中了导出来并没有去除」的全部原因。
+static BOOL gCSFSHideWritten = NO;
+static BOOL gCSFSHideStamp   = NO;
+static BOOL gCSFSHandToImage = NO;
+static BOOL gCSFSOptKnown    = NO;   // 是否成功读到过（用于日志区分「没读到」和「读到 NO」）
+static NSString *gCSFSOptSrc = nil;  // 从哪读到的：page / json / none
 
 // 从 JSON 的布尔字段取值。
 // 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
@@ -2669,6 +2719,151 @@ static BOOL CSFSLooksLikePath(NSString *s) {
 // content / recognizeText 这类键名，但层级归属无法静态确定。
 // 逐个试探比赌一个更可靠，代价只是几次取值。
 // 全部候选都要过「非空、非纯空白、不像路径」三关。
+// ═════════════════════════════════════════════════════════════════════
+// v24：导出面板三个开关的读取
+//
+// 为什么必须读：用户勾了「去除手写」「去除印章」，导出照样两个都在。
+// 原因不是判据写错，而是**压根没读这两个开关** —— 面板状态存在
+// CSJsonWordEditBottomView._originalData（类型 CSOcrPage）上，
+// 我们以前从没碰过它。
+//
+// 两个来源，面板优先、JSON 兜底：
+//   ① -[CSJsonWordEditBottomView originalData] → CSOcrPage 的三个 BOOL
+//   ② JSON 顶层同名键（App 落盘时可能一起写进去）
+// 两个来源都没有时保持上次的值，不覆盖 —— 宁可沿用，也不要用
+// 「读不到就当 NO」把用户已经勾上的选项悄悄关掉。
+// ═════════════════════════════════════════════════════════════════════
+static BOOL CSFSPullOptions(id src, NSString *from) {
+    if (!src) return NO;
+    @try {
+        id hw = CSFSValue(src, @"hideWrittenImage");
+        id st = CSFSValue(src, @"hideStampImage");
+        id hi = CSFSValue(src, @"handWrittenToImage");
+        if (!hw && !st && !hi) return NO;
+        gCSFSHideWritten = CSFSBoolValue(hw);
+        gCSFSHideStamp   = CSFSBoolValue(st);
+        gCSFSHandToImage = CSFSBoolValue(hi);
+        gCSFSOptKnown    = YES;
+        gCSFSOptSrc      = from;
+        CSFS_LOG(@"v24 opts(%@) hideWritten=%d hideStamp=%d handToImage=%d",
+                 from, (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage);
+        return YES;
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v24 opts(%@) threw: %@", from, e.reason);
+        return NO;
+    }
+}
+
+static void CSFSReadOptionsFromBottomView(id bottomView) {
+    if (!bottomView) {
+        CSFS_LOG(@"v24 opts: bottomView is nil");
+        return;
+    }
+    if (CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData")) return;
+    // 面板自己也可能转发这几个属性
+    if (CSFSPullOptions(bottomView, @"bottomView")) return;
+    CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
+             NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// v24：版式数值归一化
+//
+// 硬约束：这些字段（indent_first_line / line_gap / box_* / tabs）
+// 的**单位没有任何静态证据**。ivar 类型只说「是整数/浮点」，
+// 不说是 twips、像素、字符数还是 1/100 pt，JSON 也不带单位说明。
+//
+// 所以按数量级分档，并把原始值和选中的解释都写进日志。
+// 四种解释的典型值相差 10 倍以上，分档是稳的：
+//   两字符缩进 @11pt ≈ 440 twips ≈ 2 字符 ≈ 22 pt ≈ 2200 (1/100pt)
+// 下一轮拿日志一看就能定死，不用再猜。
+// ═════════════════════════════════════════════════════════════════════
+static const double kCSFSContentTwips = 9026.0;   // A4 11906 - 左右边距各 1440
+
+static double CSFSTwipsFromLen(id v, double basePt, const char **why) {
+    double raw = CSFSDoubleValue(v);
+    if (!(raw != 0.0)) {
+        if (why) *why = "-";
+        return 0.0;
+    }
+    double sign = (raw > 0) ? 1.0 : -1.0;
+    double a = fabs(raw);
+    double t;
+    const char *n;
+    if (a <= 10.0)        { t = a * basePt * 20.0; n = "chars"; }
+    else if (a <= 80.0)   { t = a * 20.0;          n = "pt"; }
+    else if (a <= 2000.0) { t = a;                 n = "twips"; }
+    else                  { t = a * 0.2;           n = "centi-pt"; }
+    if (why) *why = n;
+    return sign * t;
+}
+
+// 行距：w:line 在 lineRule=auto 时以 1/240 行为单位。
+// line_gap 可能是倍数（1.25）也可能是 pt（15）。
+static long CSFSLineTwips(id v, const char **why) {
+    double raw = CSFSDoubleValue(v);
+    if (!(raw > 0.0)) {
+        if (why) *why = "-";
+        return 0;
+    }
+    long r;
+    const char *n;
+    if (raw <= 5.0)       { r = (long)(raw * 240.0 + 0.5); n = "multiple"; }
+    else if (raw <= 60.0) { r = (long)(raw * 20.0 + 0.5);  n = "pt"; }
+    else                  { r = (long)raw;                 n = "twips"; }
+    if (why) *why = n;
+    return r;
+}
+
+// 制表位：先按 twips 解读；若整体超出页面，按最大值等比压回内容宽。
+// 这样即使单位是像素也能出一个「比例正确」的结果，而不是把 tab
+// 甩到页面外（Word 会把越界 tab 当默认 tab 处理，反而更乱）。
+static NSArray *CSFSNormalizeTabs(id raw, double basePt, const char **why) {
+    if (why) *why = "-";
+    if (![raw isKindOfClass:[NSArray class]]) return nil;
+    NSArray *arr = (NSArray *)raw;
+    if (arr.count == 0) return nil;
+
+    NSMutableArray *vals = [NSMutableArray arrayWithCapacity:arr.count];
+    double maxv = 0.0;
+    for (id e in arr) {
+        double d = CSFSDoubleValue(e);
+        if (d <= 0) continue;
+        [vals addObject:[NSNumber numberWithDouble:d]];
+        if (d > maxv) maxv = d;
+    }
+    if (vals.count == 0) return nil;
+
+    double scale = 1.0;
+    const char *n = "twips";
+    if (maxv > kCSFSContentTwips * 1.2) {
+        scale = kCSFSContentTwips / maxv;   // 等比压回
+        n = "scaled";
+    } else if (maxv < 100.0) {
+        scale = basePt * 20.0;              // 字符数
+        n = "chars";
+    } else if (maxv < kCSFSContentTwips * 0.15) {
+        // 最大值还不到页宽的 15% —— 这组值不可能是 twips。
+        // 正常制表位至少要能到达页面中部（两列的右列就在 50% 附近）；
+        // 若真按 twips 用，所有 tab 会挤在左边一小块，
+        // 比「不设制表位」还难看。这种情况交回调用方均分。
+        if (why) *why = "reject-too-small";
+        return nil;
+    }
+    if (why) *why = n;
+
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:vals.count];
+    double last = 0.0;
+    for (NSNumber *e in vals) {
+        double t = [e doubleValue] * scale;
+        if (t <= last + 1.0) continue;      // 必须严格递增，否则 Word 忽略
+        if (t > kCSFSContentTwips) break;
+        [out addObject:[NSNumber numberWithDouble:t]];
+        last = t;
+    }
+    return out.count ? out : nil;
+}
+
 static NSString *CSFSSliceText(id sl) {
     static NSArray *keys = nil;
     if (!keys) {
@@ -2800,6 +2995,17 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
             [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunUnderline];
         }
     }
+
+    // v24：这个 slice 前面该插制表符。
+    //
+    // add_tabstop 是 CSOcrPageSegmentParaSlice 的 ivar，App 自己就用它
+    // 表示「本格与前一格之间是制表对齐」。v23 完全忽略它，把 slice
+    // 首尾直连 —— 于是「出租方：董瀚霖身份证号：…（以下简称甲方）」
+    // 挤成一串，而预览里是三列。这是行内版式对不上的直接原因。
+    if (CSFSBoolValue(CSFSValue(sl, @"add_tabstop"))) {
+        [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunTab];
+    }
+
     return run;
 }
 
@@ -3252,35 +3458,126 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 
     NSMutableString *out = [NSMutableString stringWithString:@"<w:p>"];
 
-    // 段落属性。
+    // ── v24：段落属性一律按 JSON 自己的字段生成
     //
-    // v23：加首行缩进两字符。
+    // v23 的错就在于「不读字段、自己编规则」：无条件加 200 字符缩进，
+    // 于是标题以外的每一段都被推了两格；同时 slice 首尾直连，
+    // 于是同行多字段全粘在一起。两条都不是 XML 错，所以结构校验看不出来。
     //
-    // 依据是量出来的，不是拍出来的：把手机预览截图逐行取墨迹边界，
-    // 正文续行左边界恒为 x=64，而每个段落首行的左边界是 99~107 ——
-    // 差 36px，字高 19px，即 1.9 字 ≈ 两字符。也就是说 App 自己渲染时
-    // 每个自然段都首行缩进两字，而本 dylib 之前一个 <w:ind> 都不写，
-    // 22 段全部顶格。这是「导出和预览不像」最直观的一条。
+    // 现在按 App 的 campo 走：
+    //   indent_first_line → <w:ind w:firstLine>
+    //   tabs              → <w:tabs>
+    //   line_gap          → <w:spacing w:line>
+    //   justification     → <w:jc>
     //
-    // 只在 left/both 时缩进：center/right 的段落（合同标题就是 right）
-    // 加缩进会把整行推歪，反而制造新的不一致。
-    //
-    // firstLineChars 是 Word 扩展（按字符数算，随字号自适应），
-    // firstLine 是标准属性（按 twips 算）。两个都写：
-    // Word 优先 firstLineChars，LibreOffice/WPS 只认 firstLine。
-    // 注意 w:ind 必须排在 w:jc **之前** —— CT_PPrBase 是 sequence。
+    // ⚠ 输出顺序必须严格照 CT_PPrBase 的 sequence：
+    //   tabs → spacing → ind → jc
+    //   顺序错一项，Word/WPS 静默忽略，不报错。
     id align = [para objectForKey:kCSFSParaAlign];
-    NSMutableString *pPr = [NSMutableString string];
     BOOL alignLeftish = (align == nil) ||
                         ([align isKindOfClass:[NSString class]] &&
                          ([(NSString *)align isEqualToString:@"both"] ||
                           [(NSString *)align isEqualToString:@"left"]));
-    if (alignLeftish) {
-        // 两字符 = 2 × 字号(pt) × 20 twips/pt。defaultPt 已在 2..200 之间。
-        long fl = (long)(defaultPt * 40.0 + 0.5);
-        if (fl < 20) fl = 20;
-        [pPr appendFormat:@"<w:ind w:firstLineChars=\"200\" w:firstLine=\"%ld\"/>", fl];
+
+    // 本段基准字号：para 自己的 mostFrequentFontSize 优先，
+    // 它比「全文众数」更贴近这一段（标题段就是用自己的大字号算缩进）。
+    double paraPt = CSFSDoubleValue([para objectForKey:kCSFSParaBasePt]);
+    if (!(paraPt > 2.0 && paraPt < 200.0)) paraPt = defaultPt;
+
+    NSMutableString *pPr = [NSMutableString string];
+
+    // 1) 制表位
+    id runsObj = [para objectForKey:kCSFSParaRuns];
+    long tabCount = 0;
+    if ([runsObj isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *r0 in (NSArray *)runsObj) {
+            if ([[r0 objectForKey:kCSFSRunTab] boolValue]) tabCount++;
+        }
     }
+    if (tabCount > 0) {
+        const char *tabWhy = "-";
+        NSArray *tabs = CSFSNormalizeTabs([para objectForKey:kCSFSParaTabs], paraPt, &tabWhy);
+        if (!tabs) {
+            // 没有可用 tabs：按字段数均分内容宽。
+            // 均分不精确（预览里各列宽窄不一），但比「全部粘成一串」
+            // 和无脑默认制表位（每 720 twips）都更接近原样。
+            NSMutableArray *gen = [NSMutableArray array];
+            for (long i = 1; i <= tabCount; i++) {
+                double pos = kCSFSContentTwips * (double)i / (double)(tabCount + 1);
+                [gen addObject:[NSNumber numberWithDouble:pos]];
+            }
+            tabs = gen;
+            tabWhy = "even";
+        }
+        if (tabs.count > 0) {
+            // 直接往 pPr 上 append，不经中间变量。
+            // 这样「tabs 排在 ind 之前」这件事在源码里就是可验证的 ——
+            // 中间变量会让字面量位置与真实输出顺序脱钩，检查器只看得到
+            // 字面量在哪儿，看不出 append 到哪儿，那种检查是假的。
+            [pPr appendString:@"<w:tabs>"];
+            for (NSNumber *n in tabs) {
+                [pPr appendFormat:@"<w:tab w:val=\"left\" w:pos=\"%ld\"/>",
+                    (long)([n doubleValue] + 0.5)];
+            }
+            [pPr appendString:@"</w:tabs>"];
+            CSFS_LOG(@"v24 tabs n=%lu why=%s first=%ld", (unsigned long)tabs.count, tabWhy,
+                     (long)([[tabs objectAtIndex:0] doubleValue] + 0.5));
+        }
+    }
+
+    // 2) 行距与段前
+    {
+        const char *lgWhy = "-";
+        long line = CSFSLineTwips([para objectForKey:kCSFSParaLineGap], &lgWhy);
+        if (line > 0) {
+            // 60..2400 之外的值一定是单位判错了，宁可用默认
+            if (line >= 60 && line <= 2400) {
+                [pPr appendFormat:@"<w:spacing w:line=\"%ld\" w:lineRule=\"auto\"/>", line];
+            }
+        }
+    }
+
+    // 3) 缩进
+    //    首行缩进取 App 的 indent_first_line；它缺失时才退回「两字符」。
+    //    非左对齐段落（center/right，合同标题就是 right）不加缩进 ——
+    //    缩进会把整行推歪，反而制造新的不一致。
+    if (alignLeftish) {
+        const char *flWhy = "-";
+        double fl = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndFL], paraPt, &flWhy);
+        double il = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndL], paraPt, NULL);
+        double ir = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndR], paraPt, NULL);
+
+        long flT = 0, ilT = 0, irT = 0;
+        if (fl != 0.0 && fabs(fl) < kCSFSContentTwips * 0.45) flT = (long)(fl + (fl > 0 ? 0.5 : -0.5));
+        if (il != 0.0 && fabs(il) < kCSFSContentTwips * 0.45) ilT = (long)(il + (il > 0 ? 0.5 : -0.5));
+        if (ir != 0.0 && fabs(ir) < kCSFSContentTwips * 0.45) irT = (long)(ir + (ir > 0 ? 0.5 : -0.5));
+
+        BOOL hasFL = (flT > 0);
+        if (!hasFL && !(flT < 0)) {
+            // 字段缺失或判不出：退回两字符，两字符 = 2 × 字号(pt) × 20
+            long two = (long)(paraPt * 40.0 + 0.5);
+            if (two < 20) two = 20;
+            flT = two;
+            flWhy = "fallback-2chars";
+        }
+        if (flT > 0) {
+            // firstLineChars 是 Word 扩展（按字符自适应字号），
+            // firstLine 是标准属性（twips）。两个都写：
+            // Word 优先前者，WPS/LibreOffice 只认后者。
+            long chars = (long)((double)flT / (paraPt * 20.0) * 100.0 + 0.5);
+            if (chars < 1) chars = 1;
+            if (chars > 2000) chars = 2000;
+            NSMutableString *ind = [NSMutableString string];
+            if (ilT != 0) [ind appendFormat:@" w:left=\"%ld\"", ilT];
+            if (irT != 0) [ind appendFormat:@" w:right=\"%ld\"", irT];
+            [pPr appendFormat:@"<w:ind%@ w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
+                ind, chars, flT];
+            CSFS_LOG(@"v24 ind firstLine=%ld (raw=%@ why=%s pt=%.1f)", flT,
+                     [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy, paraPt);
+        }
+    }
+
+    // 4) 对齐
     if ([align isKindOfClass:[NSString class]] && [(NSString *)align length] > 0) {
         [pPr appendFormat:@"<w:jc w:val=\"%@\"/>", align];
     }
@@ -3296,6 +3593,13 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 
     for (NSDictionary *r in (NSArray *)runs) {
         NSString *text = [r objectForKey:kCSFSRunText];
+
+        // v24：制表符单独成一个 run，且必须排在文字之前。
+        // 单独成 run 而不是塞进同一个 <w:r>：部分移动端阅读器
+        // 只渲染 run 的第一个子元素，混排会吞掉 tab。
+        if ([[r objectForKey:kCSFSRunTab] boolValue]) {
+            [out appendString:@"<w:r><w:tab/></w:r>"];
+        }
         if (text.length == 0) continue;
 
         // 下面这段的**书写顺序就是 XML 输出顺序**，必须严格照 ECMA-376 的
@@ -3723,6 +4027,10 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     // v19：para 单独一个开关，不然先遍历到 para 就把
                                     // slice 那次 dump 吃掉，等于没 dump
                                     BOOL paraDiagDone = NO;
+                                    // v24：段落版式字段只 dump 一次。
+                                    // 缩进/制表位/行距的单位没有静态证据，
+                                    // 只能靠这一次的真实取值把量级定死。
+                                    BOOL layoutDiagDone = NO;
                                     // v21：图片计数（生成 rId / media 文件名 / docPr id）
                                     // 与「图片块结构只 dump 一次」的独立开关。
                                     // 又用独立开关，理由同上：共用 flag 会被先到的分支吃掉。
@@ -3737,6 +4045,13 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     //   seenText     —— 已入列段落的纯文本，用于去重
                                     long imgTextCount = 0;
                                     long imgDupCount = 0;
+                                    // v24：三个开关各自的拦截计数。
+                                    // 分开计数是为了下一轮能一眼看出
+                                    // 「是开关没读到」还是「读到了但判据没命中」。
+                                    long hiddenBlockCount = 0;
+                                    long stampSkipCount = 0;
+                                    long handSkipCount = 0;
+                                    long tabRunCount = 0;
                                     NSMutableSet *blockTypeSet = [NSMutableSet set];
                                     NSMutableSet *seenText = [NSMutableSet set];
                                     // v22：有多少个「stype 本来是图片」的切片
@@ -3767,6 +4082,10 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                 if ([topSegs isKindOfClass:[NSArray class]]) {
                                                     for (id page in topSegs) {
                                                         if (![page respondsToSelector:@selector(objectForKey:)]) continue;
+                                                        // v24：JSON 兜底 —— 若面板没读到，
+                                                        // 看看 page 上有没有同名开关。有就用，
+                                                        // 没有就不动（不覆盖上面已读到的值）。
+                                                        if (!gCSFSOptKnown) CSFSPullOptions(page, @"json.page");
                                                         id blocks = [page objectForKey:@"segments"];
                                                         if (![blocks isKindOfClass:[NSArray class]]) continue;
                                                         for (id block in blocks) {
@@ -3786,6 +4105,17 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                             // 而白名单式过滤会把它们整块吞掉。
                                                             // 每遇到一种新类型打一行 shape ——
                                                             // 这一行能直接看到手写块的字段构成。
+                                                            // v24：「去除手写 / 去除印章」的第一道 —— 块级隐藏。
+                                                            //
+                                                            // CSOcrPageSegment 有 _hiding（BOOL）。App 渲染时
+                                                            // 就是靠它把被选项隐掉的块排除在外。
+                                                            // 我们以前完全不看这个字段，所以哪怕 App 已经把
+                                                            // 块标成隐藏，导出照样会把它吐出来。
+                                                            if (CSFSBoolValue(CSFSValue(block, @"hiding"))) {
+                                                                hiddenBlockCount++;
+                                                                continue;
+                                                            }
+
                                                             if (bt.length > 0 && ![blockTypeSet containsObject:bt]) {
                                                                 [blockTypeSet addObject:bt];
                                                                 CSFS_LOG(@"v22 new block type: %@ shape=%@",
@@ -3823,6 +4153,42 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                       [catStr containsString:@"text"] ||
                                                                       [catStr containsString:@"ocr"]));
                                                                 BOOL hasParaTree = (CSFSValue(block, @"paras") != nil);
+
+                                                                // ── v24：去除印章（块级）
+                                                                //
+                                                                // 判据两条，都来自身份字段而不是猜：
+                                                                //   ① image_category 含 stamp / seal / yinzhang
+                                                                //   ② segment 自带 -isStampImage（valueForKey 可直接调）
+                                                                // 只勾了「去除印章」时才拦；没勾就照常输出，
+                                                                // 因为印章本身常常就是合同的要件。
+                                                                if (gCSFSHideStamp) {
+                                                                    BOOL isStamp = (catStr.length > 0 &&
+                                                                                    ([catStr containsString:@"stamp"] ||
+                                                                                     [catStr containsString:@"seal"] ||
+                                                                                     [catStr containsString:@"yinzhang"]));
+                                                                    if (!isStamp &&
+                                                                        CSFSBoolValue(CSFSValue(block, @"isStampImage"))) {
+                                                                        isStamp = YES;
+                                                                    }
+                                                                    if (isStamp) {
+                                                                        stampSkipCount++;
+                                                                        CSFS_LOG(@"v24 hideStamp: skip IMAGE block cat=%@", catStr ?: @"(nil)");
+                                                                        continue;
+                                                                    }
+                                                                }
+
+                                                                // ── v24：去除手写（块级）
+                                                                //
+                                                                // 必须排在下面「文字优先」之前：用户勾的是「删掉手写」，
+                                                                // 不是「把手写换成文字」。v22 的文字优先是对的，
+                                                                // 但它没让位给这个开关，于是勾了去除手写，
+                                                                // 手写的 OCR 文字照样被写进 Word —— 正是用户说的「没去除」。
+                                                                if (gCSFSHideWritten && handwriteLike) {
+                                                                    handSkipCount++;
+                                                                    CSFS_LOG(@"v24 hideWritten: skip IMAGE block cat=%@", catStr ?: @"(nil)");
+                                                                    continue;
+                                                                }
+
                                                                 // v22：这个图块是不是「可能是重复的手写底图」。
                                                                 // 在 if 内被置 YES，出图时据此打标记。
                                                                 BOOL suspectHandwriteImg = NO;
@@ -3926,6 +4292,32 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     [NSMutableArray arrayWithCapacity:[(NSArray *)slices count]];
                                                                 BOOL hasText = NO;
                                                                 for (id sl in slices) {
+                                                                    // ── v24：去印章 / 去手写（切片级）+ 切片隐藏
+                                                                    //
+                                                                    // 三处过滤统一放在最前面，理由：只要拦在
+                                                                    // 「文字优先」之后，手写片段的 OCR 文字就已经
+                                                                    // 进了 runs，再拦也删不掉了。
+                                                                    {
+                                                                        id stRaw = CSFSValue(sl, @"stype");
+                                                                        NSString *stLow =
+                                                                            [stRaw isKindOfClass:[NSString class]]
+                                                                            ? [(NSString *)stRaw lowercaseString] : nil;
+                                                                        if (gCSFSHideStamp && stLow.length > 0 &&
+                                                                            ([stLow containsString:@"stamp"] ||
+                                                                             [stLow containsString:@"seal"])) {
+                                                                            stampSkipCount++;
+                                                                            continue;
+                                                                        }
+                                                                        if (gCSFSHideWritten && stLow.length > 0 &&
+                                                                            [stLow containsString:@"handwrit"]) {
+                                                                            handSkipCount++;
+                                                                            continue;
+                                                                        }
+                                                                        if (CSFSBoolValue(CSFSValue(sl, @"hiding"))) {
+                                                                            hiddenBlockCount++;
+                                                                            continue;
+                                                                        }
+                                                                    }
                                                                     // v21：图片片段单独成段。
                                                                     // 依据是 stype 这个类型字段（详见
                                                                     // CSFSSliceImageInfo 注释）。
@@ -3950,8 +4342,16 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                             }
                                                                         }
                                                                     }
+                                                                    // v24：文字优先的适用条件改由面板开关决定。
+                                                                    //   handWrittenToImage == NO  → 手写转文字，文字优先
+                                                                    //                                （v22 的规则，实测可用）
+                                                                    //   handWrittenToImage == YES → 用户要手写保留成图，
+                                                                    //                                就不该由我们去抢它的图
+                                                                    // 读不到开关时沿用文字优先，不改变已能工作的行为。
+                                                                    BOOL textWins = (slText != nil) &&
+                                                                                    (gCSFSOptKnown ? !gCSFSHandToImage : YES);
                                                                     NSDictionary *sliceImg =
-                                                                        (slText != nil) ? nil : CSFSSliceImageInfo(sl);
+                                                                        textWins ? nil : CSFSSliceImageInfo(sl);
                                                                     if (sliceImg) {
                                                                         imgSeq++;
                                                                         NSMutableDictionary *si =
@@ -3977,14 +4377,51 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                         [tt stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
                                                                     if (trimmed.length == 0) continue;
                                                                     hasText = YES;
+                                                                    if ([[run objectForKey:kCSFSRunTab] boolValue]) tabRunCount++;
                                                                     [runs addObject:run];
                                                                 }
                                                                 // 全空白段落直接丢掉（原实现靠 trim 达到同一效果）
                                                                 if (!hasText) continue;
 
                                                                 NSMutableDictionary *p =
-                                                                    [NSMutableDictionary dictionaryWithCapacity:4];
+                                                                    [NSMutableDictionary dictionaryWithCapacity:6];
                                                                 [p setObject:runs forKey:kCSFSParaRuns];
+
+                                                                // v24：把段落自身的版式字段带出来。
+                                                                //
+                                                                // 这些键名来自 CSOcrPageSegmentPara 的 ivar
+                                                                // （JSON 键名与 ivar 同名，去掉下划线前缀）：
+                                                                //   indent_first_line / indent_left / indent_right
+                                                                //   tabs / line_gap / mostFrequentFontSize
+                                                                // App 预览就是按这些渲染的，而 v23 一个都没读 ——
+                                                                // 全靠自编规则，所以永远对不上。
+                                                                {
+                                                                    id fl = CSFSValue(para, @"indent_first_line");
+                                                                    id il = CSFSValue(para, @"indent_left");
+                                                                    id ir = CSFSValue(para, @"indent_right");
+                                                                    id tb = CSFSValue(para, @"tabs");
+                                                                    id lg = CSFSValue(para, @"line_gap");
+                                                                    id bp = CSFSValue(para, @"mostFrequentFontSize");
+                                                                    if (fl) [p setObject:fl forKey:kCSFSParaIndFL];
+                                                                    if (il) [p setObject:il forKey:kCSFSParaIndL];
+                                                                    if (ir) [p setObject:ir forKey:kCSFSParaIndR];
+                                                                    if (tb) [p setObject:tb forKey:kCSFSParaTabs];
+                                                                    if (lg) [p setObject:lg forKey:kCSFSParaLineGap];
+                                                                    if (bp) [p setObject:bp forKey:kCSFSParaBasePt];
+
+                                                                    // 只 dump 一次，把真实取值和量级打进日志。
+                                                                    // 单位只能靠这个日志定死，静态分析做不到。
+                                                                    if (layoutDiagDone == NO) {
+                                                                        layoutDiagDone = YES;
+                                                                        CSFS_LOG(@"v24 DIAG para layout: fl=%@ il=%@ ir=%@"
+                                                                                 @" lg=%@ bp=%@ tabs=%@ shape=%@",
+                                                                                 fl ?: @"(nil)", il ?: @"(nil)",
+                                                                                 ir ?: @"(nil)", lg ?: @"(nil)",
+                                                                                 bp ?: @"(nil)",
+                                                                                 tb ? CSFSDescribeShape(tb) : @"(nil)",
+                                                                                 CSFSDescribeShape(para));
+                                                                    }
+                                                                }
 
                                                                 // 段落级对齐。
                                                                 // v22 抽成 CSFSMapJustification ——
@@ -4194,6 +4631,19 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                  imgTextCount, imgDupCount,
                                                  sliceTextWinCount, imgSuspectDropped,
                                                  firstSliceImgSType ?: @"(none)");
+                                        // v24：开关判读的一行结论。
+                                        // optKnown=0 说明面板状态压根没读到 ——
+                                        // 那时 hideStamp/hideWritten 一定是 0，
+                                        // 不能据此认为「用户没勾」，要单独看 opts 那行。
+                                        CSFS_LOG(@"v24 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
+                                                 @" handToImage=%d | hiddenBlock=%ld stampSkip=%ld"
+                                                 @" handSkip=%ld tabRuns=%ld paras=%lu",
+                                                 (int)gCSFSOptKnown, gCSFSOptSrc ?: @"(none)",
+                                                 (int)gCSFSHideWritten, (int)gCSFSHideStamp,
+                                                 (int)gCSFSHandToImage,
+                                                 hiddenBlockCount, stampSkipCount,
+                                                 handSkipCount, tabRunCount,
+                                                 (unsigned long)styledParas.count);
                                         if (firstStyled) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);
                                         } else {

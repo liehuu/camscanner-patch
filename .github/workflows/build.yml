@@ -120,6 +120,13 @@ jobs:
           # 说明「当前代码能过」并不等于「这条检查在检查东西」。
           python3 tools/rev_check_render_c.py
           python3 tools/check_render_c.py src/CamScannerSaveToFiles.m
+          # v24：导出面板开关 + 行内版式。
+          # 「去除手写 / 去除印章」勾了不生效，根因是压根没读面板开关
+          # （CSOcrPage 的 hideWrittenImage / hideStampImage / handWrittenToImage），
+          # 而同行多字段粘连，根因是忽略了 para.tabs 与 slice.add_tabstop。
+          # 两条都是「少做了一件事」，代码完全合法 —— 编译器与 lint 一律看不见。
+          python3 tools/rev_check_v24.py
+          python3 tools/check_v24.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |
