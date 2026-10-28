@@ -3015,6 +3015,9 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     NSMutableArray *styledParas = [NSMutableArray array];
                                     // v18 诊断开关：只 dump 一次真实 style，见 CSFSParseSlice 注释
                                     BOOL diagDone = NO;
+                                    // v19：para 单独一个开关，不然先遍历到 para 就把
+                                    // slice 那次 dump 吃掉，等于没 dump
+                                    BOOL paraDiagDone = NO;
                                     id parsed = nil;
                                     SEL jsel = NSSelectorFromString(
                                         @"JSONObjectWithData:options:error:");
@@ -3058,9 +3061,18 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                             // v18：每个 para 生成一个独立段落，
                                                             // 并把每个 slice 的 style 一并带出来。
                                                             for (id para in paras) {
-                                                                if (![para respondsToSelector:@selector(objectForKey:)]) continue;
-                                                                id slices = [para objectForKey:@"slices"];
+                                                                // v19：para 也可能是模型对象。
+                                                                // 原写法先判 objectForKey: 再 continue，
+                                                                // 非字典的 para 会被整段丢掉 —— 文字都留不下。
+                                                                id slices = CSFSValue(para, @"slices");
                                                                 if (![slices isKindOfClass:[NSArray class]]) continue;
+
+                                                                // 只 dump 一次 para，用独立开关避免和 slice 的抢。
+                                                                if (paraDiagDone == NO) {
+                                                                    paraDiagDone = YES;
+                                                                    CSFS_LOG(@"v19 DIAG para %@",
+                                                                             CSFSDescribeShape(para));
+                                                                }
 
                                                                 NSMutableArray *runs =
                                                                     [NSMutableArray arrayWithCapacity:[(NSArray *)slices count]];
@@ -3082,10 +3094,17 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     [NSMutableDictionary dictionaryWithCapacity:4];
                                                                 [p setObject:runs forKey:kCSFSParaRuns];
 
-                                                                // 段落级对齐
-                                                                id just = [para objectForKey:@"justification"];
+                                                                // 段落级对齐（v19：走 CSFSValue，两态通吃）
+                                                                id just = CSFSValue(para, @"justification");
+                                                                NSString *justStr = nil;
                                                                 if ([just isKindOfClass:[NSString class]]) {
-                                                                    NSString *j = [(NSString *)just lowercaseString];
+                                                                    justStr = (NSString *)just;
+                                                                } else if ([just isKindOfClass:[NSNumber class]]) {
+                                                                    // 万一是数值枚举，转成字符串再走同一套映射
+                                                                    justStr = [(NSNumber *)just stringValue];
+                                                                }
+                                                                if (justStr.length > 0) {
+                                                                    NSString *j = [justStr lowercaseString];
                                                                     // CamScanner 的值可能是枚举名也可能是数值，
                                                                     // 只映射能明确识别的，其余留给 Word 默认。
                                                                     //
@@ -3102,6 +3121,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                         mapped = @"right";
                                                                     } else if ([j isEqualToString:@"both"] ||
                                                                                [j isEqualToString:@"justify"] ||
+                                                                               [j isEqualToString:@"justified"] ||
                                                                                [j isEqualToString:@"3"]) {
                                                                         mapped = @"both";
                                                                     }
