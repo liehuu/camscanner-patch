@@ -2286,8 +2286,8 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
 
     if (diagnosticPtr && !*diagnosticPtr) {
         *diagnosticPtr = YES;
-        CSFS_LOG(@"v19 DIAG slice %@", CSFSDescribeShape(sl));
-        CSFS_LOG(@"v19 DIAG style %@", CSFSDescribeShape(style));
+        CSFS_LOG(@"v20 DIAG slice %@", CSFSDescribeShape(sl));
+        CSFS_LOG(@"v20 DIAG style %@", CSFSDescribeShape(style));
     }
 
     // 两路候选：style 优先，slice 自己兜底（万一 JSON 是扁平结构）。
@@ -2664,15 +2664,28 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
     [cd appendData:nameData];
 }
 
-// v18：把一段段落字典渲染成 <w:p>…</w:p>。
+// v20：把一段段落字典渲染成完整的 <w:p>…</w:p>。
+//
+// ⚠ v18/v19 在这里漏了最外层的 <w:p>，只输出了 <w:pPr>+<w:r> 裸片段。
+//   后果不是「格式丢失」而是**整个文件打不开**：
+//   Word 报「在试图打开文件时遇到错误」，因为
+//     · CT_Body 只允许块级元素（p/tbl/sdt…），body 下直接出现 pPr/r 是违规
+//     · CT_P 里 pPr 的 maxOccurs=1，且必须在首位，不能夹在 run 之间
+//   这是比 v17「无法读取的内容」更前置的错误 —— Word 连容错解析都不做。
 //
 // Word 的字号单位是「半磅」(half-point)，所以 pt × 2。
 // 颜色写成 <w:color w:val="FF0000"/>，不带 # 号，否则 Word 会忽略这个属性。
+//
+// ⚠ <w:rPr> 的子元素是 xsd:sequence，顺序错 Word 同样拒收。
+//   ECMA-376 规定的顺序（节选）：
+//     rStyle → rFonts → b → bCs → i → iCs → … → color → … → sz → szCs
+//     → highlight → u → …
+//   所以 rFonts 必须写在 b 前面，u 必须写在 sz 后面。
+//   v19 把 rFonts 写在 color 之后、u 写在最前，两个位置都是错的。
 static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
-    NSMutableString *out = [NSMutableString string];
+    NSMutableString *out = [NSMutableString stringWithString:@"<w:p>"];
 
-    // 段落属性：对齐。
-    // 只在确有必要时写 <w:pPr>，避免产出大量空属性块。
+    // 段落属性：对齐。只在确有必要时写 <w:pPr>，避免产出大量空属性块。
     id align = [para objectForKey:kCSFSParaAlign];
     if ([align isKindOfClass:[NSString class]] && [(NSString *)align length] > 0) {
         [out appendFormat:@"<w:pPr><w:jc w:val=\"%@\"/></w:pPr>", align];
@@ -2680,7 +2693,7 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 
     id runs = [para objectForKey:kCSFSParaRuns];
     if (![runs isKindOfClass:[NSArray class]] || [(NSArray *)runs count] == 0) {
-        [out appendString:@"<w:r><w:t xml:space=\"preserve\"></w:t></w:r>"];
+        [out appendString:@"<w:r><w:t xml:space=\"preserve\"></w:t></w:r></w:p>"];
         return out;
     }
 
@@ -2688,17 +2701,13 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         NSString *text = [r objectForKey:kCSFSRunText];
         if (text.length == 0) continue;
 
+        // 下面这段的**书写顺序就是 XML 输出顺序**，必须严格照 ECMA-376 的
+        // CT_RPr sequence 排，不能按「先想到哪个写哪个」。改动前先回看上面的注释。
         NSMutableString *rPr = [NSMutableString string];
-        if ([[r objectForKey:kCSFSRunBold] boolValue])      [rPr appendString:@"<w:b/><w:bCs/>"];
-        if ([[r objectForKey:kCSFSRunItalic] boolValue])    [rPr appendString:@"<w:i/><w:iCs/>"];
-        if ([[r objectForKey:kCSFSRunUnderline] boolValue]) [rPr appendString:@"<w:u w:val=\"single\"/>"];
 
-        NSString *color = [r objectForKey:kCSFSRunColor];
-        if (color.length == 6) {
-            [rPr appendFormat:@"<w:color w:val=\"%@\"/>", color];
-        }
-        // 字体：同时写 ascii/hAnsi/eastAsia。
-        // 中文文档只写 hAnsi 不起作用，Word 会按 eastAsia 走。
+        // 1) rFonts —— 除 rStyle 外必须排第一。
+        // 同时写 ascii/hAnsi/eastAsia：中文文档只写 hAnsi 不起作用，
+        // Word 会按 eastAsia 走。
         NSString *face = [r objectForKey:kCSFSRunFace];
         if (face.length > 0) {
             NSString *fe = CSFSXMLEscape(face);
@@ -2706,15 +2715,31 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
                 @"<w:rFonts w:ascii=\"%@\" w:hAnsi=\"%@\" w:eastAsia=\"%@\" w:cs=\"%@\"/>",
                 fe, fe, fe, fe];
         }
-        // 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
-        // 否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
+        // 2) 粗体
+        if ([[r objectForKey:kCSFSRunBold] boolValue])   [rPr appendString:@"<w:b/><w:bCs/>"];
+        // 3) 斜体
+        if ([[r objectForKey:kCSFSRunItalic] boolValue]) [rPr appendString:@"<w:i/><w:iCs/>"];
+        // 4) 颜色
+        NSString *color = [r objectForKey:kCSFSRunColor];
+        if (color.length == 6) {
+            [rPr appendFormat:@"<w:color w:val=\"%@\"/>", color];
+        }
+        // 5) 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
+        //    否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
         id szObj = [r objectForKey:kCSFSRunSize];
         if (szObj) {
             double sz = [szObj doubleValue];
             if (sz > 0 && fabs(sz - defaultPt) > 0.5) {
                 long hp = (long)(sz * 2.0 + 0.5);
+                // 越界字号 Word 会当损坏处理，直接钳进合法区间
+                if (hp < 1) hp = 1;
+                if (hp > 3276) hp = 3276;
                 [rPr appendFormat:@"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>", hp, hp];
             }
+        }
+        // 6) 下划线 —— 必须排在 sz 之后
+        if ([[r objectForKey:kCSFSRunUnderline] boolValue]) {
+            [rPr appendString:@"<w:u w:val=\"single\"/>"];
         }
 
         if (rPr.length > 0) {
@@ -2725,6 +2750,7 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
                 CSFSXMLEscape(text)];
         }
     }
+    [out appendString:@"</w:p>"];
     return out;
 }
 
@@ -2735,7 +2761,7 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 // defaultPt 取全文出现最多的字号，作为 Normal 的基准，
 // 这样「标题比正文大」这件事在 Word 里能被体现出来（标题写 sz，正文继承）。
 static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outPath) {
-    CSFSCrashTrace("docx18: enter");
+    CSFSCrashTrace("docx20: enter");
 
     NSMutableString *body = [NSMutableString string];
     for (NSDictionary *p in paras) {
@@ -2746,11 +2772,15 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     long defHalfPt = (long)(defaultPt * 2.0 + 0.5);
     if (defHalfPt < 4 || defHalfPt > 400) defHalfPt = 24;   // 兜底 12pt
 
+    // ⚠ <w:pgMar> 的 header / footer / gutter 在 ECMA-376 里标的是
+    //   use="required"，缺一个 Word 就按损坏处理。v19 只写了四边，
+    //   这是除「漏 w:p」之外的第二个致命项。
     NSString *docXml = [NSString stringWithFormat:
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
         @"<w:body>%@<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
-        @"<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/>"
+        @"<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\""
+        @" w:header=\"851\" w:footer=\"992\" w:gutter=\"0\"/>"
         @"</w:sectPr></w:body></w:document>",
         body];
     NSString *ctXml =
@@ -2818,7 +2848,7 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     CSFSCrashTrace("docx18: eocd done");
 
     BOOL ok = [zipData writeToFile:outPath atomically:YES];
-    CSFS_LOG(@"v19 docx written=%d paras=%lu defPt=%.1f size=%lu",
+    CSFS_LOG(@"v20 docx written=%d paras=%lu defPt=%.1f size=%lu",
              (int)ok, (unsigned long)paras.count, defaultPt,
              (unsigned long)zipData.length);
     return ok;
@@ -3070,7 +3100,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 // 只 dump 一次 para，用独立开关避免和 slice 的抢。
                                                                 if (paraDiagDone == NO) {
                                                                     paraDiagDone = YES;
-                                                                    CSFS_LOG(@"v19 DIAG para %@",
+                                                                    CSFS_LOG(@"v20 DIAG para %@",
                                                                              CSFSDescribeShape(para));
                                                                 }
 
@@ -3142,7 +3172,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             // 保底：通用递归收集
                                             CSFSCollectStrings(parsed, lines);
                                         }
-                                        CSFS_LOG(@"v19 json parsed, %lu 段带样式",
+                                        CSFS_LOG(@"v20 json parsed, %lu 段带样式",
                                                  (unsigned long)styledParas.count);
                                     } else {
                                         // 非 JSON：原文按行切，生成无样式段落
@@ -3229,7 +3259,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             }
                                         }
                                         if (bestCnt > 0) defaultPt = (double)bestKey;
-                                        CSFS_LOG(@"v19 defaultPt=%.1f (样本 %ld 个 run)",
+                                        CSFS_LOG(@"v20 defaultPt=%.1f (样本 %ld 个 run)",
                                                  defaultPt, bestCnt);
                                     }
 
@@ -3255,15 +3285,15 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                 }
                                             }
                                         }
-                                        CSFS_LOG(@"v19 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
+                                        CSFS_LOG(@"v20 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
                                                  (unsigned long)styledParas.count,
                                                  nRun, nColor, nBold, nSize);
                                         if (firstStyled) {
-                                            CSFS_LOG(@"v19 sample run: %@", firstStyled);
+                                            CSFS_LOG(@"v20 sample run: %@", firstStyled);
                                         } else {
                                             // 一个带格式的 run 都没有 —— 字段名或层级对不上，
                                             // 去看上面的 "v19 DIAG slice / style" 两行。
-                                            CSFS_LOG(@"v19 stats: NO styled run at all");
+                                            CSFS_LOG(@"v20 stats: NO styled run at all");
                                         }
                                     }
 
