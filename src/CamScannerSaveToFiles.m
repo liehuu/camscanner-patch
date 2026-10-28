@@ -2611,6 +2611,29 @@ static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
 //   font_attribute 是 T@"CSTranslateRawPageFont"），
 // 但**层级归属**（谁挂在谁下面）无法靠静态分析确定。
 // 这段 dump 一旦拿到日志，就能一次性定死，不用再猜。
+// v21：判断一个 slice 是不是「图片片段」，是则返回图片信息。
+//
+// 依据：slice.stype 的类型编码是 T@"NSString"（不是 long），
+// 且字符串池里同时出现 "paraSlices" 和 "imageSlices" ——
+// 说明 slice 按类型分家，stype 就是那个类型字段。
+//
+// ⚠ 但 stype 的**具体取值**没有任何静态证据（二进制里只有键名，没有枚举值）。
+//   所以这里不按「等于 image」精确匹配，而是看它**是否含有**图片语义的片段；
+//   更关键的是：**只有 stype 明确像图片时才去找图**，没有 stype 一律按文字处理。
+//   宁可让一行文字被当文字（最坏是显示成路径），也不能把文字误判成图。
+static NSDictionary *CSFSSliceImageInfo(id sl) {
+    id st = CSFSValue(sl, @"stype");
+    if (![st isKindOfClass:[NSString class]]) return nil;
+    NSString *s = [(NSString *)st lowercaseString];
+    if (s.length == 0) return nil;
+    if (![s containsString:@"image"] && ![s containsString:@"img"] &&
+        ![s containsString:@"pic"] && ![s containsString:@"stamp"] &&
+        ![s containsString:@"handwrit"] && ![s containsString:@"photo"]) {
+        return nil;
+    }
+    return CSFSFindImage(sl, 0);
+}
+
 static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
     id t = CSFSValue(sl, @"text");
     if (![t isKindOfClass:[NSString class]] || [(NSString *)t length] == 0) return nil;
@@ -3564,6 +3587,31 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     [NSMutableArray arrayWithCapacity:[(NSArray *)slices count]];
                                                                 BOOL hasText = NO;
                                                                 for (id sl in slices) {
+                                                                    // v21：图片片段单独成段。
+                                                                    // 依据是 stype 这个类型字段（详见
+                                                                    // CSFSSliceImageInfo 注释）。
+                                                                    // 图片段先于本段文字入列 ——
+                                                                    // 实际数据里图片 slice 往往独占一段，
+                                                                    // 顺序差异不影响可读性。
+                                                                    NSDictionary *sliceImg = CSFSSliceImageInfo(sl);
+                                                                    if (sliceImg) {
+                                                                        imgSeq++;
+                                                                        NSMutableDictionary *si =
+                                                                            [NSMutableDictionary dictionaryWithDictionary:sliceImg];
+                                                                        [si setObject:[NSNumber numberWithLong:imgSeq]
+                                                                               forKey:kCSFSImgName];
+                                                                        CSFS_LOG(@"v21 slice image #%ld %@ %@x%@ bytes=%lu",
+                                                                                 imgSeq,
+                                                                                 [si objectForKey:kCSFSImgExt],
+                                                                                 [si objectForKey:kCSFSImgPxW],
+                                                                                 [si objectForKey:kCSFSImgPxH],
+                                                                                 (unsigned long)[[si objectForKey:kCSFSImgData] length]);
+                                                                        NSMutableDictionary *ip =
+                                                                            [NSMutableDictionary dictionaryWithCapacity:1];
+                                                                        [ip setObject:si forKey:kCSFSParaImage];
+                                                                        [styledParas addObject:ip];
+                                                                        continue;
+                                                                    }
                                                                     NSMutableDictionary *run = CSFSParseSlice(sl, &diagDone);
                                                                     if (!run) continue;
                                                                     NSString *tt = [run objectForKey:kCSFSRunText];
