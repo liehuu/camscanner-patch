@@ -34,6 +34,13 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 // ── 日志 ───────────────────────────────────────────────────────────────
 //
@@ -51,6 +58,22 @@ static void CSFSLogToFile(NSString *msg);
 
 #define CSFS_LOG(fmt, ...) \
     CSFSLogToFile([NSString stringWithFormat:@"[CSFS] " fmt, ##__VA_ARGS__])
+
+// ── 同步崩溃取证日志（v16 新增）────────────────────────────────────────
+//
+// CSFS(11).log 的教训：日志停在「v12 json head」之后就没了，看起来像崩在
+// JSON 解析那一段。但那只说明**异步队列里还没写盘的条目跟着进程一起没了**，
+// 崩溃点其实在这之后更远的地方。
+//
+// CSFS_LOG 走 dispatch_async + NSFileHandle，进程一崩，队列里积压的条目
+// 全部丢失 —— 用它来找崩溃点等于蒙眼打靶。所以崩溃取证必须用**同步 write(2)**：
+//   · 不开缓冲、不排队、不依赖 Foundation 对象生命周期
+//   · 直接 write(2) 到已打开的 fd，系统调用返回即已进入内核页缓存
+//   · 即使在任意线程崩溃，此前每一次 CHECKPOINT 都必然落盘
+//
+// 用法：只在可能崩溃的**关键步骤之间**埋点（不要在热路径里刷屏）。
+// 每条都带 [CRASH-TRACE] 前缀，日志里一眼可辨。
+static void CSFSCrashTrace(const char *tag);
 
 // ── 面板条目的 identifyId。原 app 使用 0x64~0x7D / 0xD3 / 0xDE / 0xDF / 0xF0 / 0xF2 / 0x43，
 //    0xE5 未被占用（见 -[CSShareManager shareActionWithOperationTpe:needLog:] 的分派表）。
@@ -79,6 +102,56 @@ static BOOL gCSFSInstalled = NO;
 // dispatch_async 的 block 内，检查器也看不到这层跨函数关系，会直接判
 // 「会卡主线程、watchdog 杀进程」。内联之后语义完全一样（本来也就只被
 // 日志写盘这一处调用），但检查器能正确证明它跑在后台。
+
+// 同步崩溃取证实现。
+//
+// 刻意**不用** NSString / NSFileHandle / NSFileManager：
+// 崩溃往往发生在对象状态已经损坏的时候，此时再走 Foundation 等于在雷区里跑步。
+// 这里只用 C 运行时 + POSIX：
+//   · 路径由 CSFSLogToFile 首次解析后存成 C 字符串（gCSFSTracePath）
+//   · 首次调用时 open(2) 一个 fd，之后一直是 append 模式
+//   · 每次 write(2) 一条，同步返回
+//
+// 线程安全：write(2) 对同一 fd 的 O_APPEND 在写入量 < PIPE_BUF(512) 时是原子的，
+// 本次每行上限 256 字节，不会与其他线程的日志交错成半行。
+static int gCSFSTraceFd = -1;
+static char gCSFSTracePath[1024];
+
+static void CSFSCrashTracePath(const char *path) {
+    if (!path || !path[0]) return;
+    size_t n = strlen(path);
+    if (n >= sizeof(gCSFSTracePath)) n = sizeof(gCSFSTracePath) - 1;
+    memcpy(gCSFSTracePath, path, n);
+    gCSFSTracePath[n] = '\0';
+    // 复用同一个文件：与 CSFS_LOG 写同一份 CSFS.log，用户在「文件」App 里
+    // 只需要取一个文件，不用满沙盒找第二个日志。
+    //
+    // 刻意在这里就把 fd 打开好，而不是留给 CSFSCrashTrace 惰性初始化：
+    // 本函数由 CSFSLogToFile 的 dispatch_once 调用，天然只执行一次，
+    // 不存在并发重复 open 的竞态。这样 CSFSCrashTrace 退化成
+    // 「判断 fd + write」两步，崩溃现场执行路径越短越安全。
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) gCSFSTraceFd = fd;
+}
+
+static void CSFSCrashTrace(const char *tag) {
+    if (!tag) return;
+    // 只读不初始化：fd 由 CSFSCrashTracePath 在 dispatch_once 里备好。
+    // 若尚未就绪（极早期调用），静默跳过 —— 取证失败绝不能影响业务。
+    int wfd = gCSFSTraceFd;
+    if (wfd < 0) return;
+    // 缓冲必须 < PIPE_BUF(512)：多线程同时 write(2) 同一 fd 时，
+    // 小于 PIPE_BUF 的写入是原子的，不会互相撕裂成半行。
+    // 本项目的 lint R8b 会把 ≥512 判为失败（第一次就抓到 512 这个临界值）。
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "[CRASH-TRACE] %s\n", tag);
+    if (n <= 0) return;
+    // snprintf 返回「本应写入的长度」，超长时 n 可能 > sizeof(buf)，
+    // 必须夹回实际可用长度，否则 write 会读越界（这是常见的一行崩溃）。
+    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    // 忽略返回值：日志失败绝不影响业务，更不能因为日志再崩一次
+    (void)write(wfd, buf, (size_t)n);
+}
 
 static void CSFSLogToFile(NSString *msg) {
     if (msg.length == 0) return;
@@ -110,7 +183,15 @@ static void CSFSLogToFile(NSString *msg) {
                         // 直接尝试创建；已存在时 createFileAtPath: 返回 NO 也无妨，
                         // 下面统一用 fileHandleForWritingAtPath: 判断是否真能写。
                         [fm createFileAtPath:p contents:[NSData data] attributes:nil];
-                        if ([fm fileExistsAtPath:p]) { cachedPath = p; break; }
+                        if ([fm fileExistsAtPath:p]) {
+                            cachedPath = p;
+                            // 让同步崩溃取证也落到同一份 CSFS.log（用户只需取一个文件）。
+                            // ⚠ 必须放在 dispatch_once 内部：本 block 执行在并发的
+                            // global 队列上，放到 block 外面会让多个线程同时进来
+                            // 各自 open 一次，造成 fd 泄漏。
+                            CSFSCrashTracePath(p.fileSystemRepresentation);
+                            break;
+                        }
                     }
                 } @catch (NSException *e) {
                     NSLog(@"[CSFS] log path resolve threw: %@", e.reason);
@@ -248,6 +329,28 @@ static NSString *const kCSFSHorizontalItemClass =
 - (void)hide:(BOOL)animated;
 - (void)setMode:(NSInteger)mode;
 - (void)setLabelText:(NSString *)text;
+@end
+
+// SSZipArchive 的最小可用面（v16）
+//
+// ⚠ 为什么必须写成协议声明，而不是继续用 methodForSelector: + IMP 直调：
+//   v15 闪退的真正根因就在这里。原写法是
+//       id zip = ((id(*)(id,SEL,NSString*))methodImp)([[zipCls alloc] init], initSel, outPath);
+//   `[[zipCls alloc] init]` 是 +1 的临时结果，只作为实参出现，没有被任何
+//   变量（更没有被 __strong 变量）持有。ARC 在语句结束时就把它 release 掉，
+//   而 initWithPath: 明明返回的还是同一个对象 —— 于是 zip 立刻变成悬空指针，
+//   下一行 [zip respondsToSelector:] 就是 EXC_BAD_ACCESS。
+//   这是确定性崩溃，不是偶发，所以「重试一次」这类兜底永远不会成功。
+//
+//   改成协议 + 正常消息发送后，objc 的 init family 语义能被编译器识别，
+//   ARC 会正确延长生命周期；同时省掉所有手写 IMP 强转的签名错位风险。
+@protocol CSFSZipArchive <NSObject>
+- (id)initWithPath:(NSString *)path;
+- (BOOL)open;
+- (void)close;
+- (void)writeData:(NSData *)data
+         filename:(NSString *)filename
+     withPassword:(NSString *)password;
 @end
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2018,9 +2121,44 @@ static void CSFSCollectStrings(id obj, NSMutableArray *out2) {
     }
 }
 
-// 扫沙盒找 JSON Word 缓存（v14：含 Library；Results 目录按 mtime 最新优先）
-// 实证（用户真机）：缓存位于 Library/<hash>/OtherFiles/imageToExcelResultsNew/<大写ID>
-// —— 无扩展名、文件名与 docId 无关，只能按「Results 目录 + 最新修改时间」锁定。
+// 扫沙盒找 JSON Word 正文（v16：内容校验为主，路径只做加权）
+//
+// 三轮真机教训，逐条记下来，因为这正是 v13/v14/v15 三次失败的同一个模式：
+//   v13  扫 Documents/Caches，找不到 —— 缓存实际在 Library/<hash>/OtherFiles
+//   v14  加 Library + 按 mtime 最新 → 命中 documentThumbnailImages/<id>_wordj.jpg
+//   v15  排除图片扩展 → 命中 OtherFiles/imageToExcelResultsNew/commonstoragePath.json
+//
+// v15 尤其值得记：命中的是 394 字节的 **plist 状态索引**
+// （`<?xml ... <key>xxx_state</key><integer>4</integer>`），不是文档正文。
+// 即使不闪退，也只会生成一个装着状态字段的假 Word。
+//
+// 根因不是「排序策略不对」，而是**选文件一直在靠路径猜，从来没校验过内容**。
+//
+// ⚠ 这里有个反直觉的实证，必须写死以免以后又想「优化」掉：
+//   用户真机提供的正文样本 NKF1JUJ4TX7K98712J1TVHYR.json（79.5KB，含完整
+//   segments/PARA/slices）**就躺在 imageToExcelResultsNew 目录下**。
+//   也就是说 App 把 Word 的 JSON 正文也存在这个「名字叫 Excel」的目录里，
+//   文件名是一个与 docId 毫无关系的大写随机 ID。
+//   → 所以**不能**按目录名筛 word，只能靠内容判定；目录名最多当加权。
+//
+// 判据（硬门槛，缺一不可）：
+//   ① 内容以 `{` 或 `[` 开头（状态文件是 `<?xml`，直接排除）
+//   ② 含 "segments" 键（实证正文结构：segments[]页 → segments[]块 → paras[] → slices[]）
+// 在通过校验的候选里取 mtime 最新的一个。
+static BOOL CSFSLooksLikeWordJSON(NSString *txt) {
+    if (txt.length < 16) return NO;
+    // 只看开头 2KB 判断形态，避免对超大文件做整串搜索
+    NSUInteger probeLen = txt.length < 2048 ? txt.length : 2048;
+    NSString *probe = [txt substringToIndex:probeLen];
+    id ws = CSFSWhiteSpaceSet();
+    if (ws) probe = [probe stringByTrimmingCharactersInSet:ws];
+    // 状态文件是 plist（以 <?xml 开头），正文是 JSON（以 { 开头）
+    if (!([probe hasPrefix:@"{"] || [probe hasPrefix:@"["])) return NO;
+    // 正文必含 segments；状态索引只有 *_state / *_isCreatedByShare
+    if (![txt containsString:@"segments"]) return NO;
+    return YES;
+}
+
 static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
     NSString *baseId = docId;
     if ([baseId hasSuffix:@"_wordj"]) {
@@ -2034,9 +2172,9 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
         tmpDir,
     ];
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray *results = [NSMutableArray array];  // Results 目录候选 @(path)
-    __block NSString *docHit = nil;                    // docId 命中且非图片
-    // 图片扩展：v14 教训——documentThumbnailImages/<docId>.jpg 会抢先命中
+    // 只收「Results 目录内」或「文件名含 docId」两类候选 —— 这是收窄，
+    // 不是判定。真正决定用哪个靠下面的内容校验。
+    NSMutableArray *cands = [NSMutableArray array];
     NSArray *imgExt = @[@"jpg", @"jpeg", @"png", @"gif", @"webp", @"bmp", @"tiff", @"heic"];
     for (NSString *root in roots) {
         if (root.length == 0) continue;
@@ -2046,72 +2184,108 @@ static NSString *CSFSFindJSONTextForDoc(NSString *docId) {
             BOOL isDir = NO;
             NSString *full = [root stringByAppendingPathComponent:rel];
             if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) continue;
-            NSString *ext = rel.pathExtension.lowercaseString;
-            BOOL isImg = [imgExt containsObject:ext];
-            // ① Results 目录下的数据文件（imageToWordResults / imageToExcelResultsNew…）
-            if ([rel containsString:@"Results"] && !isImg) {
-                [results addObject:full];
-            }
-            // ② docId 基段命中且非图片（备选）
-            if (!docHit && baseId.length > 4 && [rel containsString:baseId] && !isImg) {
-                docHit = full;
-            }
+            if ([imgExt containsObject:rel.pathExtension.lowercaseString]) continue;
+            BOOL inResults = [rel containsString:@"Results"];
+            BOOL idHit = baseId.length > 4 && [rel containsString:baseId];
+            if (inResults || idHit) [cands addObject:full];
         }
     }
+    CSFS_LOG(@"v16 scan: cands=%lu", (unsigned long)cands.count);
+    if (cands.count == 0) return nil;
+
+    // 一次性把 mtime 读出来放进内存，再排序。
+    // （反面教材：直接在 sortedArrayUsingComparator 里调 attributesOfItemAtPath:
+    //   会变成 O(n log n) 次同步读盘，本项目早前踩过这个坑。）
+    //
+    // 用「两个平行数组」而不是装字典：
+    //   字典要先装箱 NSDate，取值时再强转，而 sortUsingComparator: 的 block
+    //   签名是 NSComparisonResult(^)(id, id)，写成 ^(NSDictionary*, NSDictionary*)
+    //   会触发 incompatible block pointer types（-Wall 下直接报错）。
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:cands.count];
+    NSMutableArray<NSNumber *> *times = [NSMutableArray arrayWithCapacity:cands.count];
+    for (NSString *p in cands) {
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+        NSDate *md = [attr objectForKey:NSFileModificationDate];
+        NSTimeInterval ts = [md isKindOfClass:[NSDate class]] ? [md timeIntervalSince1970] : 0;
+        [paths addObject:p];
+        [times addObject:[NSNumber numberWithDouble:ts]];
+    }
+    // 按 mtime 降序（新的在前）。这里用定长下标做选择排序的简化版：
+    // 候选数一般只有几十个，O(n^2) 完全可接受，换来的是完全没有 block 类型问题。
+    NSUInteger cnt = paths.count;
+    for (NSUInteger i = 0; i < cnt; i++) {
+        NSUInteger mx = i;
+        for (NSUInteger j = i + 1; j < cnt; j++) {
+            if ([times[j] doubleValue] > [times[mx] doubleValue]) mx = j;
+        }
+        if (mx != i) {
+            [paths exchangeObjectAtIndex:i withObjectAtIndex:mx];
+            [times exchangeObjectAtIndex:i withObjectAtIndex:mx];
+        }
+    }
+
+    // 从最新的开始逐个校验内容，第一个通过的即用。
+    // 上限 60：既覆盖「最新生成的就是目标」这一强假设，
+    // 又不会在异常目录下一路读几千个文件。
     NSString *best = nil;
-    if (results.count > 0) {
-        // 按修改时间降序，取最新（用户正在编辑的文档必然是最新生成的）
-        NSArray *sorted = [results sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-            NSDate *da = [[fm attributesOfItemAtPath:a error:nil] objectForKey:NSFileModificationDate];
-            NSDate *db = [[fm attributesOfItemAtPath:b error:nil] objectForKey:NSFileModificationDate];
-            return [db compare:da];
-        }];
-        best = sorted.firstObject;
-        CSFS_LOG(@"v15 results=%lu newest=%@", (unsigned long)results.count, best);
-    } else if (docHit) {
-        best = docHit;
-        CSFS_LOG(@"v15 docId hit: %@", best);
+    NSString *bestText = nil;
+    NSUInteger checked = 0;
+    for (NSString *p in paths) {
+        if (checked >= 60) break;
+        checked++;
+        SEL rsel = NSSelectorFromString(@"stringWithContentsOfFile:encoding:error:");
+        NSString *(*rfn)(id, SEL, NSString *, NSUInteger, NSError **) =
+            (NSString *(*)(id, SEL, NSString *, NSUInteger, NSError **))
+            [NSString methodForSelector:rsel];
+        if (!rfn) continue;
+        NSString *txt = rfn([NSString class], rsel, p, NSUTF8StringEncoding, nil);
+        if (!CSFSLooksLikeWordJSON(txt)) continue;
+        best = p;
+        bestText = txt;
+        break;   // 已按 mtime 降序，第一个通过的就是最新的正文
     }
     if (!best) {
-        CSFS_LOG(@"v13 no cache matched (docId=%@)", docId);
+        CSFS_LOG(@"v16 no valid word-json found (docId=%@, checked=%lu)",
+                 docId, (unsigned long)checked);
         return nil;
     }
-    SEL rsel = NSSelectorFromString(@"stringWithContentsOfFile:encoding:error:");
-    NSString *(*rfn)(id, SEL, NSString *, NSUInteger, NSError **) =
-        (NSString *(*)(id, SEL, NSString *, NSUInteger, NSError **))
-        [NSString methodForSelector:rsel];
-    NSError *rerr = nil;
-    NSString *txt = rfn([NSString class], rsel, best,
-                        NSUTF8StringEncoding, &rerr);
-    CSFS_LOG(@"v14 cache file: %@ (len=%lu err=%@)", best,
-             (unsigned long)txt.length, rerr.localizedDescription ?: @"nil");
-    return txt;
+    CSFS_LOG(@"v16 picked %@ (len=%lu checked=%lu)",
+             best, (unsigned long)bestText.length, (unsigned long)checked);
+    return bestText;
 }
 
 static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
+    CSFSCrashTrace("docx: enter");
     Class zipCls = NSClassFromString(@"SSZipArchive");
     if (!zipCls) {
         CSFS_LOG(@"v12 WARN: SSZipArchive 未注册");
         return NO;
     }
-    SEL initSel = NSSelectorFromString(@"initWithPath:");
-    if (![[zipCls alloc] respondsToSelector:initSel]) return NO;
-    SEL imfsel = NSSelectorFromString(@"instanceMethodForSelector:");
-    IMP (*ifn)(id, SEL, SEL) = (IMP (*)(id, SEL, SEL))[zipCls methodForSelector:imfsel];
-    IMP methodImp = ifn(zipCls, imfsel, initSel);
-    id zip = ((id (*)(id, SEL, NSString *))methodImp)(
-        [[zipCls alloc] init], initSel, outPath);
-    SEL openSel = NSSelectorFromString(@"open");
-    SEL wdSel  = NSSelectorFromString(@"writeData:filename:withPassword:");
-    SEL closeSel = NSSelectorFromString(@"close");
-    if (!zip || ![zip respondsToSelector:openSel] || ![zip respondsToSelector:wdSel]) {
+    // v16：这里不再走 methodForSelector: + IMP 直调。
+    // 原写法 `((id(*)(id,SEL,NSString*))methodImp)([[zipCls alloc] init], initSel, outPath)`
+    // 把 +1 的临时对象当实参传，没有任何强引用持有它，ARC 在语句结束即释放，
+    // initWithPath: 返回的仍是同一个对象 → zip 变悬空指针 →
+    // 下一行 respondsToSelector: 直接 EXC_BAD_ACCESS（这就是 v15 闪退）。
+    // 改成协议消息发送后，init 语义由编译器识别，生命周期正确。
+    id<CSFSZipArchive> zip = nil;
+    if ([zipCls instancesRespondToSelector:NSSelectorFromString(@"initWithPath:")]) {
+        zip = [(id<CSFSZipArchive>)[zipCls alloc] initWithPath:outPath];
+    }
+    if (!zip) {
+        CSFS_LOG(@"v12 WARN: SSZipArchive alloc 失败");
+        return NO;
+    }
+    CSFSCrashTrace("docx: zip obj created");
+    if (![zip respondsToSelector:NSSelectorFromString(@"open")] ||
+        ![zip respondsToSelector:NSSelectorFromString(@"writeData:filename:withPassword:")]) {
         CSFS_LOG(@"v12 WARN: SSZipArchive 方法缺失");
         return NO;
     }
-    BOOL (*ofn)(id, SEL) = (BOOL (*)(id, SEL))[zip methodForSelector:openSel];
-    if (!ofn(zip, openSel)) return NO;
-    void (*wfn)(id, SEL, NSData *, NSString *, NSString *) =
-        (void (*)(id, SEL, NSData *, NSString *, NSString *))[zip methodForSelector:wdSel];
+    if (![zip open]) {
+        CSFS_LOG(@"v12 WARN: SSZipArchive open 失败 path=%@", outPath);
+        return NO;
+    }
+    CSFSCrashTrace("docx: zip opened");
 
     NSMutableString *body = [NSMutableString string];
     for (NSString *line in lines) {
@@ -2141,13 +2315,22 @@ static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
         @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
         @"</Relationships>";
 
-    wfn(zip, wdSel, [ctXml dataUsingEncoding:NSUTF8StringEncoding], @"[Content_Types].xml", nil);
-    wfn(zip, wdSel, [relsXml dataUsingEncoding:NSUTF8StringEncoding], @"_rels/.rels", nil);
-    wfn(zip, wdSel, [docRelsXml dataUsingEncoding:NSUTF8StringEncoding], @"word/_rels/document.xml.rels", nil);
-    wfn(zip, wdSel, [docXml dataUsingEncoding:NSUTF8StringEncoding], @"word/document.xml", nil);
-    SEL cfn = NSSelectorFromString(@"close");
-    void (*cfn2)(id, SEL) = (void (*)(id, SEL))[zip methodForSelector:cfn];
-    cfn2(zip, cfn);
+    [zip writeData:[ctXml dataUsingEncoding:NSUTF8StringEncoding]
+          filename:@"[Content_Types].xml"
+      withPassword:nil];
+    CSFSCrashTrace("docx: wrote [Content_Types].xml");
+    [zip writeData:[relsXml dataUsingEncoding:NSUTF8StringEncoding]
+          filename:@"_rels/.rels"
+      withPassword:nil];
+    [zip writeData:[docRelsXml dataUsingEncoding:NSUTF8StringEncoding]
+          filename:@"word/_rels/document.xml.rels"
+      withPassword:nil];
+    [zip writeData:[docXml dataUsingEncoding:NSUTF8StringEncoding]
+          filename:@"word/document.xml"
+      withPassword:nil];
+    CSFSCrashTrace("docx: wrote all parts, closing");
+    [zip close];
+    CSFSCrashTrace("docx: closed");
 
     NSFileManager *fm2 = [NSFileManager defaultManager];
     BOOL ok = [fm2 fileExistsAtPath:outPath];
@@ -2246,6 +2429,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     NSString *head = jsonText.length > 600
                                         ? [jsonText substringToIndex:600] : jsonText;
                                     CSFS_LOG(@"v12 json head: %@", head);
+                                    CSFSCrashTrace("json: loaded, before parse");
                                     NSMutableArray *lines = [NSMutableArray array];
                                     id parsed = nil;
                                     SEL jsel = NSSelectorFromString(
@@ -2260,6 +2444,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     } @catch (NSException *e) {
                                         CSFS_LOG(@"v12 json parse threw: %@", e.reason);
                                     }
+                                    CSFSCrashTrace("json: parsed");
                                     if (parsed) {
                                         // v14：JSON Word 专用提取（实证结构）：
                                         // segments[]页 → segments[]块 → paras[]段 → slices[].text
@@ -2273,6 +2458,16 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                         if (![blocks isKindOfClass:[NSArray class]]) continue;
                                                         for (id block in blocks) {
                                                             if (![block respondsToSelector:@selector(objectForKey:)]) continue;
+                                                            // v16：块类型过滤。
+                                                            // 实证样本 27 块 = 25 PARA + 1 IMAGE + 1 LINE。
+                                                            // IMAGE 块没有 paras（或只有空 slices），不加过滤会
+                                                            // 产出空的 <w:p/>，正文里凭空多出空行；
+                                                            // LINE 是版式分隔线，同样不该进正文。
+                                                            id btype = [block objectForKey:@"type"];
+                                                            if ([btype isKindOfClass:[NSString class]] &&
+                                                                ![(NSString *)btype isEqualToString:@"PARA"]) {
+                                                                continue;
+                                                            }
                                                             id paras = [block objectForKey:@"paras"];
                                                             if (![paras isKindOfClass:[NSArray class]]) continue;
                                                             NSMutableString *line = [NSMutableString string];
@@ -2321,12 +2516,19 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         });
                                         return;
                                     }
+                                    CSFSCrashTrace("json: lines collected");
+                                    // 文件名前缀：取 docId 前 12 字符。
+                                    // v16 修正：原写法在 docIdCopy 为空时 MIN(12,0)=0，
+                                    // substringToIndex:0 虽不崩但不该走到这里；
+                                    // 这里显式兜底，避免空串进入格式化。
+                                    NSString *prefix = docIdCopy.length > 0
+                                        ? [docIdCopy substringToIndex:MIN((NSUInteger)12, docIdCopy.length)]
+                                        : @"未命名";
                                     NSString *out = [NSTemporaryDirectory()
                                                      stringByAppendingPathComponent:
-                                                     [NSString stringWithFormat:@"导出_%@.docx",
-                                                      [docIdCopy substringToIndex:MIN((NSUInteger)12, docIdCopy.length)]]]
-                                                     ;
+                                                     [NSString stringWithFormat:@"导出_%@.docx", prefix]];
                                     BOOL ok = CSFSWriteDocx(lines, out);
+                                    CSFSCrashTrace("json: docx returned");
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         if (ok) {
                                             CSFSToast(@"Word 已生成，请选择保存位置");
@@ -2338,6 +2540,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     });
                                 } @catch (NSException *e) {
                                     CSFS_LOG(@"v12 background threw: %@", e.reason);
+                                    CSFSCrashTrace("json: caught NSException");
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         CSFSToast(@"生成 Word 文件失败");
                                     });

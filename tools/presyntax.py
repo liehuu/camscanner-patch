@@ -421,6 +421,11 @@ SYSTEM_SELECTORS = {
     "fileExistsAtPath:", "stringByAppendingPathComponent:",
     "lowercaseString", "hasSuffix:", "rangeOfString:",
     "substringFromIndex:",
+    # NSDate 构造（v16：mtime 缺失时的零值哨兵）
+    "dateWithTimeIntervalSince1970:", "compare:", "isKindOfClass:",
+    # v16：mtime 排序用（平行数组 + 选择排序，规避 block 参数类型不兼容）
+    "timeIntervalSince1970", "numberWithDouble:", "doubleValue",
+    "exchangeObjectAtIndex:withObjectAtIndex:", "arrayWithCapacity:",
     "initForExportingURLs:asCopy:", "allowsMultipleSelection",
     # NSAttributedString / NSMutableString 的标准初始化与构造（Foundation 官方 API）
     "initWithString:", "attributedStringWithString:",
