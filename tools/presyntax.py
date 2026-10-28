@@ -297,6 +297,18 @@ SYSTEM_SELECTORS = {
     #      否则 style/attr 的 key 一多日志会爆掉。ks 来自 allKeys，
     #      静态推断是 id，所以 P5 需要它进白名单。
     "subarrayWithRange:",
+    # v21：图片支持。
+    #   numberWithUnsignedLong:  PNG/GIF/JPEG 解析出的是 unsigned long 像素数
+    #   initWithBase64EncodedString:options:  JSON 里可能用 base64 挂图
+    #   dictionaryWithDictionary:  CSFSFindImage 找到信息后要复制成可变副本再加序号
+    #   addObjectsFromArray: / containsObject: / stringWithUTF8String: 用于
+    #     收集候选键名与属性名
+    "numberWithUnsignedLong:", "initWithBase64EncodedString:options:",
+    "dictionaryWithDictionary:", "addObjectsFromArray:", "containsObject:",
+    "stringWithUTF8String:", "hasSuffix:", "hasPrefix:", "isEqualToString:",
+    "numberWithLong:", "numberWithBool:", "numberWithDouble:",
+    "objectAtIndex:", "count", "lowercaseString", "doubleValue", "longValue",
+    "dataWithContentsOfFile:", "bytes", "length",
     "objectForKey:", "setObject:forKey:", "removeObjectForKey:", "allKeys", "allValues",
     "length", "UTF8String", "characterAtIndex:", "substringFromIndex:",
     "substringToIndex:", "stringByAppendingString:", "stringByAppendingPathComponent:",

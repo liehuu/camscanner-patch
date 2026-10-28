@@ -248,9 +248,18 @@ def check_source():
     # 检查器当时能用一条正则拦住，说明「一刀切禁止」有价值；但完全禁止
     # 又会让「后台扫沙盒找刚生成的文件」这条路无法实现 —— 于是改成
     # 「默认禁止，后台队列显式豁免」。
-    io_pats_hard = [
-        (r"\bNSData\s+dataWithContentsOf", "NSData dataWithContentsOf*"),
-    ]
+    # v21：把 NSData dataWithContentsOf* 从「硬禁止」下调为「后台队列豁免」。
+    #
+    # 下调理由（不是为了让检查通过）：
+    #   图片要进 docx，就必须把沙盒里的图片文件读进来，没有别的 API 能做到
+    #   （其实还能用 NSFileHandle 分块读，但那只是把同一件事写得更长）。
+    #   硬禁止的后果是「这个功能永远无法实现」，而不是「实现得更安全」。
+    #
+    # 但**不能因此放过主线程**：读一张整页扫描图是几 MB 同步 IO，
+    # 在主线程做一样会被 watchdog 杀掉。所以它必须走下面 soft 那一套
+    # 完整判定 —— 反向可达 hook + 调用方体内有 dispatch_get_global_queue。
+    # 也就是说：位置对了才放行，位置错了照样拦。
+    io_pats_hard = []
     for pat, human in io_pats_hard:
         if re.search(pat, text):
             fail(f"源码出现 {human}：hook 热路径内的文件 IO 会被 watchdog 杀进程")
@@ -337,6 +346,8 @@ def check_source():
         (r"\bfileHandleForWritingAtPath\s*:", "fileHandleForWritingAtPath:"),
         (r"\bseekToEndOfFile\b", "seekToEndOfFile"),
         (r"\bwriteToFile\s*:", "writeToFile:"),
+        # v21：读整张图片（见 io_pats_hard 处的下调说明）。
+        (r"\bdataWithContentsOf", "NSData dataWithContentsOf*"),
     ]
     for pat, human in io_pats_soft:
         m0 = re.search(pat, text)

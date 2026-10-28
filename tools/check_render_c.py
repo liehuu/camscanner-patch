@@ -164,6 +164,68 @@ def main():
             else:
                 ok("C2 rPr 顺序合规：%s" % " → ".join(c2_tags))
 
+    # ── C6：图片渲染模板 ──
+    fn_img = extract_func(src, 'static NSString *CSFSRenderImagePara(')
+    if fn_img is None:
+        fail("C6 找不到 CSFSRenderImagePara（图片导出可能被删掉了）")
+    else:
+        img_lits = literal_texts(fn_img)
+        img_all = ''.join(img_lits)
+        cut = img_all.find('<w:p><w:pPr>')
+        img_tpl = img_all[cut:] if cut >= 0 else img_all
+        # 图片段落必须自己包 <w:p>，否则重演 v19 的「body 下裸挂」事故
+        if '<w:drawing>' not in img_tpl:
+            fail("C6 图片模板里没有 <w:drawing>")
+        else:
+            ok("C6 图片模板含 <w:drawing>")
+        for need, label in (('<wp:inline', 'wp:inline 容器'),
+                            ('<wp:extent', 'wp:extent 尺寸'),
+                            ('<wp:docPr', 'wp:docPr 标识'),
+                            ('<a:blip', 'a:blip 图片引用'),
+                            ('<pic:pic', 'pic:pic 结构')):
+            if need not in img_tpl:
+                fail("C6 图片模板缺少 %s" % label)
+        n_ph = len(re.findall(r'%(?:ld|@)', img_tpl))
+        if n_ph != 9:
+            fail("C6 图片模板占位符应为 9 个，实际 %d（seq 改动要同步校验脚本）" % n_ph)
+        else:
+            ok("C6 图片模板占位符 9 个（lcx,lcy,seq×3,fname,rid,lcx,lcy）")
+
+    # ── C7：docXml 的命名空间 ──
+    fn_w = extract_func(src, 'static BOOL CSFSWriteDocxStyled(')
+    if fn_w is None:
+        fail("C7 找不到 CSFSWriteDocxStyled")
+    else:
+        w_lits = literal_texts(fn_w)
+        doc = ''.join(w_lits)
+        # 命名空间声明分散在相邻字面量上，直接全文找即可
+        missing = []
+        for pfx, uri_tail in (("w", "wordprocessingml/2006/main"),
+                              ("r", "officeDocument/2006/relationships"),
+                              ("wp", "drawingml/2006/wordprocessingDrawing"),
+                              ("a", "drawingml/2006/main"),
+                              ("pic", "drawingml/2006/picture")):
+            if 'xmlns:%s="http://schemas.openxmlformats.org/%s"' % (pfx, uri_tail) not in doc:
+                missing.append(pfx)
+        if missing:
+            fail("C7 docXml 缺少命名空间声明：%s" % ", ".join("xmlns:" + m for m in missing))
+        else:
+            ok("C7 docXml 声明了 w / r / wp / a / pic 五个命名空间")
+
+        # ── C8：图片三处联动必须在源码里真的生成 ──
+        if 'rIdImg' not in doc:
+            fail("C8 document.xml.rels 里没有 rIdImg 关系模板 —— 图片引用不上")
+        else:
+            ok("C8 rels 动态生成 rIdImg 关系")
+        if 'Extension="%@"' not in doc:
+            fail("C8 [Content_Types].xml 没有动态 Default Extension —— png 不会被识别")
+        else:
+            ok("C8 [Content_Types] 动态声明图片扩展名")
+        if 'word/media/' not in doc:
+            fail("C8 没有 word/media/ 路径 —— 图片字节不会进包")
+        else:
+            ok("C8 写出 word/media/ 部件")
+
     # ── C4 / C5：docXml 的 sectPr ──
     fn2 = extract_func(src, 'static BOOL CSFSWriteDocxStyled(')
     if fn2 is None:

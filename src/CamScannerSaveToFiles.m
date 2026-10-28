@@ -2132,6 +2132,15 @@ static NSString *const kCSFSRunUnderline = @"u";
 // 段落的键
 static NSString *const kCSFSParaRuns     = @"runs";
 static NSString *const kCSFSParaAlign    = @"jc";
+// v21：图片段落。
+// 一个段落字典如果带 kCSFSParaImage，就不是文段而是图片段，
+// CSFSRenderPara 会输出 <w:drawing> 而不是 <w:r><w:t>。
+static NSString *const kCSFSParaImage    = @"img";
+static NSString *const kCSFSImgData      = @"d";   // NSData 图片原始字节
+static NSString *const kCSFSImgExt       = @"e";   // @"png" / @"jpeg" / @"gif"
+static NSString *const kCSFSImgPxW       = @"w";   // 像素宽（NSNumber）
+static NSString *const kCSFSImgPxH       = @"h";   // 像素高（NSNumber）
+static NSString *const kCSFSImgName      = @"n";   // media/imageN.ext 里的 N
 
 // 从 JSON 的布尔字段取值。
 // 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
@@ -2266,6 +2275,244 @@ static NSString *CSFSDescribeShape(id obj) {
     return out;
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// v21：图片导出
+//
+// 需求：文档里插入的图片要能进 Word。
+// v16 起块类型过滤把 type != "PARA" 的整块 continue 掉了，
+// 实证样本 27 块 = 25 PARA + 1 IMAGE + 1 LINE —— **IMAGE 就是这样丢的**。
+// v16 当时的目的是去掉空段落，代价是把图也一起扔了。
+//
+// ⚠ 字段名不敢赌，所以这里**不按名字取，按内容特征认**。
+//   二进制里能静态证实的信息只有：
+//     imagePath     T@"NSString"     image_key  T@"NSString"
+//     image_category T@"NSString"    （值 HANDWRITTEN / STAMP）
+//     box_left/top/right/bottom Tf/Td，z_index/positionh/positionv Tq
+//   但没有任何证据能证明 IMAGE 块用哪个键挂图片本体。
+//   于是：把 block 当树递归扫，**只有二进制魔数对得上才算图片**。
+//   名字猜错也能捞到；反过来宁可捞不到，也不能把非图片当图塞进文档。
+// ═════════════════════════════════════════════════════════════════════
+
+// 按魔数判图片格式。返回 @"png"/@"jpeg"/@"gif"，不是图片返回 nil。
+static NSString *CSFSImageExt(NSData *d) {
+    if (![d isKindOfClass:[NSData class]] || d.length < 12) return nil;
+    const unsigned char *p = (const unsigned char *)d.bytes;
+    if (!p) return nil;
+    if (p[0] == 0x89 && p[1] == 0x50 && p[2] == 0x4E && p[3] == 0x47) return @"png";
+    if (p[0] == 0xFF && p[1] == 0xD8 && p[2] == 0xFF) return @"jpeg";
+    if (p[0] == 0x47 && p[1] == 0x49 && p[2] == 0x46 && p[3] == 0x38) return @"gif";
+    return nil;
+}
+
+// 从文件头解析像素宽高（不依赖 UIImage，避免在后台队列里碰 UIKit）。
+// 解析不出来返回 NO，调用方用兜底尺寸。
+static BOOL CSFSImagePixelSize(NSData *d, NSString *ext,
+                               unsigned long *ow, unsigned long *oh) {
+    const unsigned char *p = (const unsigned char *)d.bytes;
+    NSUInteger n = d.length;
+    if (!p || n < 16) return NO;
+
+    if ([ext isEqualToString:@"png"]) {
+        // IHDR：签名 8 字节 + 长度 4 + "IHDR" 4 → 宽高在 16..23，大端
+        if (n < 24) return NO;
+        unsigned long w = ((unsigned long)p[16] << 24) | ((unsigned long)p[17] << 16)
+                        | ((unsigned long)p[18] << 8)  |  (unsigned long)p[19];
+        unsigned long h = ((unsigned long)p[20] << 24) | ((unsigned long)p[21] << 16)
+                        | ((unsigned long)p[22] << 8)  |  (unsigned long)p[23];
+        if (w == 0 || h == 0 || w > 100000 || h > 100000) return NO;
+        *ow = w; *oh = h;
+        return YES;
+    }
+    if ([ext isEqualToString:@"gif"]) {
+        // 逻辑屏幕宽高：偏移 6..9，小端
+        if (n < 10) return NO;
+        unsigned long w = (unsigned long)p[6] | ((unsigned long)p[7] << 8);
+        unsigned long h = (unsigned long)p[8] | ((unsigned long)p[9] << 8);
+        if (w == 0 || h == 0) return NO;
+        *ow = w; *oh = h;
+        return YES;
+    }
+    if ([ext isEqualToString:@"jpeg"]) {
+        // 扫段找 SOF：D8 之后逐段跳，段长在 offset+2（大端，含自身 2 字节）
+        NSUInteger i = 2;
+        int guard = 0;
+        while (i + 9 < n && guard++ < 4096) {
+            if (p[i] != 0xFF) { i++; continue; }
+            unsigned char m = p[i + 1];
+            // SOF0..SOF15，排除 DHT(C4) / JPG(C8) / DAC(CC)
+            if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                unsigned long h = ((unsigned long)p[i + 5] << 8) | p[i + 6];
+                unsigned long w = ((unsigned long)p[i + 7] << 8) | p[i + 8];
+                if (w == 0 || h == 0) return NO;
+                *ow = w; *oh = h;
+                return YES;
+            }
+            NSUInteger seglen = ((NSUInteger)p[i + 2] << 8) | p[i + 3];
+            if (seglen < 2) return NO;
+            i += 2 + seglen;
+        }
+        return NO;
+    }
+    return NO;
+}
+
+// 把一段 NSData 包装成图片信息字典；不是图片返回 nil。
+static NSDictionary *CSFSImageInfoFromData(NSData *d) {
+    if (![d isKindOfClass:[NSData class]]) return nil;
+    // 太小的数据不可能是有效图片，顺手挡掉图标级别的干扰
+    if (d.length < 64) return nil;
+    NSString *ext = CSFSImageExt(d);
+    if (!ext) return nil;
+    unsigned long w = 0, h = 0;
+    if (!CSFSImagePixelSize(d, ext, &w, &h)) {
+        // 尺寸解析失败但魔数是对的：仍然导出，用 4:3 兜底
+        w = 400; h = 300;
+    }
+    NSMutableDictionary *info = [NSMutableDictionary dictionaryWithCapacity:5];
+    [info setObject:d forKey:kCSFSImgData];
+    [info setObject:ext forKey:kCSFSImgExt];
+    [info setObject:[NSNumber numberWithUnsignedLong:w] forKey:kCSFSImgPxW];
+    [info setObject:[NSNumber numberWithUnsignedLong:h] forKey:kCSFSImgPxH];
+    return info;
+}
+
+// 在任意 JSON 子树里找图片。
+//
+// 优先看「名字像图片」的键（imagePath / path / data / url…），
+// 再退回全量遍历。两者最终都要过 CSFSImageInfoFromData 的魔数关，
+// 所以名字猜错不会导致误判，只是决定先看哪里。
+static NSDictionary *CSFSFindImage(id obj, int depth) {
+    if (!obj || depth > 6) return nil;
+
+    if ([obj isKindOfClass:[NSData class]]) {
+        return CSFSImageInfoFromData((NSData *)obj);
+    }
+
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        if (s.length < 8 || s.length > 8 * 1024 * 1024) return nil;
+        NSString *low = [s lowercaseString];
+        // ① 本地路径
+        if ([low hasSuffix:@".png"] || [low hasSuffix:@".jpg"] ||
+            [low hasSuffix:@".jpeg"] || [low hasSuffix:@".gif"]) {
+            NSData *fd = [NSData dataWithContentsOfFile:s];
+            if (fd) {
+                NSDictionary *info = CSFSImageInfoFromData(fd);
+                if (info) return info;
+            }
+        }
+        // ② base64（长的纯 base64 串才试，否则白光扫一遍很浪费）
+        if (s.length > 128) {
+            NSData *bd = [[NSData alloc] initWithBase64EncodedString:s options:0];
+            if (bd) {
+                NSDictionary *info = CSFSImageInfoFromData(bd);
+                if (info) return info;
+            }
+        }
+        return nil;
+    }
+
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *arr = (NSArray *)obj;
+        NSUInteger cap = arr.count < 64 ? arr.count : 64;
+        for (NSUInteger i = 0; i < cap; i++) {
+            NSDictionary *r = CSFSFindImage([arr objectAtIndex:i], depth + 1);
+            if (r) return r;
+        }
+        return nil;
+    }
+
+    // 字典 / 模型对象：先试高可信键名，再全量
+    static NSString *const kHint[] = {
+        @"imageData", @"image", @"img", @"picture", @"pic",
+        @"imagePath", @"path", @"filePath", @"localPath", @"src", @"url",
+        @"data", @"value", @"content"
+    };
+    int hintCount = (int)(sizeof(kHint) / sizeof(kHint[0]));
+    for (int i = 0; i < hintCount; i++) {
+        NSDictionary *r = CSFSFindImage(CSFSValue(obj, kHint[i]), depth + 1);
+        if (r) return r;
+    }
+
+    NSMutableArray *keys = [NSMutableArray arrayWithCapacity:8];
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        [keys addObjectsFromArray:[(NSDictionary *)obj allKeys]];
+    } else {
+        unsigned int n = 0;
+        objc_property_t *props = class_copyPropertyList([obj class], &n);
+        unsigned int lim = n < 48 ? n : 48;
+        for (unsigned int i = 0; i < lim; i++) {
+            const char *nm = property_getName(props[i]);
+            if (nm) [keys addObject:[NSString stringWithUTF8String:nm]];
+        }
+        if (props) free(props);
+    }
+    for (NSString *k in keys) {
+        NSDictionary *r = CSFSFindImage(CSFSValue(obj, k), depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+// 把图片信息渲染成一个居中的内联图片段落。
+// seq 只用于生成不重复的 rId / 文件名，必须调用方保证唯一。
+//
+// 单位换算：
+//   像素 → EMU 按 96 DPI 解释，1 px = 914400/96 = 9525 EMU；
+//   正文可用宽度 = A4 11906 twips − 左右边距 1440×2 = 9026 twips，
+//   1 twip = 635 EMU → 5731510 EMU。超宽等比缩小。
+static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
+    NSData *d = [img objectForKey:kCSFSImgData];
+    if (![d isKindOfClass:[NSData class]] || d.length == 0) return @"<w:p/>";
+    NSString *ext = [img objectForKey:kCSFSImgExt];
+    if (ext.length == 0) return @"<w:p/>";
+    // 编号由调用方在建图片段时写进 kCSFSImgName，这里统一取，
+    // 保证 rId / media 文件名 / docPr id 三者同号且全局唯一。
+    NSNumber *nn = [img objectForKey:kCSFSImgName];
+    if (nn) seq = [nn longValue];
+    if (seq < 1) seq = 1;
+    NSNumber *nw = [img objectForKey:kCSFSImgPxW];
+    NSNumber *nh = [img objectForKey:kCSFSImgPxH];
+    double pxw = nw ? [nw doubleValue] : 400.0;
+    double pxh = nh ? [nh doubleValue] : 300.0;
+    if (pxw < 1) pxw = 1;
+    if (pxh < 1) pxh = 1;
+
+    double cx = pxw * 9525.0;
+    double cy = pxh * 9525.0;
+    const double kMaxCx = 9026.0 * 635.0;
+    if (cx > kMaxCx) {
+        double k = kMaxCx / cx;
+        cx = kMaxCx;
+        cy = cy * k;
+    }
+    long lcx = (long)(cx + 0.5);
+    long lcy = (long)(cy + 0.5);
+    if (lcx < 1) lcx = 1;
+    if (lcy < 1) lcy = 1;
+
+    NSString *rid = [NSString stringWithFormat:@"rIdImg%ld", seq];
+    NSString *fname = [NSString stringWithFormat:@"image%ld.%@", seq, ext];
+
+    // 注意：docPr 的 id 在整篇文档里必须唯一，用 seq 即可（seq 从 1 递增）
+    return [NSString stringWithFormat:
+        @"<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:drawing>"
+        @"<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
+        @"<wp:extent cx=\"%ld\" cy=\"%ld\"/>"
+        @"<wp:docPr id=\"%ld\" name=\"Picture %ld\"/>"
+        @"<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+        @"<pic:pic>"
+        @"<pic:nvPicPr><pic:cNvPr id=\"%ld\" name=\"%@\"/><pic:cNvPicPr/></pic:nvPicPr>"
+        @"<pic:blipFill><a:blip r:embed=\"%@\"/>"
+        @"<a:stretch><a:fillRect/></a:stretch></pic:blipFill>"
+        @"<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%ld\" cy=\"%ld\"/></a:xfrm>"
+        @"<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>"
+        @"</pic:pic></a:graphicData></a:graphic>"
+        @"</wp:inline></w:drawing></w:r></w:p>",
+        lcx, lcy, seq, seq, seq, fname, rid, lcx, lcy];
+}
+
+
 // 把 JSON 里的一个 slice 解析成 run 字典。
 // 解析失败也要返回一个只有文字的 run —— 宁可少格式，不能丢文字。
 //
@@ -2286,8 +2533,8 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
 
     if (diagnosticPtr && !*diagnosticPtr) {
         *diagnosticPtr = YES;
-        CSFS_LOG(@"v20 DIAG slice %@", CSFSDescribeShape(sl));
-        CSFS_LOG(@"v20 DIAG style %@", CSFSDescribeShape(style));
+        CSFS_LOG(@"v21 DIAG slice %@", CSFSDescribeShape(sl));
+        CSFS_LOG(@"v21 DIAG style %@", CSFSDescribeShape(style));
     }
 
     // 两路候选：style 优先，slice 自己兜底（万一 JSON 是扁平结构）。
@@ -2683,6 +2930,13 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 //   所以 rFonts 必须写在 b 前面，u 必须写在 sz 后面。
 //   v19 把 rFonts 写在 color 之后、u 写在最前，两个位置都是错的。
 static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
+    // v21：图片段优先分流。图片段只有 kCSFSParaImage，没有 runs，
+    // 走下面的文字分支会产出空段落（图依旧不显示）。
+    id img = [para objectForKey:kCSFSParaImage];
+    if ([img isKindOfClass:[NSDictionary class]]) {
+        return CSFSRenderImagePara((NSDictionary *)img, 1);
+    }
+
     NSMutableString *out = [NSMutableString stringWithString:@"<w:p>"];
 
     // 段落属性：对齐。只在确有必要时写 <w:pPr>，避免产出大量空属性块。
@@ -2761,7 +3015,23 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 // defaultPt 取全文出现最多的字号，作为 Normal 的基准，
 // 这样「标题比正文大」这件事在 Word 里能被体现出来（标题写 sz，正文继承）。
 static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outPath) {
-    CSFSCrashTrace("docx20: enter");
+    CSFSCrashTrace("docx21: enter");
+
+    // ── v21：先收集图片段。
+    // media 部件、document.xml.rels 的关系、[Content_Types] 的 Default
+    // 三处都必须与正文里的 r:embed 一一对应，缺一处 Word 就打不开 ——
+    // 所以统一从 paras 里收集，不另开一条传递路径。
+    NSMutableArray *images = [NSMutableArray array];
+    for (NSDictionary *p in paras) {
+        if (![p isKindOfClass:[NSDictionary class]]) continue;
+        id img = [p objectForKey:kCSFSParaImage];
+        if (![img isKindOfClass:[NSDictionary class]]) continue;
+        NSData *d = [(NSDictionary *)img objectForKey:kCSFSImgData];
+        NSString *e = [(NSDictionary *)img objectForKey:kCSFSImgExt];
+        if ([d isKindOfClass:[NSData class]] && d.length > 0 && e.length > 0) {
+            [images addObject:img];
+        }
+    }
 
     NSMutableString *body = [NSMutableString string];
     for (NSDictionary *p in paras) {
@@ -2775,32 +3045,71 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     // ⚠ <w:pgMar> 的 header / footer / gutter 在 ECMA-376 里标的是
     //   use="required"，缺一个 Word 就按损坏处理。v19 只写了四边，
     //   这是除「漏 w:p」之外的第二个致命项。
+    //
+    // v21：根元素补 r / wp / a / pic 四个命名空间声明。
+    //   <w:drawing> 里用到 r:embed、wp:inline、a:graphic、pic:pic，
+    //   只要有一个前缀没声明，XML 就是 ill-formed，Word 直接判损坏。
     NSString *docXml = [NSString stringWithFormat:
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
-        @"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        @"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\""
+        @" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\""
+        @" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\""
+        @" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\""
+        @" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
         @"<w:body>%@<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
         @"<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\""
         @" w:header=\"851\" w:footer=\"992\" w:gutter=\"0\"/>"
         @"</w:sectPr></w:body></w:document>",
         body];
-    NSString *ctXml =
+
+    // ── [Content_Types].xml：图片扩展名要单独声明 Default，
+    //    否则 Word 不知道 .png/.jpeg 是什么部件，报「无法读取的内容」。
+    NSMutableString *ctXml = [NSMutableString stringWithString:
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
         @"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
-        @"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        @"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"];
+    {
+        // 去重（同一份文档里 png/jpeg 混用是常见的）
+        NSMutableArray *exts = [NSMutableArray arrayWithCapacity:4];
+        for (NSDictionary *img in images) {
+            NSString *e = [img objectForKey:kCSFSImgExt];
+            if (![exts containsObject:e]) [exts addObject:e];
+        }
+        for (NSString *e in exts) {
+            NSString *mime = @"image/png";
+            if ([e isEqualToString:@"jpeg"]) mime = @"image/jpeg";
+            else if ([e isEqualToString:@"gif"]) mime = @"image/gif";
+            [ctXml appendFormat:@"<Default Extension=\"%@\" ContentType=\"%@\"/>", e, mime];
+        }
+    }
+    [ctXml appendString:
         @"<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
         @"<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
-        @"</Types>";
+        @"</Types>"];
+
     NSString *relsXml =
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
         @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
         @"</Relationships>";
-    NSString *docRelsXml =
+
+    // ── document.xml.rels：每个图片一条关系，Id 必须与正文 r:embed 完全对应。
+    NSMutableString *docRelsXml = [NSMutableString stringWithString:
         @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
         @"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
-        @"</Relationships>";
+        @"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"];
+    for (NSDictionary *img in images) {
+        NSNumber *nn = [img objectForKey:kCSFSImgName];
+        long seq = nn ? [nn longValue] : 1;
+        NSString *e = [img objectForKey:kCSFSImgExt];
+        [docRelsXml appendFormat:
+            @"<Relationship Id=\"rIdImg%ld\""
+            @" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\""
+            @" Target=\"media/image%ld.%@\"/>", seq, seq, e];
+    }
+    [docRelsXml appendString:@"</Relationships>"];
+
     // 默认字号改成动态值：原本文本占多数时是 12pt，但若整篇都是大标题，
     // 固定 12pt 会让所有文字都带 sz 覆盖，反而失真。
     NSString *stylesXml = [NSString stringWithFormat:
@@ -2831,11 +3140,22 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
                     [stylesXml dataUsingEncoding:NSUTF8StringEncoding]);
     CSFSZipAddEntry(zipData, cd, @"word/document.xml",
                     [docXml dataUsingEncoding:NSUTF8StringEncoding]);
+    // v21：图片实体。
+    // 必须是 store 型（CSFSZipAddEntry 内部固定 method=0），与 docx 其余部件一致；
+    // 用 deflate 也能过，但 store 省掉压缩库依赖，而且图片本身已压缩过。
+    for (NSDictionary *img in images) {
+        NSData *d = [img objectForKey:kCSFSImgData];
+        NSString *e = [img objectForKey:kCSFSImgExt];
+        NSNumber *nn = [img objectForKey:kCSFSImgName];
+        long seq = nn ? [nn longValue] : 1;
+        NSString *name = [NSString stringWithFormat:@"word/media/image%ld.%@", seq, e];
+        CSFSZipAddEntry(zipData, cd, name, d);
+    }
     CSFSCrashTrace("docx18: parts added");
 
     uint32_t cdSize = (uint32_t)cd.length;
     uint32_t cdOffset = (uint32_t)zipData.length;
-    NSUInteger entryCount = 5;
+    NSUInteger entryCount = 5 + images.count;
     [zipData appendData:cd];
     CSFSWriteLE32(zipData, 0x06054b50);
     CSFSWriteLE16(zipData, 0);
@@ -2848,9 +3168,9 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     CSFSCrashTrace("docx18: eocd done");
 
     BOOL ok = [zipData writeToFile:outPath atomically:YES];
-    CSFS_LOG(@"v20 docx written=%d paras=%lu defPt=%.1f size=%lu",
-             (int)ok, (unsigned long)paras.count, defaultPt,
-             (unsigned long)zipData.length);
+    CSFS_LOG(@"v21 docx written=%d paras=%lu imgs=%lu defPt=%.1f size=%lu",
+             (int)ok, (unsigned long)paras.count, (unsigned long)images.count,
+             defaultPt, (unsigned long)zipData.length);
     return ok;
 }
 
@@ -3048,6 +3368,12 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     // v19：para 单独一个开关，不然先遍历到 para 就把
                                     // slice 那次 dump 吃掉，等于没 dump
                                     BOOL paraDiagDone = NO;
+                                    // v21：图片计数（生成 rId / media 文件名 / docPr id）
+                                    // 与「图片块结构只 dump 一次」的独立开关。
+                                    // 又用独立开关，理由同上：共用 flag 会被先到的分支吃掉。
+                                    long imgSeq = 0;
+                                    BOOL imgDiagDone = NO;
+                                    long imgBlockCount = 0;
                                     id parsed = nil;
                                     SEL jsel = NSSelectorFromString(
                                         @"JSONObjectWithData:options:error:");
@@ -3074,18 +3400,52 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                         id blocks = [page objectForKey:@"segments"];
                                                         if (![blocks isKindOfClass:[NSArray class]]) continue;
                                                         for (id block in blocks) {
-                                                            if (![block respondsToSelector:@selector(objectForKey:)]) continue;
+                                                            // v21：不再要求 block 必须是字典 ——
+                                                            // 模型对象也要能取图（CSFSValue 两态通吃）。
+                                                            // 原写法在这里 continue，模型对象 block 会整块消失。
                                                             // v16：块类型过滤。
                                                             // 实证样本 27 块 = 25 PARA + 1 IMAGE + 1 LINE。
-                                                            // IMAGE 块没有 paras（或只有空 slices），不加过滤会
-                                                            // 产出空的 <w:p/>，正文里凭空多出空行；
-                                                            // LINE 是版式分隔线，同样不该进正文。
-                                                            id btype = [block objectForKey:@"type"];
-                                                            if ([btype isKindOfClass:[NSString class]] &&
-                                                                ![(NSString *)btype isEqualToString:@"PARA"]) {
+                                                            id btypeRaw = CSFSValue(block, @"type");
+                                                            NSString *bt = [btypeRaw isKindOfClass:[NSString class]]
+                                                                         ? (NSString *)btypeRaw : @"PARA";
+
+                                                            // v21：IMAGE 块导出成图片段落。
+                                                            // ⚠ v16 起把非 PARA 一律 continue，图就是这么丢的：
+                                                            //   当时的目的是去掉 IMAGE 块产生的空 <w:p/>，
+                                                            //   代价是图片一起被扔掉。
+                                                            //   LINE 是版式分隔线，仍然跳过。
+                                                            if ([bt isEqualToString:@"IMAGE"]) {
+                                                                imgBlockCount++;
+                                                                NSDictionary *found = CSFSFindImage(block, 0);
+                                                                if (imgDiagDone == NO) {
+                                                                    imgDiagDone = YES;
+                                                                    CSFS_LOG(@"v21 DIAG image block %@ -> %@",
+                                                                             CSFSDescribeShape(block),
+                                                                             found ? @"FOUND" : @"NOT FOUND");
+                                                                }
+                                                                if (found) {
+                                                                    imgSeq++;
+                                                                    NSMutableDictionary *info =
+                                                                        [NSMutableDictionary dictionaryWithDictionary:found];
+                                                                    [info setObject:[NSNumber numberWithLong:imgSeq]
+                                                                             forKey:kCSFSImgName];
+                                                                    CSFS_LOG(@"v21 image #%ld %@ %@x%@ bytes=%lu",
+                                                                             imgSeq,
+                                                                             [info objectForKey:kCSFSImgExt],
+                                                                             [info objectForKey:kCSFSImgPxW],
+                                                                             [info objectForKey:kCSFSImgPxH],
+                                                                             (unsigned long)[[info objectForKey:kCSFSImgData] length]);
+                                                                    NSMutableDictionary *ip =
+                                                                        [NSMutableDictionary dictionaryWithCapacity:1];
+                                                                    [ip setObject:info forKey:kCSFSParaImage];
+                                                                    [styledParas addObject:ip];
+                                                                }
                                                                 continue;
                                                             }
-                                                            id paras = [block objectForKey:@"paras"];
+                                                            if (![bt isEqualToString:@"PARA"]) {
+                                                                continue;   // LINE 及其它
+                                                            }
+                                                            id paras = CSFSValue(block, @"paras");
                                                             if (![paras isKindOfClass:[NSArray class]]) continue;
 
                                                             // v18：每个 para 生成一个独立段落，
@@ -3100,7 +3460,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 // 只 dump 一次 para，用独立开关避免和 slice 的抢。
                                                                 if (paraDiagDone == NO) {
                                                                     paraDiagDone = YES;
-                                                                    CSFS_LOG(@"v20 DIAG para %@",
+                                                                    CSFS_LOG(@"v21 DIAG para %@",
                                                                              CSFSDescribeShape(para));
                                                                 }
 
@@ -3172,7 +3532,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             // 保底：通用递归收集
                                             CSFSCollectStrings(parsed, lines);
                                         }
-                                        CSFS_LOG(@"v20 json parsed, %lu 段带样式",
+                                        CSFS_LOG(@"v21 json parsed, %lu 段",
                                                  (unsigned long)styledParas.count);
                                     } else {
                                         // 非 JSON：原文按行切，生成无样式段落
@@ -3259,7 +3619,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             }
                                         }
                                         if (bestCnt > 0) defaultPt = (double)bestKey;
-                                        CSFS_LOG(@"v20 defaultPt=%.1f (样本 %ld 个 run)",
+                                        CSFS_LOG(@"v21 defaultPt=%.1f (样本 %ld 个 run)",
                                                  defaultPt, bestCnt);
                                     }
 
@@ -3285,15 +3645,28 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                 }
                                             }
                                         }
-                                        CSFS_LOG(@"v20 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld",
+                                        CSFS_LOG(@"v21 stats: paras=%lu runs=%ld color=%ld bold=%ld size=%ld"
+                                                 @" imgBlocks=%ld imgs=%ld",
                                                  (unsigned long)styledParas.count,
-                                                 nRun, nColor, nBold, nSize);
+                                                 nRun, nColor, nBold, nSize,
+                                                 imgBlockCount, imgSeq);
                                         if (firstStyled) {
-                                            CSFS_LOG(@"v20 sample run: %@", firstStyled);
+                                            CSFS_LOG(@"v21 sample run: %@", firstStyled);
                                         } else {
                                             // 一个带格式的 run 都没有 —— 字段名或层级对不上，
-                                            // 去看上面的 "v19 DIAG slice / style" 两行。
-                                            CSFS_LOG(@"v20 stats: NO styled run at all");
+                                            // 去看上面的 "v21 DIAG slice / style" 两行。
+                                            CSFS_LOG(@"v21 stats: NO styled run at all");
+                                        }
+                                        // 图片这块的三种失败要能一眼分开：
+                                        //   imgBlocks>0 且 imgs=0  → 块找到了但没捞出图片字节，
+                                        //                            说明图不在 block 的可见字段里
+                                        //   imgBlocks=0             → 压根没有 IMAGE 块，
+                                        //                            图可能在 PARA 块的 slice 里
+                                        //   imgs>0 但文档没图        → 写入端问题
+                                        if (imgBlockCount > 0 && imgSeq == 0) {
+                                            CSFS_LOG(@"v21 WARN: 有 %ld 个 IMAGE 块但一张也没取到，"
+                                                     @"图不在 block 的直接字段里",
+                                                     imgBlockCount);
                                         }
                                     }
 
