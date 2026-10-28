@@ -2275,6 +2275,12 @@ static NSString *CSFSDescribeShape(id obj) {
     return out;
 }
 
+// v22 前向声明。
+// CSFSWhiteSpaceSet 定义在文件后半段（v14 那一块），但 v22 的文字判定
+// 函数要用它。C 不允许调用未声明函数，与其把那段函数搬过来
+// （搬动会打乱 v14 以来段落顺序，diff 变成一片红），不如补一条原型。
+static id CSFSWhiteSpaceSet(void);
+
 // ═════════════════════════════════════════════════════════════════════
 // v21：图片导出
 //
@@ -2602,6 +2608,102 @@ static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
 }
 
 
+// ═════════════════════════════════════════════════════════════════════
+// v22：文字优先
+//
+// 现象：导出 Word 时开了「手写转文字」，文档里的手写部分仍然是图片，
+//       而那些字本该是纯文字。
+//
+// 根因（在 v21 自己身上）：slice 循环里图片分支排在最前，判据只有
+// slice.stype 一个字符串，命中就 continue —— 把 CSFSParseSlice 整段跳过。
+// 可是「手写转文字」之后，手写区的 slice **仍然带 handwrite 类 stype**
+// （App 得靠它区分手写区和印刷区），同时 text 已经被 OCR 填好。
+// 于是文字被 continue 掉、笔迹图被塞进文档，与用户看到的完全一致。
+//
+// 修正原则：**「有识别文字」是硬优先级，与 stype 无关。**
+// 图片只是兜底，不是与文字并列的选项。
+// 这个方向是安全的：图片模式下的图片 slice 不带 text；
+// 一旦带 text，说明 App 已经识别过，导出文字才是用户的预期。
+// ═════════════════════════════════════════════════════════════════════
+
+// 判断一个字符串是不是「路径/URL」。
+// 用途：CSFSSliceText 要按别名试探文字字段，其中 content/value 这类
+// 键可能装的是图片路径。把路径当正文写进 Word，就是一张图变成
+// 一行 "file:///var/mobile/.../image.jpg" —— 比丢文字更糟。
+static BOOL CSFSLooksLikePath(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    if ([s hasPrefix:@"/"] || [s hasPrefix:@"file://"]) return YES;
+    if ([s containsString:@"://"]) return YES;
+    // 只有「整串就是个文件名」才判路径：正文里出现 "见 image.png" 这种
+    // 句子不该被排除，所以加了长度上限。
+    if (s.length <= 160) {
+        NSString *low = [s lowercaseString];
+        NSArray *exts = @[@".png", @".jpg", @".jpeg", @".gif",
+                          @".heic", @".webp", @".tiff", @".bmp", @".pdf"];
+        for (NSString *e in exts) {
+            if ([low hasSuffix:e]) return YES;
+        }
+    }
+    return NO;
+}
+
+// 取 slice 的文字。text 优先，别名兜底。
+//
+// 为什么要别名：手写识别结果不保证落在 text 上。二进制里能看到
+// content / recognizeText 这类键名，但层级归属无法静态确定。
+// 逐个试探比赌一个更可靠，代价只是几次取值。
+// 全部候选都要过「非空、非纯空白、不像路径」三关。
+static NSString *CSFSSliceText(id sl) {
+    static NSArray *keys = nil;
+    if (!keys) {
+        keys = @[@"text", @"content", @"ocrText", @"ocr_text",
+                 @"recognizeText", @"recognize_text",
+                 @"handwriteText", @"handwrite_text",
+                 @"resultText", @"string"];
+    }
+    id ws = CSFSWhiteSpaceSet();
+    for (NSString *k in keys) {
+        id v = CSFSValue(sl, k);
+        if (![v isKindOfClass:[NSString class]]) continue;
+        NSString *s = (NSString *)v;
+        if (s.length == 0) continue;
+        if ([s stringByTrimmingCharactersInSet:ws].length == 0) continue;
+        if (CSFSLooksLikePath(s)) continue;
+        return s;
+    }
+    return nil;
+}
+
+// v21：判断一个 slice 是不是「图片片段」，是则返回图片信息。
+//
+// 依据：slice.stype 的类型编码是 T@"NSString"（不是 long），
+// 且字符串池里同时出现 "paraSlices" 和 "imageSlices" ——
+// 说明 slice 按类型分家，stype 就是那个类型字段。
+//
+// ⚠ 但 stype 的**具体取值**没有任何静态证据（二进制里只有键名，没有枚举值）。
+//   所以这里不按「等于 image」精确匹配，而是看它**是否含有**图片语义的片段。
+// v22：单独抽出来，因为统计日志要回答一个只有它能回答的问题 ——
+//   「这个切片本来会被当成图片，是因为有文字才变成文字的」有多少个。
+//   没有这个数，下一轮无法区分「App 没识别」和「我们判错了」。
+static BOOL CSFSSTypeLooksImage(id sl) {
+    id st = CSFSValue(sl, @"stype");
+    if (![st isKindOfClass:[NSString class]]) return NO;
+    NSString *s = [(NSString *)st lowercaseString];
+    if (s.length == 0) return NO;
+    return ([s containsString:@"image"] || [s containsString:@"img"] ||
+            [s containsString:@"pic"] || [s containsString:@"stamp"] ||
+            [s containsString:@"handwrit"] || [s containsString:@"photo"]);
+}
+
+// v22：在 stype 之前先加一道文字关 —— 有文字就不再考虑图。
+static NSDictionary *CSFSSliceImageInfo(id sl) {
+    // v22：文字优先。这一条必须排在 stype 判定之前：
+    // 手写转文字后 stype 仍是 handwrite，但 text 已经填好了。
+    if (CSFSSliceText(sl) != nil) return nil;
+    if (!CSFSSTypeLooksImage(sl)) return nil;
+    return CSFSFindImage(sl, 0);
+}
+
 // 把 JSON 里的一个 slice 解析成 run 字典。
 // 解析失败也要返回一个只有文字的 run —— 宁可少格式，不能丢文字。
 //
@@ -2611,35 +2713,14 @@ static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
 //   font_attribute 是 T@"CSTranslateRawPageFont"），
 // 但**层级归属**（谁挂在谁下面）无法靠静态分析确定。
 // 这段 dump 一旦拿到日志，就能一次性定死，不用再猜。
-// v21：判断一个 slice 是不是「图片片段」，是则返回图片信息。
-//
-// 依据：slice.stype 的类型编码是 T@"NSString"（不是 long），
-// 且字符串池里同时出现 "paraSlices" 和 "imageSlices" ——
-// 说明 slice 按类型分家，stype 就是那个类型字段。
-//
-// ⚠ 但 stype 的**具体取值**没有任何静态证据（二进制里只有键名，没有枚举值）。
-//   所以这里不按「等于 image」精确匹配，而是看它**是否含有**图片语义的片段；
-//   更关键的是：**只有 stype 明确像图片时才去找图**，没有 stype 一律按文字处理。
-//   宁可让一行文字被当文字（最坏是显示成路径），也不能把文字误判成图。
-static NSDictionary *CSFSSliceImageInfo(id sl) {
-    id st = CSFSValue(sl, @"stype");
-    if (![st isKindOfClass:[NSString class]]) return nil;
-    NSString *s = [(NSString *)st lowercaseString];
-    if (s.length == 0) return nil;
-    if (![s containsString:@"image"] && ![s containsString:@"img"] &&
-        ![s containsString:@"pic"] && ![s containsString:@"stamp"] &&
-        ![s containsString:@"handwrit"] && ![s containsString:@"photo"]) {
-        return nil;
-    }
-    return CSFSFindImage(sl, 0);
-}
-
 static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
-    id t = CSFSValue(sl, @"text");
-    if (![t isKindOfClass:[NSString class]] || [(NSString *)t length] == 0) return nil;
+    // v22：文字统一走 CSFSSliceText（text 优先 + 别名兜底 + 排除路径）。
+    // 原来只认 text，手写转文字的结果如果落在别的键上就整段丢字。
+    NSString *t = CSFSSliceText(sl);
+    if (t.length == 0) return nil;
 
     NSMutableDictionary *run = [NSMutableDictionary dictionaryWithCapacity:8];
-    [run setObject:(NSString *)t forKey:kCSFSRunText];
+    [run setObject:t forKey:kCSFSRunText];
 
     id style = CSFSValue(sl, @"style");
 
@@ -2693,6 +2774,99 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
         }
     }
     return run;
+}
+
+// v22：para.justification → w:jc 合法值。
+//
+// 抽成函数的原因很实际：v21 这段内联在 para 循环里，v22 的 IMAGE 块
+// 也要生成文字段落，如果各写一份，两处迟早会漂。
+// 注意 w:jc 的合法取值只有 left / center / right / both / distribute，
+// **不存在 "justify"**，写成 justify 会被 Word 静默忽略。
+static NSString *CSFSMapJustification(id just) {
+    NSString *justStr = nil;
+    if ([just isKindOfClass:[NSString class]]) {
+        justStr = (NSString *)just;
+    } else if ([just isKindOfClass:[NSNumber class]]) {
+        justStr = [(NSNumber *)just stringValue];
+    }
+    if (justStr.length == 0) return nil;
+    NSString *j = [justStr lowercaseString];
+    if ([j isEqualToString:@"center"] || [j isEqualToString:@"1"]) return @"center";
+    if ([j isEqualToString:@"right"] || [j isEqualToString:@"right_align"] ||
+        [j isEqualToString:@"2"]) return @"right";
+    if ([j isEqualToString:@"both"] || [j isEqualToString:@"justify"] ||
+        [j isEqualToString:@"justified"] || [j isEqualToString:@"3"]) return @"both";
+    return nil;
+}
+
+// v22：把「一个块里已有的识别文字」抽成 styled 段落数组。
+//
+// 这个函数存在的唯一理由：
+//   开了「手写转文字」之后，手写区在 JSON 里仍然是一个 IMAGE 块
+//   （版面语义上它确实是图），识别结果压在块内部。
+//   只要块里能抠出文字，就必须按文字导出，不能插图。
+//
+// 两条路径，先结构化后兜底：
+//   ① block.paras[].slices[] —— 与普通 PARA 块完全一致的结构，最可靠
+//   ② block 自身的文字字段（text / content / ocrText …）—— 兜底，
+//      同样要过「非空、非纯空白、不像路径」三关
+// 返回的每个元素就是一个 para 字典（kCSFSParaRuns + 可选 kCSFSParaAlign）。
+static NSArray *CSFSBlockTextParas(id block) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!block) return out;
+
+    // ① 结构化路径
+    id paras = CSFSValue(block, @"paras");
+    if ([paras isKindOfClass:[NSArray class]]) {
+        for (id para in (NSArray *)paras) {
+            id slices = CSFSValue(para, @"slices");
+            if (![slices isKindOfClass:[NSArray class]]) continue;
+            NSMutableArray *runs = [NSMutableArray array];
+            for (id sl in (NSArray *)slices) {
+                // 这里**不判图**：能走到 CSFSBlockTextParas 的前提就是
+                // 调用方已经决定「有文字就用文字」，图片分支不再参与。
+                NSMutableDictionary *run = CSFSParseSlice(sl, NULL);
+                if (!run) continue;
+                [runs addObject:run];
+            }
+            if (runs.count == 0) continue;
+            NSMutableDictionary *p = [NSMutableDictionary dictionaryWithCapacity:2];
+            [p setObject:runs forKey:kCSFSParaRuns];
+            NSString *jc = CSFSMapJustification(CSFSValue(para, @"justification"));
+            if (jc) [p setObject:jc forKey:kCSFSParaAlign];
+            [out addObject:p];
+        }
+    }
+    if (out.count > 0) return out;
+
+    // ② 块自身字段兜底。CSFSSliceText 已经带三关校验，直接复用。
+    NSString *own = CSFSSliceText(block);
+    if (own.length > 0) {
+        NSMutableDictionary *run = [NSMutableDictionary dictionaryWithCapacity:1];
+        [run setObject:own forKey:kCSFSRunText];
+        NSMutableDictionary *p = [NSMutableDictionary dictionaryWithCapacity:1];
+        [p setObject:[NSMutableArray arrayWithObject:run] forKey:kCSFSParaRuns];
+        NSString *jc = CSFSMapJustification(CSFSValue(block, @"justification"));
+        if (jc) [p setObject:jc forKey:kCSFSParaAlign];
+        [out addObject:p];
+    }
+    return out;
+}
+
+// v22：把 styled 段落数组拼成纯文本，用于「同一段文字是否已存在」的判断。
+// 只取文字，不管格式 —— 去重要比的是内容。
+static NSString *CSFSParasPlainText(NSArray *paras) {
+    NSMutableString *m = [NSMutableString string];
+    for (NSDictionary *p in paras) {
+        id rs = [p objectForKey:kCSFSParaRuns];
+        if (![rs isKindOfClass:[NSArray class]]) continue;
+        for (NSDictionary *r in (NSArray *)rs) {
+            id t = [r objectForKey:kCSFSRunText];
+            if ([t isKindOfClass:[NSString class]]) [m appendString:(NSString *)t];
+        }
+        [m appendString:@"\n"];
+    }
+    return m;
 }
 
 static NSString *CSFSXMLEscape(NSString *in) {
@@ -3486,6 +3660,21 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     long imgSeq = 0;
                                     BOOL imgDiagDone = NO;
                                     long imgBlockCount = 0;
+                                    // v22：手写转文字相关计数与观测集合。
+                                    //   imgTextCount —— 有多少个 IMAGE 块因为有识别文字
+                                    //                   而改成文字导出（不插图）
+                                    //   imgDupCount  —— 有多少个 IMAGE 块的文字与已有段落重复被跳过
+                                    //   blockTypeSet —— 出现过哪些块类型（关键：手写块到底叫什么）
+                                    //   seenText     —— 已入列段落的纯文本，用于去重
+                                    long imgTextCount = 0;
+                                    long imgDupCount = 0;
+                                    NSMutableSet *blockTypeSet = [NSMutableSet set];
+                                    NSMutableSet *seenText = [NSMutableSet set];
+                                    // v22：有多少个「stype 本来是图片」的切片
+                                    // 因为有文字而改走文字。这个数 > 0 就说明
+                                    // 本次修复命中了「手写转文字」那条路径。
+                                    long sliceTextWinCount = 0;
+                                    NSString *firstSliceImgSType = nil;
                                     id parsed = nil;
                                     SEL jsel = NSSelectorFromString(
                                         @"JSONObjectWithData:options:error:");
@@ -3521,6 +3710,19 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                             NSString *bt = [btypeRaw isKindOfClass:[NSString class]]
                                                                          ? (NSString *)btypeRaw : @"PARA";
 
+                                                            // v22：块类型观测。
+                                                            // 只认 PARA/IMAGE/LINE 是 v16 的假设，
+                                                            // 「手写转文字」很可能引入了新类型
+                                                            // （HANDWRITE / TEXT / OCR / NOTE…），
+                                                            // 而白名单式过滤会把它们整块吞掉。
+                                                            // 每遇到一种新类型打一行 shape ——
+                                                            // 这一行能直接看到手写块的字段构成。
+                                                            if (bt.length > 0 && ![blockTypeSet containsObject:bt]) {
+                                                                [blockTypeSet addObject:bt];
+                                                                CSFS_LOG(@"v22 new block type: %@ shape=%@",
+                                                                         bt, CSFSDescribeShape(block));
+                                                            }
+
                                                             // v21：IMAGE 块导出成图片段落。
                                                             // ⚠ v16 起把非 PARA 一律 continue，图就是这么丢的：
                                                             //   当时的目的是去掉 IMAGE 块产生的空 <w:p/>，
@@ -3528,6 +3730,57 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                             //   LINE 是版式分隔线，仍然跳过。
                                                             if ([bt isEqualToString:@"IMAGE"]) {
                                                                 imgBlockCount++;
+
+                                                                // v22：先问「块里有没有已经识别好的文字」。
+                                                                // 手写转文字之后，手写区在 JSON 里**仍然是
+                                                                // IMAGE 块**（版面语义上它真的是图），
+                                                                // 识别结果压在块内部。v21 在这里无条件取图，
+                                                                // 等于把识别结果丢掉、再把笔迹图贴回去 ——
+                                                                // 正是用户看到的现象。
+                                                                //
+                                                                // ⚠ 但不能对所有 IMAGE 块都这么干：用户手动插入的
+                                                                //   照片/截图同样带着 CamScanner 历史 OCR 缓存，
+                                                                //   一律文字化会把真图片变成一堆字。
+                                                                //   所以只对「手写类」块放宽：image_category 属于
+                                                                //   HANDWRITTEN 一族，或者块里有 paras 结构。
+                                                                //   （image_category 的值域在二进制里实证为
+                                                                //     HANDWRITTEN / STAMP，STAMP 是指纹印章，不展开。）
+                                                                id cat = CSFSValue(block, @"image_category");
+                                                                NSString *catStr = [cat isKindOfClass:[NSString class]]
+                                                                    ? [(NSString *)cat lowercaseString] : nil;
+                                                                BOOL handwriteLike =
+                                                                    (catStr.length > 0 &&
+                                                                     ([catStr containsString:@"handwrit"] ||
+                                                                      [catStr containsString:@"text"] ||
+                                                                      [catStr containsString:@"ocr"]));
+                                                                BOOL hasParaTree = (CSFSValue(block, @"paras") != nil);
+                                                                if (catStr.length > 0 && imgDiagDone == NO) {
+                                                                    CSFS_LOG(@"v22 IMAGE block category=%@ handwriteLike=%d paraTree=%d",
+                                                                             catStr, (int)handwriteLike, (int)hasParaTree);
+                                                                }
+                                                                if (handwriteLike || hasParaTree) {
+                                                                    NSArray *btParas = CSFSBlockTextParas(block);
+                                                                    NSString *plain = CSFSParasPlainText(btParas);
+                                                                    NSString *trimmed =
+                                                                        [plain stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
+                                                                    if (trimmed.length > 0) {
+                                                                        if ([seenText containsObject:trimmed]) {
+                                                                            imgDupCount++;
+                                                                            CSFS_LOG(@"v22 IMAGE block -> text already present, skip image (%lu chars)",
+                                                                                     (unsigned long)trimmed.length);
+                                                                        } else {
+                                                                            [seenText addObject:trimmed];
+                                                                            imgTextCount++;
+                                                                            CSFS_LOG(@"v22 IMAGE block -> text wins (%lu paras, %lu chars)",
+                                                                                     (unsigned long)btParas.count,
+                                                                                     (unsigned long)trimmed.length);
+                                                                            [styledParas addObjectsFromArray:btParas];
+                                                                        }
+                                                                        continue;
+                                                                    }
+                                                                    CSFS_LOG(@"v22 WARN IMAGE block handwrite-like but no text, fall back to image");
+                                                                }
+
                                                                 NSDictionary *found = CSFSFindImage(block, 0);
                                                                 if (imgDiagDone == NO) {
                                                                     imgDiagDone = YES;
@@ -3561,8 +3814,13 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 }
                                                                 continue;
                                                             }
-                                                            if (![bt isEqualToString:@"PARA"]) {
-                                                                continue;   // LINE 及其它
+                                                            // v22：只跳过 LINE（版式分隔线）。
+                                                            // 其余块类型只要有 paras 就按文字处理 ——
+                                                            // v16 的 `![bt isEqual:@"PARA"] continue`
+                                                            // 是白名单，任何新类型（手写、表格、题注）
+                                                            // 都会被整块吞掉，且没有任何日志痕迹。
+                                                            if ([bt isEqualToString:@"LINE"]) {
+                                                                continue;
                                                             }
                                                             id paras = CSFSValue(block, @"paras");
                                                             if (![paras isKindOfClass:[NSArray class]]) continue;
@@ -3590,10 +3848,29 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     // v21：图片片段单独成段。
                                                                     // 依据是 stype 这个类型字段（详见
                                                                     // CSFSSliceImageInfo 注释）。
-                                                                    // 图片段先于本段文字入列 ——
-                                                                    // 实际数据里图片 slice 往往独占一段，
-                                                                    // 顺序差异不影响可读性。
-                                                                    NSDictionary *sliceImg = CSFSSliceImageInfo(sl);
+                                                                    // v22：但文字优先 —— 这个 slice 只要有
+                                                                    // 识别好的文字，就不许当图处理。
+                                                                    // 手写转文字后 stype 仍是 handwrite，
+                                                                    // 只靠 stype 判图会把文字连同格式一起丢掉。
+                                                                    //
+                                                                    // 单独取一次 slText 只为留一行日志：
+                                                                    // 若下一轮手写还是图，这行能直接区分
+                                                                    // 「App 压根没识别」和「我们判错了」。
+                                                                    NSString *slText = CSFSSliceText(sl);
+                                                                    // v22：这个切片「本来会被当成图片」吗？
+                                                                    // 只有本来会当图片、却因为有文字而改判的，
+                                                                    // 才是本次修复的真实战果，单独计数。
+                                                                    if (slText != nil && CSFSSTypeLooksImage(sl)) {
+                                                                        sliceTextWinCount++;
+                                                                        if (!firstSliceImgSType) {
+                                                                            id stv = CSFSValue(sl, @"stype");
+                                                                            if ([stv isKindOfClass:[NSString class]]) {
+                                                                                firstSliceImgSType = (NSString *)stv;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    NSDictionary *sliceImg =
+                                                                        (slText != nil) ? nil : CSFSSliceImageInfo(sl);
                                                                     if (sliceImg) {
                                                                         imgSeq++;
                                                                         NSMutableDictionary *si =
@@ -3628,40 +3905,22 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     [NSMutableDictionary dictionaryWithCapacity:4];
                                                                 [p setObject:runs forKey:kCSFSParaRuns];
 
-                                                                // 段落级对齐（v19：走 CSFSValue，两态通吃）
-                                                                id just = CSFSValue(para, @"justification");
-                                                                NSString *justStr = nil;
-                                                                if ([just isKindOfClass:[NSString class]]) {
-                                                                    justStr = (NSString *)just;
-                                                                } else if ([just isKindOfClass:[NSNumber class]]) {
-                                                                    // 万一是数值枚举，转成字符串再走同一套映射
-                                                                    justStr = [(NSNumber *)just stringValue];
-                                                                }
-                                                                if (justStr.length > 0) {
-                                                                    NSString *j = [justStr lowercaseString];
-                                                                    // CamScanner 的值可能是枚举名也可能是数值，
-                                                                    // 只映射能明确识别的，其余留给 Word 默认。
-                                                                    //
-                                                                    // 注意 w:jc 的合法取值：
-                                                                    //   left / center / right / both / distribute
-                                                                    // 不存在 "justify"，写成 justify 会被 Word 忽略。
-                                                                    NSString *mapped = nil;
-                                                                    if ([j isEqualToString:@"center"] ||
-                                                                        [j isEqualToString:@"1"]) {
-                                                                        mapped = @"center";
-                                                                    } else if ([j isEqualToString:@"right"] ||
-                                                                               [j isEqualToString:@"right_align"] ||
-                                                                               [j isEqualToString:@"2"]) {
-                                                                        mapped = @"right";
-                                                                    } else if ([j isEqualToString:@"both"] ||
-                                                                               [j isEqualToString:@"justify"] ||
-                                                                               [j isEqualToString:@"justified"] ||
-                                                                               [j isEqualToString:@"3"]) {
-                                                                        mapped = @"both";
-                                                                    }
-                                                                    if (mapped) {
-                                                                        [p setObject:mapped forKey:kCSFSParaAlign];
-                                                                    }
+                                                                // 段落级对齐。
+                                                                // v22 抽成 CSFSMapJustification ——
+                                                                // IMAGE 块转文字那条路径也要用同一套映射，
+                                                                // 各写一份迟早会漂。
+                                                                NSString *jc =
+                                                                    CSFSMapJustification(CSFSValue(para, @"justification"));
+                                                                if (jc) [p setObject:jc forKey:kCSFSParaAlign];
+
+                                                                // v22：记下这段文字，供 IMAGE 块去重。
+                                                                // 手写区有时在相邻 PARA 块里也出现一遍，
+                                                                // 不去重就是「文字 + 图片」各来一份。
+                                                                {
+                                                                    NSString *plain =
+                                                                        [CSFSParasPlainText(@[p])
+                                                                         stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
+                                                                    if (plain.length > 0) [seenText addObject:plain];
                                                                 }
                                                                 [styledParas addObject:p];
                                                             }
@@ -3794,6 +4053,20 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                  (unsigned long)styledParas.count,
                                                  nRun, nColor, nBold, nSize,
                                                  imgBlockCount, imgSeq);
+                                        // v22：手写转文字的关键三行。
+                                        //   types   —— 文档里到底有哪几种块
+                                        //   imgText —— 多少个 IMAGE 块因为有文字而没插图
+                                        //   imgDup  —— 多少个 IMAGE 块的文字判定为重复被跳过
+                                        // 若 imgText=0 且 imgBlocks>0，说明手写区没有被识别成文字，
+                                        // 应当去看 "v22 new block type: ..." 与
+                                        // "v22 IMAGE block category=..." 两行。
+                                        CSFS_LOG(@"v22 stats: types=[%@] imgText=%ld imgDup=%ld"
+                                                 @" sliceTextWin=%ld firstSliceImgSType=%@",
+                                                 [[blockTypeSet allObjects]
+                                                  componentsJoinedByString:@","],
+                                                 imgTextCount, imgDupCount,
+                                                 sliceTextWinCount,
+                                                 firstSliceImgSType ?: @"(none)");
                                         if (firstStyled) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);
                                         } else {

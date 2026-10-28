@@ -101,6 +101,14 @@ jobs:
           # 本项直接读 .m 里的字符串字面量，断言 <w:p> 包裹、rPr 顺序、
           # pgMar 必需属性。放这里，编不过的东西不许编。
           python3 tools/check_render_c.py src/CamScannerSaveToFiles.m
+          # v22：手写转文字导出的手写区仍然是图片。
+          # 根因是判据顺序（图片关排在文字关前面），不是图片逻辑本身错 ——
+          # 编译器、lint、甚至离线渲染样本都看不见这类缺陷
+          # （样本里压根没有手写 slice）。
+          # 本项断言「文字关必须排在图片关之前」，先跑注入式反向验证再跑正检，
+          # 确保它真的在比顺序，而不是只检查关键字存在。
+          python3 tools/rev_check_text_priority.py
+          python3 tools/check_text_priority.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |

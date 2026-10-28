@@ -305,6 +305,10 @@ SYSTEM_SELECTORS = {
     #     收集候选键名与属性名
     "numberWithUnsignedLong:", "initWithBase64EncodedString:options:",
     "dictionaryWithDictionary:", "addObjectsFromArray:", "containsObject:",
+    # v22：文字优先需要两个集合
+    #   +[NSMutableSet set]      —— 块类型观测表、已入列段落文本去重表
+    #   -[NSSet allObjects]      —— 把块类型集合拼成日志里的一行
+    "set", "allObjects",
     "stringWithUTF8String:", "hasSuffix:", "hasPrefix:", "isEqualToString:",
     "numberWithLong:", "numberWithBool:", "numberWithDouble:",
     "objectAtIndex:", "count", "lowercaseString", "doubleValue", "longValue",
