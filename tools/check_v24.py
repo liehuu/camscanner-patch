@@ -109,22 +109,27 @@ def main():
     # 这条是真正容易写反的地方：只要「文字优先」或「取图」先执行，
     # 手写切片的 OCR 文字就已经进了 runs，后面再拦也删不掉。
     # 用文件内的真实先后比较，不是「两个词都出现过」。
+    #
+    # v25 判据从 `gCSFSHideStamp && stLow` 改成
+    # `gCSFSHideStamp && (slCat == 2`（含 image_category 精确匹配 + stype 兜底）。
+    # 条件跨行写，所以用正则匹配而不是 find。
+    import re
     code = strip_comments(src)
-    pos_stamp_filter = code.find('gCSFSHideStamp && stLow')
-    pos_hand_filter = code.find('gCSFSHideWritten && stLow')
+    pos_stamp_filter = re.search(r'gCSFSHideStamp\s*&&\s*\(?\s*slCat', code)
+    pos_hand_filter  = re.search(r'gCSFSHideWritten\s*&&\s*\(?\s*slCat', code)
     pos_take_img = code.find('textWins ? nil : CSFSSliceImageInfo(sl)')
     if pos_take_img < 0:
         fail('E3 找不到切片取图语句（textWins ? nil : CSFSSliceImageInfo(sl)），'
              '模板结构变了，需人工复核')
     else:
         bad = []
-        if pos_stamp_filter < 0:
+        if not pos_stamp_filter:
             bad.append('印章过滤缺失')
-        elif pos_stamp_filter > pos_take_img:
+        elif pos_stamp_filter.start() > pos_take_img:
             bad.append('印章过滤排在取图之后')
-        if pos_hand_filter < 0:
+        if not pos_hand_filter:
             bad.append('手写过滤缺失')
-        elif pos_hand_filter > pos_take_img:
+        elif pos_hand_filter.start() > pos_take_img:
             bad.append('手写过滤排在取图之后')
         if bad:
             fail('E3 切片级过滤位置错误：%s —— 一旦取图先跑，'
@@ -139,7 +144,11 @@ def main():
         fail('E4 没有检查 block.hiding —— App 已标记隐藏的块仍会被导出')
 
     # ── E5 手写/印章图块的块级拦截
-    if 'gCSFSHideStamp' in src and 'isStampImage' in src:
+    # v25：判据从 containsString 改成 CSFSCategoryType（严格相等），
+    # 检查器匹配新函数名。
+    if 'gCSFSHideStamp' in src and 'CSFSCategoryType' in src:
+        ok('E5 印章/手写图块有块级拦截（CSFSCategoryType 精确匹配）')
+    elif 'gCSFSHideStamp' in src and 'isStampImage' in src:
         ok('E5 印章图块有块级拦截（image_category + isStampImage）')
     else:
         fail('E5 印章图块缺块级拦截：勾了「去除印章」，STAMP 图仍会进文档')

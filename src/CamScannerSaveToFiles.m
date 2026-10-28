@@ -2184,6 +2184,7 @@ static NSString *const kCSFSParaIndFL    = @"fl";    // 首行缩进（原始值
 static NSString *const kCSFSParaIndL     = @"il";    // 左缩进
 static NSString *const kCSFSParaIndR     = @"ir";    // 右缩进
 static NSString *const kCSFSParaIndH     = @"ih";    // 悬挂缩进
+static NSString *const kCSFSParaFloat    = @"fb";    // floating_box：浮动框，不参与缩进
 static NSString *const kCSFSParaTabs     = @"tabs";  // 制表位数组（已归一为 twips）
 static NSString *const kCSFSParaLineGap  = @"lg";    // 行距
 static NSString *const kCSFSParaGapBef   = @"gb";    // 段前
@@ -2207,6 +2208,33 @@ static BOOL gCSFSHideStamp   = NO;
 static BOOL gCSFSHandToImage = NO;
 static BOOL gCSFSOptKnown    = NO;   // 是否成功读到过（用于日志区分「没读到」和「读到 NO」）
 static NSString *gCSFSOptSrc = nil;  // 从哪读到的：page / json / none
+
+// ═════════════════════════════════════════════════════════════════════
+// v25：页面级版式上下文
+//
+// 为什么需要：App 的排版数值全是「渲染坐标」，必须先乘页面缩放比
+// 才能变成 pt。这个换算是从 -[CSOcrPage scale] 反汇编出来的原文：
+//
+//     double s = 1.0;
+//     double rw = self.renderWidth;
+//     if (rw > 0) { float pw = self.page_size.width;
+//                   if (pw > 0) s = rw / (double)pw; }
+//     return s;
+//
+// 另外两个全局偏好（CSITextEngineSettings）会整体改变字号和行距：
+//   fontSizeMode  0/1/2  → 字号 +0 / -1 / +1 pt
+//   lineSpaceMode 0/1/2  → 行距倍数 +0 / -0.25 / +0.25
+// 反汇编证据：-[CSITextEngineSettings caculateFontSizeWithOriginalFontSize:]
+//             -[... caculateLineHeightMultipleWithOriginalLineHeightMultiple:]
+// 这两个值不读，预览和导出就永远差一档 —— 跟段落字段读没读无关。
+// ═════════════════════════════════════════════════════════════════════
+static double  gCSFSPageScale     = 0.0;   // renderWidth / page_size.width，0 = 未知
+static double  gCSFSPageWidth     = 0.0;   // page_size.width（原始像素）
+static double  gCSFSRenderWidth   = 0.0;
+static NSInteger gCSFSFontSizeMode  = 0;
+static NSInteger gCSFSLineSpaceMode = 0;
+static BOOL    gCSFSAiBeautify    = NO;
+static NSString *gCSFSPageSrc     = nil;
 
 // 从 JSON 的布尔字段取值。
 // 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
@@ -2733,6 +2761,35 @@ static BOOL CSFSLooksLikePath(NSString *s) {
 // 两个来源都没有时保持上次的值，不覆盖 —— 宁可沿用，也不要用
 // 「读不到就当 NO」把用户已经勾上的选项悄悄关掉。
 // ═════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════
+// v25：手写 / 印章的身份判定 —— 与 App 完全对齐
+//
+// 反汇编 -[CSOcrPageSegment customImageCategoryType] 的原文：
+//     NSString *c = self.image_category;
+//     if ([c localizedCaseInsensitiveCompare:@"HANDWRITTEN"] == Same) return 1;
+//     if ([c localizedCaseInsensitiveCompare:@"STAMP"]       == Same) return 2;
+//     return 0;
+// 而 -[CSOcrPageSegment isStampImage] 就是 `return [self customImageCategoryType] == 2`。
+//
+// 两个字符串常量在 __cfstring 里紧邻（…"HANDWRITTEN\0STAMP\0"…），
+// 所以这条判据是**严格相等**，不是 containsString。
+// v24 用 containsString:@"stamp" 近似，正好也能命中，但它同时会命中
+// "nostamp"、"stamp_removed" 这类值 —— 判据的边界不能靠巧合。
+// ═════════════════════════════════════════════════════════════════════
+static NSInteger CSFSCategoryType(id block) {
+    id c = CSFSValue(block, @"image_category");
+    if (![c isKindOfClass:[NSString class]]) c = CSFSValue(block, @"imageCategory");
+    if (![c isKindOfClass:[NSString class]]) return 0;
+    NSString *s = [(NSString *)c uppercaseString];
+    if ([s isEqualToString:@"HANDWRITTEN"]) return 1;
+    if ([s isEqualToString:@"STAMP"])       return 2;
+    // 兼容带后缀的写法（HANDWRITTEN_TEXT 之类），仍然按前缀认，
+    // 但日志里会打出原值，方便下一轮确认要不要收紧。
+    if ([s hasPrefix:@"HANDWRITTEN"]) return 1;
+    if ([s hasPrefix:@"STAMP"])       return 2;
+    return 0;
+}
+
 static BOOL CSFSPullOptions(id src, NSString *from) {
     if (!src) return NO;
     @try {
@@ -2745,6 +2802,10 @@ static BOOL CSFSPullOptions(id src, NSString *from) {
         gCSFSHandToImage = CSFSBoolValue(hi);
         gCSFSOptKnown    = YES;
         gCSFSOptSrc      = from;
+        gCSFSPageSrc     = from;
+        // v25：同一次拿到 page 就顺带把版式上下文取走，
+        // 免得后面再去找一遍（面板那时可能已经销毁）。
+        CSFSCaptureLayoutContext(src);
         CSFS_LOG(@"v24 opts(%@) hideWritten=%d hideStamp=%d handToImage=%d",
                  from, (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage);
         return YES;
@@ -2754,16 +2815,112 @@ static BOOL CSFSPullOptions(id src, NSString *from) {
     }
 }
 
+// 前置声明：CSFSReadOptionsFromBottomView 用到，实现在它下面。
+static id CSFSFindPageObject(id obj, int depth);
+static void CSFSCaptureLayoutContext(id page);
+
 static void CSFSReadOptionsFromBottomView(id bottomView) {
     if (!bottomView) {
         CSFS_LOG(@"v24 opts: bottomView is nil");
         return;
     }
+    // 溯源顺序按「离真相的距离」排，不是按代码便利排：
+    //   ① bottomView.originalData —— 当前页，最直接
+    //   ② bottomView.context.allPages —— v25 新增。CSJsonWordEditContext 是
+    //      编辑页的中枢（bottomView/middleView/document/allPages 全挂在它上面），
+    //      开关最终就是通过它下面的 adapter 写到 page 上的。
+    //      v24 只看了 originalData，一旦它是个没同步开关的副本就永远读到 NO。
+    //   ③ bottomView 自己
     if (CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData")) return;
-    // 面板自己也可能转发这几个属性
+
+    id ctx = CSFSValue(bottomView, @"context");
+    if (ctx) {
+        id pages = CSFSValue(ctx, @"allPages");
+        id page = CSFSFindPageObject(pages, 0);
+        if (CSFSPullOptions(page, @"context.allPages")) return;
+    }
     if (CSFSPullOptions(bottomView, @"bottomView")) return;
     CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
              NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
+}
+
+// 在任意形状的对象里挖出一个 CSOcrPage：
+//   · 对象自身响应 hideWrittenImage/hideStampImage → 就是它
+//   · 数组 → 逐个元素下探（只看前 8 个，够用且不会在大文档上耗时）
+//   · 模型对象 → 试 ocrPage / page 两个键
+// 全程 respondsToSelector 保护，不认识的形状直接放弃，不抛异常。
+static id CSFSFindPageObject(id obj, int depth) {
+    if (!obj || depth > 4) return nil;
+    @try {
+        if ([obj respondsToSelector:NSSelectorFromString(@"hideWrittenImage")] ||
+            [obj respondsToSelector:NSSelectorFromString(@"hideStampImage")]) {
+            return obj;
+        }
+        if ([obj isKindOfClass:[NSArray class]]) {
+            NSArray *arr = (NSArray *)obj;
+            NSUInteger n = MIN(arr.count, (NSUInteger)8);
+            for (NSUInteger i = 0; i < n; i++) {
+                id r = CSFSFindPageObject([arr objectAtIndex:i], depth + 1);
+                if (r) return r;
+            }
+            return nil;
+        }
+        for (NSString *k in @[@"ocrPage", @"page", @"originalData"]) {
+            id v = CSFSValue(obj, k);
+            if (v) {
+                id r = CSFSFindPageObject(v, depth + 1);
+                if (r) return r;
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v25 findPage threw: %@", e.reason);
+    }
+    return nil;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// v25：把页面的版式上下文抓下来（scale / page_size / 全局字号行距偏好）
+//
+// 这段不产出任何输出，只是让后面的换算有正确的分母。
+// 拿不到时保持 0，换算函数会走「不缩放」的分支并记日志 ——
+// 绝不能因为拿不到就崩，也不能因为拿不到就悄悄按猜的值算。
+// ═════════════════════════════════════════════════════════════════════
+static void CSFSCaptureLayoutContext(id page) {
+    if (!page) { CSFS_LOG(@"v25 layout: page nil, scale unknown"); return; }
+    @try {
+        double rw = CSFSDoubleValue(CSFSValue(page, @"renderWidth"));
+        double pw = 0.0;
+        id ps = CSFSValue(page, @"page_size");
+        if (ps) {
+            // page_size 在 App 里是 CSISize 模型，不是 NSValue/NSDictionary。
+            // 反汇编 -[CSOcrPage scale] 里取的是 page_size.width（getter），
+            // 所以先试 width 方法，再试字典键，两条路够覆盖。
+            if ([ps respondsToSelector:@selector(width)]) {
+                pw = [(NSNumber *)[ps performSelector:@selector(width)] doubleValue];
+            }
+            if (!(pw > 0) && [ps isKindOfClass:[NSDictionary class]]) {
+                id w = [(NSDictionary *)ps objectForKey:@"width"];
+                if (!w) w = [(NSDictionary *)ps objectForKey:@"w"];
+                pw = CSFSDoubleValue(w);
+            }
+        }
+        gCSFSRenderWidth = rw;
+        gCSFSPageWidth   = pw;
+        if (rw > 0 && pw > 0) gCSFSPageScale = rw / pw;
+
+        // 全局偏好：影响字号和行距，缺一档就差一档
+        id cs = CSFSValue(page, @"clientSettings");
+        if (cs) {
+            gCSFSFontSizeMode  = (NSInteger)CSFSDoubleValue(CSFSValue(cs, @"fontSizeMode"));
+            gCSFSLineSpaceMode = (NSInteger)CSFSDoubleValue(CSFSValue(cs, @"lineSpaceMode"));
+            gCSFSAiBeautify    = CSFSBoolValue(CSFSValue(cs, @"aiBeautifyEnable"));
+        }
+        CSFS_LOG(@"v25 layout: renderW=%.1f pageW=%.1f scale=%.4f fontSizeMode=%ld lineSpaceMode=%ld aiBeautify=%d",
+                 rw, pw, gCSFSPageScale,
+                 (long)gCSFSFontSizeMode, (long)gCSFSLineSpaceMode, (int)gCSFSAiBeautify);
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v25 layout threw: %@", e.reason);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -2780,39 +2937,95 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
 // ═════════════════════════════════════════════════════════════════════
 static const double kCSFSContentTwips = 9026.0;   // A4 11906 - 左右边距各 1440
 
-static double CSFSTwipsFromLen(id v, double basePt, const char **why) {
+// ═════════════════════════════════════════════════════════════════════
+// v25：缩进数值 → twips
+//
+// App 的原文（同 setupParaStyle 反汇编）：
+//     headIndent          = page.scale * indent_hanging    * k
+//     firstLineHeadIndent = page.scale * indent_first_line * k
+//     k = isCellPara ? 0.8 : 1.0
+//
+// 也就是说 indent_* 是**页面像素**，乘 scale(=renderWidth/pageWidth)
+// 变成渲染 pt。NSParagraphStyle 的单位是 pt，docx 也是 pt（1pt=20twips），
+// 所以换算到 docx 就是 scale*raw*20 —— 与预览同一个 pt 值，视觉才对得上。
+//
+// 没有 scale 时退两步：
+//   · raw 很小（≤12）→ 按字符数算，raw*字号pt
+//   · 否则按 A4 宽度比例折回（1654px≈A4@200dpi）
+// 两条都不是精确值，所以日志里会标出用的哪一条，便于下一轮定死。
+// ═════════════════════════════════════════════════════════════════════
+static double CSFSIndentTwips(id v, double basePt, const char **why) {
     double raw = CSFSDoubleValue(v);
     if (!(raw != 0.0)) {
-        if (why) *why = "-";
+        if (why) *why = "none";
         return 0.0;
     }
     double sign = (raw > 0) ? 1.0 : -1.0;
     double a = fabs(raw);
-    double t;
+    double pt;
     const char *n;
-    if (a <= 10.0)        { t = a * basePt * 20.0; n = "chars"; }
-    else if (a <= 80.0)   { t = a * 20.0;          n = "pt"; }
-    else if (a <= 2000.0) { t = a;                 n = "twips"; }
-    else                  { t = a * 0.2;           n = "centi-pt"; }
+
+    if (a <= 12.0) {
+        // 字符数：1 字符 ≈ 1 个字号宽
+        pt = a * basePt;
+        n = "chars";
+    } else if (gCSFSPageScale > 0.0) {
+        pt = a * gCSFSPageScale;
+        n = "px*scale";
+    } else {
+        pt = a * (595.0 / 1654.0);   // A4 宽 595pt / 典型 1654px
+        n = "px@200dpi";
+    }
     if (why) *why = n;
-    return sign * t;
+    return sign * pt * 20.0;
 }
 
-// 行距：w:line 在 lineRule=auto 时以 1/240 行为单位。
-// line_gap 可能是倍数（1.25）也可能是 pt（15）。
-static long CSFSLineTwips(id v, const char **why) {
-    double raw = CSFSDoubleValue(v);
-    if (!(raw > 0.0)) {
-        if (why) *why = "-";
-        return 0;
-    }
-    long r;
+// ═════════════════════════════════════════════════════════════════════
+// v25：行距 —— 按 App 的真实公式算，不再猜单位
+//
+// 反汇编 -[CSWordEditDataManager setupParaStyleWithAttributeString:
+//          para:ocrPage:segment:isCellPara:] 得到的原文：
+//
+//     if (page.clientSettings.aiBeautifyEnable)
+//         multiple = 1.25;                       // 常量 @0x1088cdc50
+//     else {
+//         multiple = para.line_gap / (para.style.font_size * 1.44);
+//         multiple = [clientSettings caculateLineHeightMultiple:
+//                        multiple];             // lineSpaceMode ±0.25, clamp>=1
+//     }
+//     [paragraphStyle setLineHeightMultiple:multiple];
+//
+// 1.44 是反汇编里的 immediate double（@0x1088cbfb8）。
+// 代入真实数据 line_gap=20 / font=11 → 20/(11*1.44)=1.263，
+// 与上一轮从预览截图量出来的行距 24px/字高19px=1.26 完全吻合。
+// v24 把 line_gap 直接当 twips 用（20 twips 会被判非法丢弃），
+// 所以行距一直停在 Word 默认的 1.0 —— 这是「排版还是不对」的主因。
+//
+// OOXML 侧：lineRule=auto 时 w:line 以 1/240 行为单位，所以 w:line = 240*multiple。
+// ═════════════════════════════════════════════════════════════════════
+static long CSFSLineTwipsFromGap(id v, double fontPt, const char **why) {
+    double gap = CSFSDoubleValue(v);
+    if (!(gap > 0.0)) { if (why) *why = "none"; return 0; }
+
+    double multiple;
     const char *n;
-    if (raw <= 5.0)       { r = (long)(raw * 240.0 + 0.5); n = "multiple"; }
-    else if (raw <= 60.0) { r = (long)(raw * 20.0 + 0.5);  n = "pt"; }
-    else                  { r = (long)raw;                 n = "twips"; }
+    if (gCSFSAiBeautify) {
+        multiple = 1.25;
+        n = "aiBeautify";
+    } else {
+        double basePt = (fontPt > 1.0 && fontPt < 200.0) ? fontPt : 11.0;
+        multiple = gap / (basePt * 1.44);
+        if (gCSFSLineSpaceMode == 1)      multiple -= 0.25;
+        else if (gCSFSLineSpaceMode == 2) multiple += 0.25;
+        if (multiple < 1.0) multiple = 1.0;
+        n = "gap/formula";
+    }
+    if (multiple > 10.0) multiple = 10.0;      // 上限，防脏数据把行距拉爆
+
+    long line = (long)(multiple * 240.0 + 0.5);
+    if (line < 240) line = 240;
     if (why) *why = n;
-    return r;
+    return line;
 }
 
 // 制表位：先按 twips 解读；若整体超出页面，按最大值等比压回内容宽。
@@ -3483,6 +3696,10 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     // 它比「全文众数」更贴近这一段（标题段就是用自己的大字号算缩进）。
     double paraPt = CSFSDoubleValue([para objectForKey:kCSFSParaBasePt]);
     if (!(paraPt > 2.0 && paraPt < 200.0)) paraPt = defaultPt;
+    // v25：基准字号同样要叠 fontSizeMode 的那一档，
+    // 否则用它推出来的「两字符缩进」和行距都会偏。
+    if (gCSFSFontSizeMode == 1)      paraPt -= 1.0;
+    else if (gCSFSFontSizeMode == 2) paraPt += 1.0;
 
     NSMutableString *pPr = [NSMutableString string];
 
@@ -3528,52 +3745,83 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     // 2) 行距与段前
     {
         const char *lgWhy = "-";
-        long line = CSFSLineTwips([para objectForKey:kCSFSParaLineGap], &lgWhy);
+        long line = CSFSLineTwipsFromGap([para objectForKey:kCSFSParaLineGap], paraPt, &lgWhy);
         if (line > 0) {
-            // 60..2400 之外的值一定是单位判错了，宁可用默认
-            if (line >= 60 && line <= 2400) {
+            if (line >= 240 && line <= 2400) {
                 [pPr appendFormat:@"<w:spacing w:line=\"%ld\" w:lineRule=\"auto\"/>", line];
+                CSFS_LOG(@"v25 spacing line=%ld (=%.3fx, raw=%@ why=%s pt=%.1f)",
+                         line, (double)line / 240.0,
+                         [para objectForKey:kCSFSParaLineGap] ?: @"(nil)", lgWhy, paraPt);
             }
         }
     }
 
-    // 3) 缩进
-    //    首行缩进取 App 的 indent_first_line；它缺失时才退回「两字符」。
-    //    非左对齐段落（center/right，合同标题就是 right）不加缩进 ——
-    //    缩进会把整行推歪，反而制造新的不一致。
+    // 3) 缩进 —— 按 App 的三条硬规则，不再是「一律两字符」
+    //
+    // 反汇编 -[CSWordEditDataManager setupParaStyleWithAttributeString:
+    //          para:ocrPage:segment:isCellPara:] 的原文：
+    //   ① para.floating_box 为真  → 整段不设任何缩进（浮动框有自己的坐标）
+    //   ② para.indent_hanging >= 1 → setHeadIndent(page.scale * hanging * k)
+    //      **且不再设 firstLineHeadIndent** —— 这两个分支是互斥的
+    //   ③ 否则 para.indent_first_line != 0 → setFirstLineHeadIndent(
+    //                                             page.scale * fl * k)
+    //
+    // v23/v24 只实现了③，而且字段缺失时无脑补两字符；①② 一次都没做。
+    // 「乙方：  某某公司」这种一行里带两个字段的段落，下一行要与上一行的
+    // 值左对齐，靠的就是②的悬挂缩进 —— 补不出来就必然错位。
     if (alignLeftish) {
-        const char *flWhy = "-";
-        double fl = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndFL], paraPt, &flWhy);
-        double il = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndL], paraPt, NULL);
-        double ir = CSFSTwipsFromLen([para objectForKey:kCSFSParaIndR], paraPt, NULL);
+        BOOL floating = CSFSBoolValue([para objectForKey:kCSFSParaFloat]);
+        if (!floating) {
+            const char *hWhy = "-";
+            double hangRaw = CSFSDoubleValue([para objectForKey:kCSFSParaIndH]);
+            double hangT = CSFSIndentTwips([para objectForKey:kCSFSParaIndH], paraPt, &hWhy);
 
-        long flT = 0, ilT = 0, irT = 0;
-        if (fl != 0.0 && fabs(fl) < kCSFSContentTwips * 0.45) flT = (long)(fl + (fl > 0 ? 0.5 : -0.5));
-        if (il != 0.0 && fabs(il) < kCSFSContentTwips * 0.45) ilT = (long)(il + (il > 0 ? 0.5 : -0.5));
-        if (ir != 0.0 && fabs(ir) < kCSFSContentTwips * 0.45) irT = (long)(ir + (ir > 0 ? 0.5 : -0.5));
+            const char *flWhy = "-";
+            double flT = CSFSIndentTwips([para objectForKey:kCSFSParaIndFL], paraPt, &flWhy);
+            double ilT = CSFSIndentTwips([para objectForKey:kCSFSParaIndL], paraPt, NULL);
+            double irT = CSFSIndentTwips([para objectForKey:kCSFSParaIndR], paraPt, NULL);
 
-        BOOL hasFL = (flT > 0);
-        if (!hasFL && !(flT < 0)) {
-            // 字段缺失或判不出：退回两字符，两字符 = 2 × 字号(pt) × 20
-            long two = (long)(paraPt * 40.0 + 0.5);
-            if (two < 20) two = 20;
-            flT = two;
-            flWhy = "fallback-2chars";
-        }
-        if (flT > 0) {
-            // firstLineChars 是 Word 扩展（按字符自适应字号），
-            // firstLine 是标准属性（twips）。两个都写：
-            // Word 优先前者，WPS/LibreOffice 只认后者。
-            long chars = (long)((double)flT / (paraPt * 20.0) * 100.0 + 0.5);
-            if (chars < 1) chars = 1;
-            if (chars > 2000) chars = 2000;
-            NSMutableString *ind = [NSMutableString string];
-            if (ilT != 0) [ind appendFormat:@" w:left=\"%ld\"", ilT];
-            if (irT != 0) [ind appendFormat:@" w:right=\"%ld\"", irT];
-            [pPr appendFormat:@"<w:ind%@ w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
-                ind, chars, flT];
-            CSFS_LOG(@"v24 ind firstLine=%ld (raw=%@ why=%s pt=%.1f)", flT,
-                     [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy, paraPt);
+            long lim = (long)(kCSFSContentTwips * 0.9);
+            long ilL = 0, irL = 0;
+            if (ilT != 0.0 && fabs(ilT) < lim) ilL = (long)(ilT + (ilT > 0 ? 0.5 : -0.5));
+            if (irT != 0.0 && fabs(irT) < lim) irL = (long)(irT + (irT > 0 ? 0.5 : -0.5));
+
+            if (hangRaw >= 1.0 && hangT > 0.0 && hangT < lim) {
+                // ② 悬挂缩进：所有行左缩进，首行不额外缩进
+                NSMutableString *attrs = [NSMutableString string];
+                [attrs appendFormat:@" w:left=\"%ld\"", (long)(hangT + 0.5)];
+                if (irL != 0) [attrs appendFormat:@" w:right=\"%ld\"", irL];
+                [pPr appendFormat:@"<w:ind%@/>", attrs];
+                CSFS_LOG(@"v25 ind hanging left=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
+                         (long)(hangT + 0.5), [para objectForKey:kCSFSParaIndH] ?: @"(nil)",
+                         hWhy, gCSFSPageScale, paraPt);
+            } else {
+                // ③ 首行缩进
+                long flL = 0;
+                if (flT > 0.0 && flT < lim) flL = (long)(flT + 0.5);
+                if (flL <= 0) {
+                    // 字段真缺失才兜底两字符；这是保险，不是规则
+                    flL = (long)(paraPt * 40.0 + 0.5);
+                    if (flL < 20) flL = 20;
+                    flWhy = "fallback-2chars";
+                }
+                NSMutableString *attrs = [NSMutableString string];
+                if (ilL != 0) [attrs appendFormat:@" w:left=\"%ld\"", ilL];
+                if (irL != 0) [attrs appendFormat:@" w:right=\"%ld\"", irL];
+                // firstLineChars 是 Word 扩展（按字符自适应字号），
+                // firstLine 是标准属性（twips）。两个都写：
+                // Word 优先前者，WPS/LibreOffice 只认后者。
+                long chars = (long)((double)flL / (paraPt * 20.0) * 100.0 + 0.5);
+                if (chars < 1) chars = 1;
+                if (chars > 2000) chars = 2000;
+                [pPr appendFormat:@"<w:ind%@ w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
+                    attrs, chars, flL];
+                CSFS_LOG(@"v25 ind firstLine=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
+                         flL, [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy,
+                         gCSFSPageScale, paraPt);
+            }
+        } else {
+            CSFS_LOG(@"v25 ind skipped: floating_box");
         }
     }
 
@@ -3628,21 +3876,22 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         // 5) 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
         //    否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
         //
-        //    v23：先把「与基准差 20% 以内」的字号归并到基准。
-        //    实测真机导出的 docx：124 个 run 里 7 个是 10pt、其余 11pt，
-        //    而这 7 个恰好整段落在第五条、第六条、第十二条上 ——
-        //    Word 里看到的就是「这几条字小一圈」，用户一眼就发现了。
-        //    10% 级别的抖动来自 OCR 的逐行度量误差，不是排版意图：
-        //    同一份合同的正文不可能忽大忽小。
-        //    阈值 20% 卡得很宽裕：标题（25pt）离基准 11pt 有 127%，
-        //    不会被误并；脚注（8pt）离 27%，也不会被并。
+        //    v25：取消 v23 的「20% 归并」。
+        //    App 的规则是逐 slice 取自己的 font_size，只在最后叠加一档
+        //    全局偏移 —— 反汇编
+        //    -[CSITextEngineSettings caculateFontSizeWithOriginalFontSize:]：
+        //        fontSizeMode 1 → -1pt，2 → +1pt，其余原样。
+        //    也就是说预览里 10pt 与 11pt 本来就是混排的，它就该混排。
+        //    v23 把它们统一到 11pt，等于改了 App 的排版，看着「更整齐」
+        //    却和预览不一样 —— 这正是用户说的「还是不对」。
         id szObj = [r objectForKey:kCSFSRunSize];
         if (szObj && defaultPt > 2.0 && defaultPt < 200.0) {
             double sz = [szObj doubleValue];
-            if (sz > 2.0 && sz < 200.0 && fabs(sz - defaultPt) <= defaultPt * 0.2) {
-                sz = defaultPt;      // 归并到基准
+            if (sz > 2.0 && sz < 200.0) {
+                if (gCSFSFontSizeMode == 1)      sz -= 1.0;
+                else if (gCSFSFontSizeMode == 2) sz += 1.0;
             }
-            if (sz > 0 && fabs(sz - defaultPt) > 0.5) {
+            if (sz > 2.0 && sz < 200.0 && fabs(sz - defaultPt) > 0.1) {
                 long hp = (long)(sz * 2.0 + 0.5);
                 // 越界字号 Word 会当损坏处理，直接钳进合法区间
                 if (hp < 1) hp = 1;
@@ -4156,36 +4405,29 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
 
                                                                 // ── v24：去除印章（块级）
                                                                 //
-                                                                // 判据两条，都来自身份字段而不是猜：
-                                                                //   ① image_category 含 stamp / seal / yinzhang
-                                                                //   ② segment 自带 -isStampImage（valueForKey 可直接调）
+                                                                // 判据就是 App 自己的 customImageCategoryType：
+                                                                // 2 = STAMP、1 = HANDWRITTEN（严格相等）。
                                                                 // 只勾了「去除印章」时才拦；没勾就照常输出，
                                                                 // 因为印章本身常常就是合同的要件。
-                                                                if (gCSFSHideStamp) {
-                                                                    BOOL isStamp = (catStr.length > 0 &&
-                                                                                    ([catStr containsString:@"stamp"] ||
-                                                                                     [catStr containsString:@"seal"] ||
-                                                                                     [catStr containsString:@"yinzhang"]));
-                                                                    if (!isStamp &&
-                                                                        CSFSBoolValue(CSFSValue(block, @"isStampImage"))) {
-                                                                        isStamp = YES;
-                                                                    }
-                                                                    if (isStamp) {
-                                                                        stampSkipCount++;
-                                                                        CSFS_LOG(@"v24 hideStamp: skip IMAGE block cat=%@", catStr ?: @"(nil)");
-                                                                        continue;
-                                                                    }
+                                                                NSInteger catType = CSFSCategoryType(block);
+                                                                if (gCSFSHideStamp && catType == 2) {
+                                                                    stampSkipCount++;
+                                                                    CSFS_LOG(@"v25 hideStamp: skip IMAGE block cat=%@", catStr ?: @"(nil)");
+                                                                    continue;
                                                                 }
 
-                                                                // ── v24：去除手写（块级）
+                                                                // ── v25：去除手写（块级）
                                                                 //
                                                                 // 必须排在下面「文字优先」之前：用户勾的是「删掉手写」，
                                                                 // 不是「把手写换成文字」。v22 的文字优先是对的，
                                                                 // 但它没让位给这个开关，于是勾了去除手写，
                                                                 // 手写的 OCR 文字照样被写进 Word —— 正是用户说的「没去除」。
-                                                                if (gCSFSHideWritten && handwriteLike) {
+                                                                //
+                                                                // 判据从 v24 的「含 text/ocr 就算手写」收紧成 catType==1：
+                                                                // 前者会把带 OCR 结果的普通图块也当手写删掉。
+                                                                if (gCSFSHideWritten && catType == 1) {
                                                                     handSkipCount++;
-                                                                    CSFS_LOG(@"v24 hideWritten: skip IMAGE block cat=%@", catStr ?: @"(nil)");
+                                                                    CSFS_LOG(@"v25 hideWritten: skip IMAGE block cat=%@", catStr ?: @"(nil)");
                                                                     continue;
                                                                 }
 
@@ -4302,15 +4544,27 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                         NSString *stLow =
                                                                             [stRaw isKindOfClass:[NSString class]]
                                                                             ? [(NSString *)stRaw lowercaseString] : nil;
-                                                                        if (gCSFSHideStamp && stLow.length > 0 &&
-                                                                            ([stLow containsString:@"stamp"] ||
-                                                                             [stLow containsString:@"seal"])) {
+                                                                        // v25：slice 自己也带 image_category 时以它为准
+                                                                        // （与 -[CSOcrPageSegment customImageCategoryType]
+                                                                        //  同一套字符串），stype 只作为兜底。
+                                                                        NSInteger slCat = CSFSCategoryType(sl);
+                                                                        if (gCSFSHideStamp &&
+                                                                            (slCat == 2 ||
+                                                                             (stLow.length > 0 &&
+                                                                              ([stLow containsString:@"stamp"] ||
+                                                                               [stLow containsString:@"seal"])))) {
                                                                             stampSkipCount++;
+                                                                            CSFS_LOG(@"v25 hideStamp: skip slice stype=%@ cat=%ld",
+                                                                                     stLow ?: @"(nil)", (long)slCat);
                                                                             continue;
                                                                         }
-                                                                        if (gCSFSHideWritten && stLow.length > 0 &&
-                                                                            [stLow containsString:@"handwrit"]) {
+                                                                        if (gCSFSHideWritten &&
+                                                                            (slCat == 1 ||
+                                                                             (stLow.length > 0 &&
+                                                                              [stLow containsString:@"handwrit"]))) {
                                                                             handSkipCount++;
+                                                                            CSFS_LOG(@"v25 hideWritten: skip slice stype=%@ cat=%ld",
+                                                                                     stLow ?: @"(nil)", (long)slCat);
                                                                             continue;
                                                                         }
                                                                         if (CSFSBoolValue(CSFSValue(sl, @"hiding"))) {
@@ -4399,12 +4653,16 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     id fl = CSFSValue(para, @"indent_first_line");
                                                                     id il = CSFSValue(para, @"indent_left");
                                                                     id ir = CSFSValue(para, @"indent_right");
+                                                                    id ih = CSFSValue(para, @"indent_hanging");
+                                                                    id fb = CSFSValue(para, @"floating_box");
                                                                     id tb = CSFSValue(para, @"tabs");
                                                                     id lg = CSFSValue(para, @"line_gap");
                                                                     id bp = CSFSValue(para, @"mostFrequentFontSize");
                                                                     if (fl) [p setObject:fl forKey:kCSFSParaIndFL];
                                                                     if (il) [p setObject:il forKey:kCSFSParaIndL];
                                                                     if (ir) [p setObject:ir forKey:kCSFSParaIndR];
+                                                                    if (ih) [p setObject:ih forKey:kCSFSParaIndH];
+                                                                    if (fb) [p setObject:fb forKey:kCSFSParaFloat];
                                                                     if (tb) [p setObject:tb forKey:kCSFSParaTabs];
                                                                     if (lg) [p setObject:lg forKey:kCSFSParaLineGap];
                                                                     if (bp) [p setObject:bp forKey:kCSFSParaBasePt];
@@ -4413,10 +4671,12 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     // 单位只能靠这个日志定死，静态分析做不到。
                                                                     if (layoutDiagDone == NO) {
                                                                         layoutDiagDone = YES;
-                                                                        CSFS_LOG(@"v24 DIAG para layout: fl=%@ il=%@ ir=%@"
+                                                                        CSFS_LOG(@"v25 DIAG para layout: fl=%@ il=%@ ir=%@ ih=%@ fb=%@"
                                                                                  @" lg=%@ bp=%@ tabs=%@ shape=%@",
                                                                                  fl ?: @"(nil)", il ?: @"(nil)",
-                                                                                 ir ?: @"(nil)", lg ?: @"(nil)",
+                                                                                 ir ?: @"(nil)", ih ?: @"(nil)",
+                                                                                 fb ?: @"(nil)",
+                                                                                 lg ?: @"(nil)",
                                                                                  bp ?: @"(nil)",
                                                                                  tb ? CSFSDescribeShape(tb) : @"(nil)",
                                                                                  CSFSDescribeShape(para));
@@ -4424,11 +4684,13 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 }
 
                                                                 // 段落级对齐。
-                                                                // v22 抽成 CSFSMapJustification ——
-                                                                // IMAGE 块转文字那条路径也要用同一套映射，
-                                                                // 各写一份迟早会漂。
-                                                                NSString *jc =
-                                                                    CSFSMapJustification(CSFSValue(para, @"justification"));
+                                                                // App 渲染时读的是 para.horizontalTextAligment
+                                                                // （NSTextAlignment 数值 0/1/2/3），
+                                                                // justification 只是落盘用的别名。
+                                                                // 两个都试，App 那个优先 —— 以渲染时为准。
+                                                                id alignRaw = CSFSValue(para, @"horizontalTextAligment");
+                                                                if (!alignRaw) alignRaw = CSFSValue(para, @"justification");
+                                                                NSString *jc = CSFSMapJustification(alignRaw);
                                                                 if (jc) [p setObject:jc forKey:kCSFSParaAlign];
 
                                                                 // v22：记下这段文字，供 IMAGE 块去重。
