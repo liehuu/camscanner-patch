@@ -127,6 +127,16 @@ jobs:
           # 两条都是「少做了一件事」，代码完全合法 —— 编译器与 lint 一律看不见。
           python3 tools/rev_check_v24.py
           python3 tools/check_v24.py src/CamScannerSaveToFiles.m
+          # v27：「去除手写 / 去除印章」两轮都没生效，真因不是「没读开关」，
+          # 而是**读到的第一份就信了**。v25 的 CSFSPullOptions 一拿到字段就
+          # return YES，于是 CSFSReadOptionsFromBottomView 里排第一的
+          # bottomView.originalData 直接短路，v25 特意新加的
+          # context.allPages 分支一次都没执行过 —— 行为与 v24 逐字节等价。
+          # 这类「代码合法但永远走不到」的缺陷，编译器、lint、check_v24 全看不见，
+          # 所以单独立一项：断言三个来源都不许短路、返回值必须留变量、
+          # 合并必须是 OR 语义、必须有 FINAL 汇总日志。
+          python3 tools/rev_check_v27.py
+          python3 tools/check_v27.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |

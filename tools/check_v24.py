@@ -203,10 +203,19 @@ def main():
     #
     # 这是安全边界：读不到开关（optKnown=0）时必须留下痕迹，
     # 否则「用户明明勾了」和「用户没勾」在日志里长得一模一样。
-    if 'v24 stats: optKnown=' in src:
-        ok('E10 统计行带 optKnown，可区分「没读到开关」与「读到了 NO」')
-    else:
+    #
+    # 判据不能绑版本号字面量（v24 曾写死 'v24 stats: optKnown='，
+    # 一升到 v27 就假 FAIL）。按**实质**判：日志格式串里同时出现
+    # optKnown 与 hideWritten/hideStamp，说明这一行确实在报开关判读结果。
+    stats_line = None
+    for ln in src.split('\n'):
+        if 'CSFS_LOG' in ln and 'optKnown=' in ln and 'hideWritten=' in ln:
+            stats_line = ln
+            break
+    if stats_line is None:
         fail('E10 统计行没有 optKnown —— 读不到开关时会被误判成「用户没勾」')
+    else:
+        ok('E10 统计行带 optKnown，可区分「没读到开关」与「读到了 NO」')
 
     print('=== check_v24 ===')
     for m in oks:

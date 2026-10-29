@@ -49,9 +49,12 @@ def inject(name, text, old, new):
 
 def main():
     base = io.open(SRC, encoding='utf-8').read()
-    if 'v24 stats: optKnown=' not in base:
-        print('[FAIL] 基线里找不到 v24 标记，源码版本不对')
-        return 1
+    # 基线判据不能绑版本号（曾写死 'v24 stats: optKnown='，升到 v27 就假 FAIL）。
+    # 改为要求 check_v24 真正依赖的那几个实质特征存在。
+    for need in ('optKnown=', 'hideWritten=', 'CSFSReadOptionsFromBottomView'):
+        if need not in base:
+            print('[FAIL] 基线里找不到 %s，源码版本不对' % need)
+            return 1
 
     # 基线必须通过
     out, rc = run_on(base)
@@ -114,9 +117,13 @@ def main():
     cases.append(('E8 tabs 顺序被破坏', inj_e8_order, 'CT_PPrBase 是 sequence'))
 
     # 8) 统计行丢了 optKnown —— 会让「没读到」和「用户没勾」长得一样
+    #
+    # 注入方式跟着判据走：check_v24 现在按「日志行里同时有 optKnown= 与
+    # hideWritten=」认定，所以注入改成把 optKnown= 整个抹掉，
+    # 而不是只改版本号前缀（后者在判据升级后已经不管用了）。
     cases.append((
         'E10 统计行缺 optKnown',
-        lambda t: inject('E10', t, 'v24 stats: optKnown=', 'v24 stats: '),
+        lambda t: inject('E10', t, 'optKnown=%d', 'knownFlag=%d'),
         '没有 optKnown'))
 
     passed = 0

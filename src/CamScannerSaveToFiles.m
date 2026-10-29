@@ -2209,6 +2209,37 @@ static BOOL gCSFSHandToImage = NO;
 static BOOL gCSFSOptKnown    = NO;   // 是否成功读到过（用于日志区分「没读到」和「读到 NO」）
 static NSString *gCSFSOptSrc = nil;  // 从哪读到的：page / json / none
 
+// ── v27：开关「多来源合并」而不是「先找到谁就信谁」 ────────────────────
+//
+// v25 的错：CSFSPullOptions 里 `if (!hw && !st && !hi) return NO;`
+// 只要目标对象**有**这三个字段就 return YES，于是
+// CSFSReadOptionsFromBottomView 的第一个来源 bottomView.originalData
+// 一旦带上这三个字段（哪怕全是 NO），立刻短路返回，
+// v25 特意新加的 context.allPages 分支根本执行不到。
+// 用户勾了却导出一模一样 —— 因为它读的是 originalData 这份**未同步的副本**。
+//
+// 改法：每个来源各自记录，最后合并。
+//
+// 但**三个开关的合并方向不一样**，不能用同一套规则 ——
+// 这是语义问题，不是实现细节：
+//
+//   hideWrittenImage / hideStampImage  语义是「删掉某类内容」
+//       → 合并取 OR（任一来源说删 → 就删）。
+//         读到多份说法相反，说明读到的是同步落后的副本；
+//         此时按「用户已经明确要求删」执行，才符合他在面板上的动作。
+//         代价是需要「少删」偏保守 —— 但用户勾了就是要删，不删才是没生效。
+//
+//   handWrittenToImage  语义是「保留手写成图」（与上面方向相反）
+//       → 合并取**最后一份读到明确的来源**，且在只有 NO 时才确认为 NO。
+//         不能取 OR：OR 会让「任何一份副本残留的 YES」把用户这次的
+//         「手写转文字」选择压掉，等于悄悄关掉 v22 实测可用的那条路。
+//
+// 一次拿到所有来源后再定，所以先存「是否见过」与「最后一份的值」。
+static BOOL gCSFSSeenWritten = NO;   // 任一来源明确读到 hideWrittenImage 的存在
+static BOOL gCSFSSeenStamp   = NO;
+static BOOL gCSFSSeenHandTo  = NO;
+static BOOL gCSFSHandToResolved = NO; // handWrittenToImage 是否已有确定值
+
 // ═════════════════════════════════════════════════════════════════════
 // v25：页面级版式上下文
 //
@@ -2797,6 +2828,20 @@ static NSInteger CSFSCategoryType(id block) {
 static id CSFSFindPageObject(id obj, int depth);
 static void CSFSCaptureLayoutContext(id page);
 
+// 从一个来源收集开关。
+//
+// v27 关键改动：**不再短路**。
+//   v24/v25 的写法是「这个来源有这三个字段 → 就认定读到了 → return YES」，
+//   于是 CSFSReadOptionsFromBottomView 里排第一的 bottomView.originalData
+//   只要带上字段（哪怕全是同步落后的 NO），后面的 context.allPages 就永远不执行。
+//   v25 以为「换了入口」，实际上一个入口都没换 —— 行为与 v24 完全一致。
+//
+//   现在改成：每个来源只把「自己看到的」记进 gCSFSSeenXxx，最后合并取 OR。
+//   三个来源全跑完才算完，任一来源说勾了就是勾了。
+//   字段不存在时不再 return NO 终止，而是记一笔「这个来源没提供」继续下一个。
+//
+//   返回 YES 表示「本次至少从这个来源读到了字段」，用于让调用方拼日志，
+//   但调用方**不再据此提前返回**。
 static BOOL CSFSPullOptions(id src, NSString *from) {
     if (!src) return NO;
     @try {
@@ -2804,17 +2849,45 @@ static BOOL CSFSPullOptions(id src, NSString *from) {
         id st = CSFSValue(src, @"hideStampImage");
         id hi = CSFSValue(src, @"handWrittenToImage");
         if (!hw && !st && !hi) return NO;
-        gCSFSHideWritten = CSFSBoolValue(hw);
-        gCSFSHideStamp   = CSFSBoolValue(st);
-        gCSFSHandToImage = CSFSBoolValue(hi);
+        gCSFSSeenWritten = YES;
+        gCSFSSeenStamp   = YES;
+        gCSFSSeenHandTo  = YES;
+        BOOL w = CSFSBoolValue(hw);
+        BOOL s = CSFSBoolValue(st);
+        BOOL h = CSFSBoolValue(hi);
+        // 合并规则按语义分（详见 gCSFSSeenWritten 处的长注释）：
+        //   hideWrittenImage / hideStampImage → OR（说删就删）
+        //   handWrittenToImage                → 以最后一份明确读到为准（不 OR）
+        if (w) gCSFSHideWritten = YES;
+        if (s) gCSFSHideStamp   = YES;
+        // handToImage 只要本来源真的给了字段，就用它的值覆盖（后读到的更新）。
+        if (hi) {
+            gCSFSHandToImage   = h;
+            gCSFSHandToResolved = YES;
+        }
         gCSFSOptKnown    = YES;
-        gCSFSOptSrc      = from;
+        // 来源名按实际贡献拼，别再用「最后写入者」——
+        // 合并语义下「最后写入者」会误导排查。
+        //
+        // presyntax.py 的 P5 只放行 @protocol 里声明过的 selector 和系统白名单。
+        // stringByAppendingFormat: 不在白名单里，而把它加进 @protocol 又要维护
+        // 一份假的 NSString 接口声明，所以这里用白名单里的 stringByAppendingString:
+        // 手工拼（from 里本来就只有 "context.allPages" 这类固定串，不涉格式化）。
+        NSString *tag = (w || s || h) ? from : [from stringByAppendingString:@"(no)"];
+        if (gCSFSOptSrc.length) {
+            gCSFSOptSrc = [gCSFSOptSrc stringByAppendingString:@"+"];
+            gCSFSOptSrc = [gCSFSOptSrc stringByAppendingString:tag];
+        } else {
+            gCSFSOptSrc = tag;
+        }
         gCSFSPageSrc     = from;
         // v25：同一次拿到 page 就顺带把版式上下文取走，
         // 免得后面再去找一遍（面板那时可能已经销毁）。
         CSFSCaptureLayoutContext(src);
-        CSFS_LOG(@"v24 opts(%@) hideWritten=%d hideStamp=%d handToImage=%d",
-                 from, (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage);
+        CSFS_LOG(@"v27 opts(%@) hideWritten=%d hideStamp=%d handToImage=%d"
+                 @" | merged w=%d s=%d h=%d",
+                 from, (int)w, (int)s, (int)h,
+                 (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage);
         return YES;
     } @catch (NSException *e) {
         CSFS_LOG(@"v24 opts(%@) threw: %@", from, e.reason);
@@ -2827,24 +2900,32 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
         CSFS_LOG(@"v24 opts: bottomView is nil");
         return;
     }
-    // 溯源顺序按「离真相的距离」排，不是按代码便利排：
-    //   ① bottomView.originalData —— 当前页，最直接
-    //   ② bottomView.context.allPages —— v25 新增。CSJsonWordEditContext 是
-    //      编辑页的中枢（bottomView/middleView/document/allPages 全挂在它上面），
-    //      开关最终就是通过它下面的 adapter 写到 page 上的。
-    //      v24 只看了 originalData，一旦它是个没同步开关的副本就永远读到 NO。
-    //   ③ bottomView 自己
-    if (CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData")) return;
+    // v27：三个来源**全部**走一遍再合并，不再「谁先命中就返回」。
+    // 溯源顺序按「离真相的距离」排（近的在前，日志里先出现）：
+    //   ① bottomView.originalData —— 当前页，最直接，但可能是同步落后的副本
+    //   ② bottomView.context.allPages —— 编辑页中枢 CSJsonWordEditContext，
+    //      开关最终由它的 adapter 写到 page 上，这里才是真值
+    //   ③ bottomView 自己 —— 兜底
+    BOOL got1 = CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData");
 
+    BOOL got2 = NO;
     id ctx = CSFSValue(bottomView, @"context");
     if (ctx) {
         id pages = CSFSValue(ctx, @"allPages");
         id page = CSFSFindPageObject(pages, 0);
-        if (CSFSPullOptions(page, @"context.allPages")) return;
+        got2 = CSFSPullOptions(page, @"context.allPages");
     }
-    if (CSFSPullOptions(bottomView, @"bottomView")) return;
-    CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
-             NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
+    BOOL got3 = CSFSPullOptions(bottomView, @"bottomView");
+
+    if (!got1 && !got2 && !got3) {
+        CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
+                 NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
+    } else {
+        CSFS_LOG(@"v27 opts: FINAL hideWritten=%d hideStamp=%d handToImage=%d"
+                 @" (srcs: originalData=%d allPages=%d self=%d)",
+                 (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage,
+                 (int)got1, (int)got2, (int)got3);
+    }
 }
 
 // 在任意形状的对象里挖出一个 CSOcrPage：
@@ -4337,6 +4418,8 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                         // v24：JSON 兜底 —— 若面板没读到，
                                                         // 看看 page 上有没有同名开关。有就用，
                                                         // 没有就不动（不覆盖上面已读到的值）。
+                                                        // v27：合并语义下这段变成「所有来源都还没读到」
+                                                        // 才补一次；已经读到就不重复跑，避免日志噪音。
                                                         if (!gCSFSOptKnown) CSFSPullOptions(page, @"json.page");
                                                         id blocks = [page objectForKey:@"segments"];
                                                         if (![blocks isKindOfClass:[NSArray class]]) continue;
@@ -4900,12 +4983,14 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         // optKnown=0 说明面板状态压根没读到 ——
                                         // 那时 hideStamp/hideWritten 一定是 0，
                                         // 不能据此认为「用户没勾」，要单独看 opts 那行。
-                                        CSFS_LOG(@"v24 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
-                                                 @" handToImage=%d | hiddenBlock=%ld stampSkip=%ld"
-                                                 @" handSkip=%ld tabRuns=%ld paras=%lu",
+                                        CSFS_LOG(@"v27 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
+                                                 @" handToImage=%d seen(w/s/h)=%d%d%d | hiddenBlock=%ld"
+                                                 @" stampSkip=%ld handSkip=%ld tabRuns=%ld paras=%lu",
                                                  (int)gCSFSOptKnown, gCSFSOptSrc ?: @"(none)",
                                                  (int)gCSFSHideWritten, (int)gCSFSHideStamp,
                                                  (int)gCSFSHandToImage,
+                                                 (int)gCSFSSeenWritten, (int)gCSFSSeenStamp,
+                                                 (int)gCSFSSeenHandTo,
                                                  hiddenBlockCount, stampSkipCount,
                                                  handSkipCount, tabRunCount,
                                                  (unsigned long)styledParas.count);
