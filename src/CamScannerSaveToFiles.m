@@ -2790,6 +2790,13 @@ static NSInteger CSFSCategoryType(id block) {
     return 0;
 }
 
+// 前置声明：CSFSPullOptions / CSFSReadOptionsFromBottomView 都会用到，实现在下面。
+// decl_order.py（CI 语法闸门之一）把前置声明也算作「定义」并要求早于首次使用，
+// 所以这两条必须排在 CSFSPullOptions 之前 —— v25 曾把它们放在后面，
+// 于是 CSFSPullOptions 里对 CSFSCaptureLayoutContext 的调用早于声明 12 行，CI 挂。
+static id CSFSFindPageObject(id obj, int depth);
+static void CSFSCaptureLayoutContext(id page);
+
 static BOOL CSFSPullOptions(id src, NSString *from) {
     if (!src) return NO;
     @try {
@@ -2814,10 +2821,6 @@ static BOOL CSFSPullOptions(id src, NSString *from) {
         return NO;
     }
 }
-
-// 前置声明：CSFSReadOptionsFromBottomView 用到，实现在它下面。
-static id CSFSFindPageObject(id obj, int depth);
-static void CSFSCaptureLayoutContext(id page);
 
 static void CSFSReadOptionsFromBottomView(id bottomView) {
     if (!bottomView) {
