@@ -99,9 +99,10 @@ BLK_SPACE_STATS_EARLY = (
 #     用 NSMutableString 累加。锚点跟着改成构造那一句。
 NBSP_SPLIT = '[nb appendString:@"\\u00A0"];'
 
-# v35：CSFSFixSpaceRuns 多了 indentTw 形参，且返回值接给 paraSuggestLeft。
+# v36：CSFSFixSpaceRuns 返回值从 BOOL 改为位标志 int paraFitFlags
+#      （一次预算要同时表达「建议左对齐」与「建议取消首行缩进」）。
 #      R5 / R7 共用这一处调用点。
-CALL_FIX = ('        paraSuggestLeft = CSFSFixSpaceRuns('
+CALL_FIX = ('        paraFitFlags = CSFSFixSpaceRuns('
             '(NSMutableArray *)runs, paraPt, fitIndentTw);')
 
 
@@ -209,7 +210,7 @@ def main():
         'CSFSRenderPara 里不调用 CSFSFixSpaceRuns',
         'F1 CSFSRenderPara 里没有调用 CSFSFixSpaceRuns',
         lambda s: inject(s, CALL_FIX,
-                         '        paraSuggestLeft = NO; /* removed */', 'R5'),
+                         '        paraFitFlags = 0; /* removed */', 'R5'),
     ))
 
     # R6 —— v34 起删除。

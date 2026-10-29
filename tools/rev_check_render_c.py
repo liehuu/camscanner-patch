@@ -82,11 +82,15 @@ def main():
     IND_ANCHOR = '[pPr appendFormat:@"<w:ind w:firstLineChars='
 
     # 1) <w:jc> 排到 <w:ind> 前面 —— CT_PPrBase 是 sequence，顺序错一项静默失效
+    #
+    # v36：缩进语句从 12 空格缩进（嵌在 else 分支深处）变成 8 空格，
+    # 原先「缩进 + 锚点」的写法因此命中 0 次、用例静默 SKIP。
+    # 现在只用锚点本身，不绑定行首缩进 —— 缩进层级再变也不会失效。
     def c1(t):
         return inject('jc 前置',
                       t,
-                      '            ' + IND_ANCHOR,
-                      '            [pPr appendString:@"<w:jc w:val=\\"both\\"/>"];\n            ' + IND_ANCHOR)
+                      IND_ANCHOR,
+                      '[pPr appendString:@"<w:jc w:val=\\"both\\"/>"]; ' + IND_ANCHOR)
     cases.append(('C9 pPr 顺序', c1, 'C9 pPr 顺序违规'))
 
     # 2) 删掉首行缩进 —— 正是 v22 及之前的真实状态。

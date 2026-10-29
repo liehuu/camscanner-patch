@@ -365,18 +365,22 @@ def main():
                  '若改成无差别压空白，下划线会被压短，退回 v32 的老毛病')
 
         # W4 左对齐只覆盖 both。
-        # 判据必须绑 paraSuggestLeft —— alignLeftish 的计算里也有一处
-        # isEqualToString:@"both"，只 grep 它永远绿。
-        m_w4 = re.search(r'paraSuggestLeft\s*&&[^{}]*?'
+        # 判据必须绑「宽度预算的结论」这个数据流 —— alignLeftish 的计算里
+        # 也有一处 isEqualToString:@"both"，只 grep 它永远绿。
+        #
+        # v36：结论载体从 BOOL paraSuggestLeft 换成了位标志
+        #      paraFitFlags & kCSFSFitLeft（因为一次预算要同时表达
+        #      「改左对齐」和「清缩进」两件事，BOOL 装不下）。
+        m_w4 = re.search(r'paraFitFlags\s*&\s*kCSFSFitLeft\s*\)\s*&&[^{}]*?'
                          r'isEqualToString\s*:\s*@"both"', rnd or '', re.S)
         if m_w4:
-            ok('W4 左对齐只在 paraSuggestLeft 且原 jc 是 both 时生效'
+            ok('W4 左对齐只在「预算建议左对齐」且原 jc 是 both 时生效'
                '（标题 center / 右对齐不受影响）')
-        elif re.search(r'paraSuggestLeft', rnd or ''):
-            fail('W4 找不到「paraSuggestLeft && jc==both」的条件 —— '
+        elif re.search(r'kCSFSFitLeft', rnd or ''):
+            fail('W4 找不到「(flags & kCSFSFitLeft) && jc==both」的条件 —— '
                  '左对齐会无差别覆盖 center/right，标题被拉回左边')
         else:
-            fail('W4 渲染阶段没用 paraSuggestLeft —— 宽度预算的结论被丢掉')
+            fail('W4 渲染阶段没用宽度预算的结论 —— 算完就丢掉了')
 
     # ══════════════════════════════════════════════════════════════
     # 七、标题（C）

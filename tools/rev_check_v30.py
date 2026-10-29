@@ -203,8 +203,8 @@ def main():
         '悬挂缩进只写 w:left，漏掉 w:hanging',
         'M6 有 1 处 w:left 没配 w:hanging',
         lambda s: inject(s,
-                         '[pPr appendFormat:@"<w:ind w:left=\\"%ld\\" w:hanging=\\"%ld\\"/>", hangL, hangL];',
-                         '[pPr appendFormat:@"<w:ind w:left=\\"%ld\\"/>", hangL];',
+                         '[pPr appendFormat:@"<w:ind w:left=\\"%ld\\" w:hanging=\\"%ld\\"/>", indHang, indHang];',
+                         '[pPr appendFormat:@"<w:ind w:left=\\"%ld\\"/>", indHang];',
                          'D8'),
     ))
 

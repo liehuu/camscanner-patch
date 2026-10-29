@@ -29,3 +29,10 @@ remote_src.m
 
 # 交付产物目录（从 CI artifact 下载解包而来，绝不入库）
 dist/
+
+# 本地门禁 / 推送 / 打包日志 —— 一次性诊断产物，不入库。
+# 每次改动都会生成一份新的，入库只会让 diff 变噪音。
+*.log
+
+# acrimmp 临时验证脚本（本地跑 IMP 签名对照用）
+tmpacrimmp*.m

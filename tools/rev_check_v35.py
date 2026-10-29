@@ -76,13 +76,12 @@ def main():
         'run 级修正挪回 <w:pPr> 之后（左对齐结论写不进 jc）',
         '[FAIL] O1',
         lambda s: inject(s,
-                         '    BOOL paraSuggestLeft = NO;\n'
+                         '    int paraFitFlags = 0;\n'
                          '    if (runsOK) {\n'
-                         '        paraSuggestLeft = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);\n'
+                         '        paraFitFlags = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);\n'
                          '    }\n',
-                         '    BOOL paraSuggestLeft = NO;\n',
-                         'R1') if s.count('        paraSuggestLeft = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);\n    }\n') == 1
-        else None,
+                         '    int paraFitFlags = 0;\n',
+                         'R1'),
     ))
 
     # R1b 挪到 pPr 之后（保留调用，只是位置错）
@@ -341,6 +340,10 @@ def main():
     for tag, desc, expect, fn in cases:
         mutated = fn(orig)
         if mutated is None:
+            # 静默失败最要命：计数 +1 却没有一行输出，看日志只看到
+            # 「19/20」却不知道是哪条挂了（本项目栽过多次）。
+            print('  [BAD ] %s %s —— 注入函数返回 None'
+                  '（锚点没命中 / 前置条件不成立），用例失效' % (tag, desc))
             bad += 1
             continue
         if mutated == orig:

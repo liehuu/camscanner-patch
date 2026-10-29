@@ -4465,6 +4465,52 @@ static double CSFSEstRunWidthPt(NSDictionary *r, double paraPt) {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// v36：宽度预算的结论用位标志返回。
+//
+// v35 只返回一个 BOOL（「要不要改左对齐」），装不下第二个结论。
+// 而真机第一轮就暴露出：这段既需要「别缩进」，也需要「保持两端对齐」，
+// 用一个 BOOL 表达就只能二选一。
+// ═════════════════════════════════════════════════════════════════════
+#define kCSFSFitLeft      1   // jc 建议改成 left
+#define kCSFSFitNoIndent  2   // 清掉首行缩进：缩进是这段折行的唯一原因
+
+// ═════════════════════════════════════════════════════════════════════
+// v36：把空白 run 按比例缩 —— **宽度字段和字符数必须一起改**。
+//
+// v35 只改了 kCSFSRunSpaceW（只参与估算），而写 XML 时走的是
+// text.length。真机日志铁证：
+//   v35 tailfit: tailSum=114.0 noTail=331.0 avail=429.3 ratio=0.836
+// 报着「压到 83.6%」，导出 XML 里那个 run 仍然是原样的 22 个空格
+// （转成 11 个 NBSP）—— 宽度字段压根不进 XML。
+// 结果是：估算按压过的算（说装得下），实际按没压的排（照样折行），
+// 两头都不对，还看不出是哪儿的问题。
+// ═════════════════════════════════════════════════════════════════════
+static void CSFSScaleSpaceRuns(NSMutableArray *runs, BOOL onlyTail, double ratio) {
+    if (!(ratio > 0.0) || ratio >= 0.999) return;
+    NSUInteger cnt = [runs count];
+    for (NSUInteger i = 0; i < cnt; i++) {
+        id o = [runs objectAtIndex:i];
+        if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
+        NSMutableDictionary *r = (NSMutableDictionary *)o;
+        if (onlyTail && ![[r objectForKey:kCSFSRunTail] boolValue]) continue;
+        NSString *t = [r objectForKey:kCSFSRunText];
+        if (!CSFSIsPureWhiteSpace(t) || t.length == 0) continue;
+        double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+        if (sw > 0.0) {
+            [r setObject:[NSNumber numberWithDouble:sw * ratio]
+                  forKey:kCSFSRunSpaceW];
+        }
+        NSUInteger nn = (NSUInteger)((double)t.length * ratio + 0.5);
+        if (nn < 1) nn = 1;
+        if (nn != t.length) {
+            NSMutableString *ns = [NSMutableString stringWithCapacity:nn];
+            for (NSUInteger k = 0; k < nn; k++) [ns appendString:@" "];
+            [r setObject:ns forKey:kCSFSRunText];
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // v35：段落宽度预算 —— 保证「本来一行」的段落不被挤成两行
 //
 // 判据只有三条，宁可不动也不乱动：
@@ -4476,16 +4522,18 @@ static double CSFSEstRunWidthPt(NSDictionary *r, double paraPt) {
 // 只压**有 slice.width 的空白**，不动文字、不动缩进 ——
 // 文字宽度是 OCR 识别出来的事实，空白宽度才是可以商量的排版量。
 // ═════════════════════════════════════════════════════════════════════
-static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw) {
-    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return NO;
+static int CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw,
+                            BOOL *outDropIndent) {
+    if (outDropIndent) *outDropIndent = NO;
+    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return 0;
 
     double lineW = kCSFSContentTwips / 20.0;
-    if (!(lineW > 40.0)) return NO;
+    if (!(lineW > 40.0)) return 0;
 
     double indentPt = (double)indentTw / 20.0;
     if (indentPt < 0.0 || indentPt > lineW * 0.5) indentPt = 0.0;
     double avail = lineW - indentPt;
-    if (!(avail > 60.0)) return NO;
+    if (!(avail > 60.0)) return 0;
 
     NSUInteger cnt = [runs count];
     double total = 0.0, spaceSum = 0.0, tailSum = 0.0, noTail = 0.0;
@@ -4514,6 +4562,86 @@ static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw)
     // 填充没有语义，裁短不改变任何文字位置；
     // 而它后面的东西根本不存在，所以「裁到剩余宽度」是零损失的。
     // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // v36：缩进是这段折行的**唯一原因** → 顶格，不缩进。
+    //
+    // 真机第一轮（v35）导出 PDF 后逐行量 bbox 的实测：
+    //   p1 出租方  缩进 21pt，内容 413.7pt → 408.3pt 装得下 → 一行 ✓
+    //   p2 承租方  缩进 21pt，内容 442.0pt → 装不下 → 折掉「方）」2 字
+    //   p3 中介方  缩进 21pt，内容 451.5pt → 装不下 → 折掉「人：」
+    // 而 App 预览截图里这三段都是**顶格**的（「出租方：」与下面
+    // 「根据《中华人民共和国民法典》」左边缘对齐，见用户截图）。
+    //
+    // 顶格后：p2 需 442.0 < 451.3 ✓；p3 需 451.5 ≈ 451.3（差 0.2pt）。
+    // 也就是说这 21pt 缩进是折行的全部原因 —— 与空白长短无关。
+    // v35 一直在压空白（而且只改宽度字段没改字符数，等于没压）。
+    //
+    // 判据刻意保守，四条同时成立才清缩进：
+    //   · 有缩进（> 1pt），否则谈不上「去掉」
+    //   · 加了缩进装不下
+    //   · 顶格后装得下（total ≤ 整行宽 × 估算偏差容差）
+    //   · 不是长段落（长段落本来就要折好几行，缩进不是原因）
+    // 四条的实质是：「同一段话，缩进就两行、顶格就一行」——
+    // 这种时候版式让位于行数。
+    //
+    // ═══════════════════════════════════════════════════════════════
+    // 【为什么容差是 1.18，不是 1.06】
+    //
+    // 估算是**系统性偏大**的：v35 日志与 Word 实测对照
+    //   p1 估算 459.9pt / 真实 413.7pt → 偏大 11.2%
+    // 因为字宽模型是粗的（汉字按 1em、半角按 0.5em），
+    // 而真实文本里全角标点、连字符、字距都会吃掉一些。
+    //
+    // 按 1.06 卡上限，反推真机三段估算值：
+    //   p2 442.0 × 1.112 ≈ 491.5   > 451.3 × 1.06 = 478.4  ✗
+    //   p3 451.5 × 1.112 ≈ 502.1   > 478.4                 ✗
+    // 也就是说 1.06 会让这条分支**一次都不触发** —— 改动白写，
+    // 而且日志里只会看到 overflow，看不出是阈值卡掉了。
+    // 这跟 v35 的 squeeze 一次没跑是同一个坑：阈值按"我以为的
+    // 误差"定，而不是按"实测到的误差"定。
+    //
+    // 1.18 = 11.2% 偏差 + 6% 余量。上界的安全边际来自另一侧：
+    // 长段落估算在 900~4000pt，远大于 451.3 × 1.18 = 532.5，
+    // 不会因为放宽而被误判成"顶格就好"。
+    //
+    // 【但这次三段其实不走这条分支】
+    // 日志里 `fallback-2chars` 出现 3 次 → 说明 fl 字段就是 0，
+    // 也就是 OCR 明确说了「顶格」。删掉兜底之后 indFirst 本来就是 0，
+    // indentPt = 0，这条分支连条件都不满足 —— 三段自动顶格。
+    //
+    // 所以本次修复的主路径是「删兜底」（I 组），这里只是保险：
+    // 万一将来某个文档 OCR 真的给了 fl > 0，但加缩进会折行，
+    // 才由它来清。**不要因为真机上 branch 没触发就去调这个系数** ——
+    // 没触发恰恰是正常的。
+    // ═══════════════════════════════════════════════════════════════
+    int flags = 0;
+    if (indentPt > 1.0 && total > avail && total <= lineW * 1.18 &&
+        total > avail * 0.6) {
+        flags |= kCSFSFitNoIndent;
+        if (outDropIndent) *outDropIndent = YES;
+        CSFS_LOG(@"v36 dropindent: total=%.1f availInd=%.1f lineW=%.1f（顶格才放得下）",
+                 total, avail, lineW);
+        avail = lineW;
+        indentPt = 0.0;
+        // ═══════════════════════════════════════════════════════════
+        // 顶格之后**不再压任何空白**，直接出结论。
+        //
+        // 理由是估算本身偏大：实测 p1 估算 459.9pt、Word 真实排 413.7pt，
+        // 偏大 11%。按这个数去「挤进一行」，会把 p1 那 18 个空格
+        // 压掉 13% —— 而那 18 个空格正是用户要的身份证下划线长度，
+        // 实际根本不需要压。v35 的 squeeze 就是这样误伤的。
+        //
+        // 缩进既然是折行的唯一原因，去掉缩进就够了；
+        // 剩下的余量问题交给对齐（单行段落改不改 jc 没有视觉差别，
+        // 多行段落改了正好避免 jc=both 撑开字距）。
+        // ═══════════════════════════════════════════════════════════
+        double rem0 = fmod(total, avail);
+        if (rem0 > 0.0 && rem0 < avail * 0.5 && total < avail * 1.35) {
+            flags |= kCSFSFitLeft;
+        }
+        return flags;
+    }
+
     if (tailSum > 0.0) {
         double room = avail - noTail;
         if (room < 2.0) room = 2.0;
@@ -4521,25 +4649,14 @@ static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw)
         if (tailSum > target) {
             double r2 = target / tailSum;
             if (r2 < 0.05) r2 = 0.05;
-            for (NSUInteger i = 0; i < cnt; i++) {
-                id o = [runs objectAtIndex:i];
-                if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
-                NSMutableDictionary *r = (NSMutableDictionary *)o;
-                if (![[r objectForKey:kCSFSRunTail] boolValue]) continue;
-                if (!CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText])) continue;
-                double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
-                if (sw > 0.0) {
-                    [r setObject:[NSNumber numberWithDouble:sw * r2]
-                          forKey:kCSFSRunSpaceW];
-                }
-            }
+            CSFSScaleSpaceRuns(runs, YES, r2);
             CSFS_LOG(@"v35 tailfit: tailSum=%.1f noTail=%.1f avail=%.1f ratio=%.3f",
                      tailSum, noTail, avail, r2);
             total = noTail + target;
         }
     }
 
-    if (total <= avail) return NO;                 // ① 装得下
+    if (total <= avail) return flags;              // ① 装得下
 
     // ═══════════════════════════════════════════════════════════════
     // v35：只差 5% 以内的段落，压一点留白把它挤进一行。
@@ -4556,22 +4673,13 @@ static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw)
     //     差得多的段落宁可折行也不动它的长度。
     // ═══════════════════════════════════════════════════════════════
     if (total <= avail * 1.05 && spaceSum > 1.0) {
-        double need = total - avail * 0.995;
+        double need = total - avail * 0.99;
         double ratio = (spaceSum - need) / spaceSum;
         if (ratio >= 0.5 && ratio < 0.999) {
-            for (NSUInteger i = 0; i < cnt; i++) {
-                id o = [runs objectAtIndex:i];
-                if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
-                NSMutableDictionary *r = (NSMutableDictionary *)o;
-                double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
-                if (sw > 0.0 && CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText])) {
-                    [r setObject:[NSNumber numberWithDouble:sw * ratio]
-                          forKey:kCSFSRunSpaceW];
-                }
-            }
+            CSFSScaleSpaceRuns(runs, NO, ratio);
             CSFS_LOG(@"v35 squeeze: total=%.1f avail=%.1f spaceSum=%.1f ratio=%.3f",
                      total, avail, spaceSum, ratio);
-            return NO;                             // 挤进一行了，保持两端对齐
+            return flags;                          // 挤进一行了，保持两端对齐
         }
     }
 
@@ -4590,9 +4698,10 @@ static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw)
     // ═══════════════════════════════════════════════════════════════
     double rem = fmod(total, avail);
     BOOL suggestLeft = (rem > 0.0 && rem < avail * 0.5) && (total < avail * 1.35);
+    if (suggestLeft) flags |= kCSFSFitLeft;
     CSFS_LOG(@"v35 overflow: total=%.1f avail=%.1f rem=%.1f left=%d",
              total, avail, rem, (int)suggestLeft);
-    return suggestLeft;
+    return flags;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -4638,8 +4747,8 @@ static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw)
 //
 // 保留 v33 做对的部分：字号缺失时从邻居继承、以及 NBSP 换行尾空格。
 // ═════════════════════════════════════════════════════════════════════
-static BOOL CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt, long indentTw) {
-    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return NO;
+static int CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt, long indentTw) {
+    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return 0;
 
     static long fixLogCount = 0;   // 明细日志最多 6 条，防刷屏
     NSUInteger cnt = [runs count];
@@ -4820,16 +4929,21 @@ static BOOL CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt, long indentTw)
 
     // v35：宽度预算放在最后一步 —— 字体、行尾、tab 都已定稿，
     // 这时候估出来的宽度才和真正写进 XML 的一致。
-    BOOL suggestLeft = CSFSFitParaWidth(runs, paraPt, indentTw);
+    // v36：返回位标志（左对齐 / 清缩进），不再只回一个 BOOL。
+    BOOL dropIndent = NO;
+    int fitFlags = CSFSFitParaWidth(runs, paraPt, indentTw, &dropIndent);
+    if (dropIndent) fitFlags |= kCSFSFitNoIndent;
 
-    if (fillSize || faceFix || fillBody || textFaceFix || tailDrop || tabDrop) {
+    if (fillSize || faceFix || fillBody || textFaceFix || tailDrop || tabDrop ||
+        dropIndent) {
         CSFS_LOG(@"v35 spcfix para: faceFix=%ld textFaceFix=%ld fillBody=%ld"
                  @" fillSize=%ld underNative=%ld tailDrop=%ld tabDrop=%ld"
-                 @" face=%@ pt=%.1f ind=%ld left=%d",
+                 @" dropInd=%d face=%@ pt=%.1f ind=%ld left=%d",
                  faceFix, textFaceFix, fillBody, fillSize, underNative, tailDrop, tabDrop,
-                 wideFace, paraPt, indentTw, (int)suggestLeft);
+                 (int)dropIndent, wideFace, paraPt, indentTw,
+                 (int)((fitFlags & kCSFSFitLeft) != 0));
     }
-    return suggestLeft;
+    return fitFlags;
 }
 
 static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
@@ -5080,48 +5194,51 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     //      App 设的是 headIndent=X 且 firstLineHeadIndent=0，
     //      即「首行顶格、其余行缩 X」。只写 w:left=X 会让**首行也缩进**，
     //      整体右移一格。OOXML 的等价写法是 w:left=X + w:hanging=X。
+    // v36：缩进「先算值、后落笔」。
+    //   要不要缩进不只看 OCR 的 indent_first_line，还要看宽度预算：
+    //   若加了缩进会让本来一行的段落折行、去掉缩进就正好一行，那就不缩。
+    //   所以这里只把值算出来，等 CSFSFixSpaceRuns 的结论回来再写 pPr。
+    long indHang = 0;        // >0：悬挂缩进（首行顶格，其余行缩进）
+    long indFirst = 0;       // >0：首行缩进
     if (alignLeftish) {
         BOOL floating = CSFSBoolValue([para objectForKey:kCSFSParaFloat]);
         if (!floating) {
-            const char *hWhy = "-";
             double hangRaw = CSFSDoubleValue([para objectForKey:kCSFSParaIndH]);
-            double hangT = CSFSIndentTwips([para objectForKey:kCSFSParaIndH], paraPt, &hWhy);
-
-            const char *flWhy = "-";
-            double flT = CSFSIndentTwips([para objectForKey:kCSFSParaIndFL], paraPt, &flWhy);
+            double hangT = CSFSIndentTwips([para objectForKey:kCSFSParaIndH],
+                                           paraPt, NULL);
+            double flT = CSFSIndentTwips([para objectForKey:kCSFSParaIndFL],
+                                         paraPt, NULL);
 
             long lim = (long)(kCSFSContentTwips * 0.9);
             if (hangRaw >= 1.0 && hangT > 0.0 && hangT < lim) {
                 // ② 悬挂缩进：首行顶格，其余行缩 hangT
-                long hangL = (long)(hangT + 0.5);
-                [pPr appendFormat:@"<w:ind w:left=\"%ld\" w:hanging=\"%ld\"/>", hangL, hangL];
-                CSFS_LOG(@"v30 ind hanging left=%ld hanging=%ld (raw=%@ why=%s scale=%.4f)",
-                         hangL, hangL, [para objectForKey:kCSFSParaIndH] ?: @"(nil)",
-                         hWhy, gCSFSPageScale);
-            } else {
+                indHang = (long)(hangT + 0.5);
+            } else if (flT > 0.0 && flT < lim) {
                 // ③ 首行缩进
-                long flL = 0;
-                if (flT > 0.0 && flT < lim) flL = (long)(flT + 0.5);
-                if (flL <= 0) {
-                    // 字段真缺失才兜底两字符；这是保险，不是规则
-                    flL = (long)(paraPt * 40.0 + 0.5);
-                    if (flL < 20) flL = 20;
-                    flWhy = "fallback-2chars";
-                }
-                // firstLineChars 是 Word 扩展（按字符自适应字号），
-                // firstLine 是标准属性（twips）。两个都写：
-                // Word 优先前者，WPS/LibreOffice 只认后者。
-                long chars = (long)((double)flL / (paraPt * 20.0) * 100.0 + 0.5);
-                if (chars < 1) chars = 1;
-                if (chars > 2000) chars = 2000;
-                [pPr appendFormat:@"<w:ind w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
-                    chars, flL];
+                indFirst = (long)(flT + 0.5);
                 // 首行缩进是首行的实际开销，宽度预算要减掉它。
                 // 悬挂缩进（上面那个分支）首行顶格，开销为 0，故不设。
-                fitIndentTw = flL;
-                CSFS_LOG(@"v30 ind firstLine=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
-                         flL, [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy,
-                         gCSFSPageScale, paraPt);
+                fitIndentTw = indFirst;
+            }
+            // ═══════════════════════════════════════════════════════
+            // v36：删掉「fl 为 0 或缺失 → 兜底两字符缩进」。
+            //
+            // 反汇编原文 ③ 是 `cbz x0 → 跳过`：**fl 为 0 就跳过，不设缩进**。
+            // v30 却写成了「字段缺失 → 兜底两字符」，把「顶格」这个
+            // 明确状态当成了「数据缺失」，给每一段都补了 22pt。
+            //
+            // 真机后果（v35 导出 PDF 逐行量 bbox）：
+            //   承租方：缩进 21pt 后内容 442pt，可用只剩 430.3pt
+            //          → 折掉「方）」两个残字
+            //   中介方：缩进 21pt 后内容 451.5pt → 折掉「人：」
+            // 而预览截图里这两段都是顶格的。**兜底把正确的顶格改坏了**，
+            // 这是本项目第三次栽在「兜底掩盖真相」上（前两次是字体兜底、
+            // indent 兜底）。
+            // ═══════════════════════════════════════════════════════
+            if (indHang == 0 && indFirst == 0) {
+                CSFS_LOG(@"v36 ind none: fl=%@ ih=%@（顶格，不缩进）",
+                         [para objectForKey:kCSFSParaIndFL] ?: @"(nil)",
+                         [para objectForKey:kCSFSParaIndH] ?: @"(nil)");
             }
         } else {
             CSFS_LOG(@"v30 ind skipped: floating_box");
@@ -5135,9 +5252,42 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     // 于是宽度预算算出来的结论只能丢掉，等于白算。
     id runs = [para objectForKey:kCSFSParaRuns];
     BOOL runsOK = [runs isKindOfClass:[NSArray class]] && [(NSArray *)runs count] > 0;
-    BOOL paraSuggestLeft = NO;
+    int paraFitFlags = 0;
     if (runsOK) {
-        paraSuggestLeft = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);
+        paraFitFlags = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);
+    }
+
+    // 2) 缩进落笔 —— 必须在 jc 之前（CT_PPrBase 的顺序是 ind → jc）
+    if (paraFitFlags & kCSFSFitNoIndent) {
+        if (indFirst > 0) {
+            CSFS_LOG(@"v36 ind drop: firstLine=%ld → 0（加缩进会折行，顶格刚好一行）",
+                     indFirst);
+        }
+        indFirst = 0;
+    }
+    if (indHang > 0) {
+        [pPr appendFormat:@"<w:ind w:left=\"%ld\" w:hanging=\"%ld\"/>", indHang, indHang];
+        CSFS_LOG(@"v30 ind hanging left=%ld hanging=%ld (scale=%.4f)",
+                 indHang, indHang, gCSFSPageScale);
+    } else if (indFirst > 0) {
+        // firstLineChars 是 Word 扩展（按字符自适应字号），
+        // firstLine 是标准属性（twips）。两个都写：
+        // Word 优先前者，WPS/LibreOffice 只认后者。
+        long chars = (long)((double)indFirst / (paraPt * 20.0) * 100.0 + 0.5);
+        if (chars < 1) chars = 1;
+        if (chars > 2000) chars = 2000;
+        [pPr appendFormat:@"<w:ind w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
+            chars, indFirst];
+        CSFS_LOG(@"v30 ind firstLine=%ld (pt=%.1f scale=%.4f)",
+                 indFirst, paraPt, gCSFSPageScale);
+    } else if (paraFitFlags & kCSFSFitNoIndent) {
+        // v36：本来是「有缩进」、因为会折行才清成「顶格」的段落，
+        // 给 1pt 的右边距垫。
+        // 这类段落是「顶格刚好一行」的临界情形：实测 p3 顶格后
+        // 需要 451.5pt 而版心 451.3pt，只差 0.2pt 就折掉「人：」。
+        // 1pt = 0.35mm，肉眼不可见，但足以吃掉估算误差和 twips 取整。
+        [pPr appendString:@"<w:ind w:right=\"-20\"/>"];
+        CSFS_LOG(@"v36 ind pad: right=-20tw（临界段落留 1pt 余量）");
     }
 
     // v35：标题段强制居中。
@@ -5163,7 +5313,7 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     }
     // v35：折行余量太小 → 改左对齐，避免 jc=both 把首行字距撑成两倍。
     // 只覆盖 both，不动 center/right（标题与右对齐是刻意的）。
-    if (paraSuggestLeft && [align isKindOfClass:[NSString class]] &&
+    if ((paraFitFlags & kCSFSFitLeft) && [align isKindOfClass:[NSString class]] &&
         [(NSString *)align isEqualToString:@"both"]) {
         align = @"left";
         CSFS_LOG(@"v35 align: both -> left（折行余量 <50%%，两端对齐会撑开字距）");
