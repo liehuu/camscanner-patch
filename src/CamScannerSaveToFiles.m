@@ -2209,6 +2209,135 @@ static BOOL gCSFSHandToImage = NO;
 static BOOL gCSFSOptKnown    = NO;   // 是否成功读到过（用于日志区分「没读到」和「读到 NO」）
 static NSString *gCSFSOptSrc = nil;  // 从哪读到的：page / json / none
 
+// ── v29：开关的**真身**在 CSImageToJsonManager，而且属性名少一个 n ────────
+//
+// v24～v28 五轮全部失败，最终用三路静态分析定死了根因，两条都致命：
+//
+// 【错一】属性名拼写不同 —— 这是最要命的一条
+//   反汇编 -updateCategoryListViewItemsWithShowFormula:showHandToPrint:
+//          showRemoveHand:showRemoveSignet:... 得到：
+//
+//     1012e4124: bl STUB[hideWrittenImage]      ; 从 Document 读：Writ**t**en
+//     1012e414c: bl STUB[setHideWritteImage:]   ; 写到 Manager：Writ**t**e
+//
+//   两处只差一个 n。名字池里两个都真实存在：
+//     hideWrittenImage / setHideWrittenImage:   ← CSOcrPage、Document 用（完整拼写）
+//     hideWritteImage  / setHideWritteImage:    ← CSImageToJsonManager 用（少一个 n）
+//   前五轮读的一直是完整拼写，落在 Manager 上就永远是 nil →
+//   日志里 optKnown=0 seen(w/s/h)=000，五个版本一次没变过。
+//
+// 【错二】读的对象不对
+//   Manager 上的 setter 只被这几个方法写：
+//     CSJsonWordEditAdapterManager -updateCategoryListViewItemsWith...
+//     CSNewWordEditContainerView   -updateCategoryListViewItemsForWordWith...
+//     CSPageReadingAdapterManager  -updateCategoryListViewItemsWith...
+//     CSDebugWordRenderViewController -startRenderWithPageID:
+//   —— 全是「面板选项变化」时同步进来，即 Manager 持有的才是当前生效值。
+//   而真正执行删除的是 Manager 自己的：
+//     -removeHandWritten:document:
+//     -removeHiddenImagesInSegments:document:
+//     -removeHandwrittenFormula:document:
+//   入口是 -jsonRemovedHiddenImage:document:，它按开关决定调哪几个。
+//
+//   所以导出时不该自己解析 JSON 去猜哪些块是手写/印章，
+//   而应当把开关**回写**给 Manager，让 app 用它自己的删除逻辑处理 ——
+//   这也正是「app 里已经有转换代码，直接调它」的正确落点。
+//
+// 本文件用下面两个函数按真实拼写读写 Manager，两个名字都试，
+// 谁存在用谁（拼写差异只在这一处收口，其余代码不必知道）。
+static const char *kCSFSMgrHideWritten[] = { "hideWritteImage", "hideWrittenImage", NULL };
+static const char *kCSFSMgrHideStamp[]   = { "hideStampImage", "hideStampImage", NULL };
+static const char *kCSFSMgrHasWritten[]  = { "hasWritteImage", "hasWrittenImage", NULL };
+
+// 取 app 单例 CSImageToJsonManager。
+// 既试 defaultManager 也试 sharedManager 也试 new ——
+// 反汇编显示调用点用的是 +defaultManager（STUB[defaultManager]），
+// 但单例命名在不同版本可能改，三个都试一遍成本极低。
+static id CSFSImageToJsonManager(void) {
+    static id cached = nil;
+    static BOOL tried = NO;
+    if (tried) return cached;
+    tried = YES;
+    @try {
+        Class cls = NSClassFromString(@"CSImageToJsonManager");
+        if (!cls) {
+            CSFS_LOG(@"v29 mgr: CSImageToJsonManager 类不存在");
+            return nil;
+        }
+        for (NSString *selName in @[@"defaultManager", @"sharedManager", @"sharedInstance"]) {
+            SEL s = NSSelectorFromString(selName);
+            if (![cls respondsToSelector:s]) continue;
+            IMP imp = [cls methodForSelector:s];
+            if (!imp) continue;
+            id (*fn)(id, SEL) = (id (*)(id, SEL))imp;
+            id v = fn((id)cls, s);
+            if (v) {
+                cached = v;
+                CSFS_LOG(@"v29 mgr: 从 +%@ 拿到 %@", selName, NSStringFromClass([v class]));
+                break;
+            }
+        }
+        if (!cached) {
+            // 兜底：alloc/init（个别单例的 +defaultManager 是懒加载，
+            // 但万一没有这个类方法，直接造一个也能读当前值）
+            SEL initSel = NSSelectorFromString(@"init");
+            if ([cls instancesRespondToSelector:initSel]) {
+                cached = [[cls alloc] init];
+                CSFS_LOG(@"v29 mgr: 兜底 alloc/init 得到 %@", NSStringFromClass([cached class]));
+            }
+        }
+    } @catch (NSException *e) {
+        CSFS_LOG(@"v29 mgr threw: %@", e.reason);
+    }
+    return cached;
+}
+
+// 按名字表依次尝试读取 BOOL 属性。返回 YES/NO 表示取到的值，
+// found 通过指针返回「是否真的读到了」（区分「读到 NO」和「没这个属性」）。
+static BOOL CSFSReadBoolFrom(id obj, const char *names[], BOOL *found) {
+    if (found) *found = NO;
+    if (!obj) return NO;
+    for (int i = 0; names[i]; i++) {
+        NSString *nm = [NSString stringWithUTF8String:names[i]];
+        SEL s = NSSelectorFromString(nm);
+        if (![obj respondsToSelector:s]) continue;
+        @try {
+            IMP imp = [obj methodForSelector:s];
+            if (!imp) continue;
+            BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))imp;
+            BOOL v = fn(obj, s);
+            if (found) *found = YES;
+            return v;
+        } @catch (NSException *e) {
+            CSFS_LOG(@"v29 read %@ threw: %@", nm, e.reason);
+        }
+    }
+    return NO;
+}
+
+// 按名字表依次尝试写 BOOL 属性。返回是否成功写入过一个。
+static BOOL CSFSWriteBoolTo(id obj, const char *names[], BOOL value) {
+    if (!obj) return NO;
+    for (int i = 0; names[i]; i++) {
+        NSString *getter = [NSString stringWithUTF8String:names[i]];
+        NSString *setterName = [NSString stringWithFormat:@"set%@%@:",
+                                [[getter substringToIndex:1] uppercaseString],
+                                [getter substringFromIndex:1]];
+        SEL s = NSSelectorFromString(setterName);
+        if (![obj respondsToSelector:s]) continue;
+        @try {
+            IMP imp = [obj methodForSelector:s];
+            if (!imp) continue;
+            void (*fn)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))imp;
+            fn(obj, s, value);
+            return YES;
+        } @catch (NSException *e) {
+            CSFS_LOG(@"v29 write %@ threw: %@", setterName, e.reason);
+        }
+    }
+    return NO;
+}
+
 // ── v27：开关「多来源合并」而不是「先找到谁就信谁」 ────────────────────
 //
 // v25 的错：CSFSPullOptions 里 `if (!hw && !st && !hi) return NO;`
@@ -2932,7 +3061,49 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
     // originalData 降到最后（它常常是 nil，但 nil 时不该耽误别人）。
     // ═══════════════════════════════════════════════════════════════
 
-    // ① currentAIEditModel.ocrPage —— 最可能是活的那一份
+    // ① CSImageToJsonManager 单例 —— v29 新增，真正的生效值在这里
+    //
+    // 前面五轮之所以全部失败，就是因为一直没看这个对象（详见 gCSFSHideWritten
+    // 上方 v29 那段长注释）。它由 -updateCategoryListViewItemsWith... 在
+    // 面板选项每次变化时同步写入，是「当前生效」的那一份。
+    // 注意属性名少一个 n（hideWritteImage），所以走名字表，不硬写。
+    BOOL sawMgr = NO;
+    id mgr = CSFSImageToJsonManager();
+    if (mgr) {
+        BOOL fw = NO, fs = NO;
+        BOOL mw = CSFSReadBoolFrom(mgr, kCSFSMgrHideWritten, &fw);
+        BOOL ms = CSFSReadBoolFrom(mgr, kCSFSMgrHideStamp, &fs);
+        // hasWritteImage 不是「去除手写」，而是「这篇文档里有手写图」，
+        // 意义不同，只用来打日志佐证，不参与合并。
+        BOOL fh = NO;
+        BOOL mh = CSFSReadBoolFrom(mgr, kCSFSMgrHasWritten, &fh);
+        if (fw || fs) {
+            sawMgr = YES;
+            if (mw) gCSFSHideWritten = YES;
+            if (ms) gCSFSHideStamp   = YES;
+            // 有手写图时，「手写转文字」的反面就是「保留成图」。
+            // 这里不猜方向，只记录，交给后面的内容判定。
+            gCSFSSeenWritten = YES;
+            gCSFSSeenStamp   = YES;
+            if (fh) gCSFSSeenHandTo = YES;
+            gCSFSOptKnown = YES;
+            gCSFSOptSrc = [NSString stringWithFormat:@"mgr(hw=%d st=%d hasHW=%d)",
+                           (int)mw, (int)ms, (int)mh];
+        }
+        CSFS_LOG(@"v29 mgr opts: hideWritteImage=%@(%d) hideStampImage=%@(%d)"
+                 @" hasWritteImage=%@(%d) | merged w=%d s=%d",
+                 fw ? @"有" : @"无", (int)mw,
+                 fs ? @"有" : @"无", (int)ms,
+                 fh ? @"有" : @"无", (int)mh,
+                 (int)gCSFSHideWritten, (int)gCSFSHideStamp);
+    } else {
+        CSFS_LOG(@"v29 mgr opts: 拿不到 CSImageToJsonManager 单例");
+    }
+
+    // ② currentAIEditModel.ocrPage —— v28 的主来源，降为次要
+    //
+    // 它的属性名是完整拼写 hideWrittenImage，与 Manager 不同名。
+    // 两者指同一件事，任一为 YES 即视为要删（OR 合并，见上面的语义说明）。
     BOOL gotModel = NO;
     id model = CSFSValue(bottomView, @"currentAIEditModel");
     if (model) {
@@ -2946,7 +3117,7 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
         CSFS_LOG(@"v28 opts: currentAIEditModel=nil");
     }
 
-    // ② context.allPages —— 编辑页中枢，多页时取第 0 页
+    // ③ context.allPages —— 编辑页中枢，多页时取第 0 页
     BOOL gotPages = NO;
     id ctx = CSFSValue(bottomView, @"context");
     if (ctx) {
@@ -2963,7 +3134,7 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
         CSFS_LOG(@"v28 opts: context=nil");
     }
 
-    // ③ bottomView.originalData —— 只有点过 AI 美化才非 nil，放最后
+    // ④ bottomView.originalData —— 只有点过 AI 美化才非 nil，放最后
     id od = CSFSValue(bottomView, @"originalData");
     BOOL gotOrig = CSFSPullOptions(od, @"bottomView.originalData");
     if (!od) {
@@ -2971,17 +3142,17 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
                  @"aiBeautifyAction / dismissAIBeautifyViewController: 赋值）");
     }
 
-    // ④ bottomView 自己（兜底，理论上是 view 不会有这些字段）
+    // ⑤ bottomView 自己（兜底，理论上是 view 不会有这些字段）
     BOOL gotSelf = CSFSPullOptions(bottomView, @"bottomView");
 
     if (!gCSFSOptKnown) {
         CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
                  NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
     } else {
-        CSFS_LOG(@"v28 opts: FINAL hideWritten=%d hideStamp=%d handToImage=%d"
-                 @" (srcs: model=%d allPages=%d originalData=%d self=%d)",
+        CSFS_LOG(@"v29 opts: FINAL hideWritten=%d hideStamp=%d handToImage=%d"
+                 @" (srcs: mgr=%d model=%d allPages=%d originalData=%d self=%d)",
                  (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage,
-                 (int)gotModel, (int)gotPages, (int)gotOrig, (int)gotSelf);
+                 (int)sawMgr, (int)gotModel, (int)gotPages, (int)gotOrig, (int)gotSelf);
     }
 }
 

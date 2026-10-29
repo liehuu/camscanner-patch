@@ -138,6 +138,12 @@ jobs:
           python3 tools/rev_check_v27.py
           python3 tools/check_v27.py src/CamScannerSaveToFiles.m
 
+          # v29：开关真身在 CSImageToJsonManager，且属性名少一个 n。
+          # v24～v28 五轮门禁全绿却连错五次，就是因为没有任何检查器
+          # 看得见「拼写不同」这件事 —— 代码完全合法，只是永远读不到值。
+          python3 tools/rev_check_v29.py
+          python3 tools/check_v29.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail
