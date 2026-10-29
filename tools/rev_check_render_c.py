@@ -71,7 +71,15 @@ def main():
     #       ind, chars, flT];
     # 锚点必须跟着实现走。这里统一取行首那段，不依赖后面的实参列表 ——
     # 实参名一改（v23 是 fl，v24 是 flT）锚点就失效，用例会静默 SKIP。
-    IND_ANCHOR = '[pPr appendFormat:@"<w:ind%@ w:firstLineChars='
+    # v30：首行缩进那行改成了裸写（去掉了 %@ 那段左右缩进），
+    # 所以锚点要从 '...<w:ind%@ w:firstLineChars=' 改成 '...<w:ind w:firstLineChars='。
+    #
+    # 为什么不写成「两种都试」：两种都试的话，将来实现再变一次，
+    # 又会静默 SKIP —— 而 SKIP 只是打印一句，退出码不受影响，
+    # 于是「7 例里 2 例没跑」和「7 例全跑」在 CI 上看起来一样。
+    # 锚点跟着当前实现走，变了就让它显式 SKIP（能被 gate_local 看见），
+    # 这比假装通过安全。
+    IND_ANCHOR = '[pPr appendFormat:@"<w:ind w:firstLineChars='
 
     # 1) <w:jc> 排到 <w:ind> 前面 —— CT_PPrBase 是 sequence，顺序错一项静默失效
     def c1(t):
@@ -97,7 +105,7 @@ def main():
     def c3(t):
         return inject('缩进落到 pPr 外', t,
                       IND_ANCHOR,
-                      '[out appendFormat:@"<w:ind%@ w:firstLineChars=')
+                      '[out appendFormat:@"<w:ind w:firstLineChars=')
     cases.append(('C3 缩进跑到 pPr 外', c3, 'C3 段落变量上直接输出了 pPr 子元素'))
 
     # 4) <w:pPr> 包裹模板被去掉（属性变成裸输出）

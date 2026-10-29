@@ -144,6 +144,28 @@ jobs:
           python3 tools/rev_check_v29.py
           python3 tools/check_v29.py src/CamScannerSaveToFiles.m
 
+          # v30：排版照本地排版引擎的真实公式。
+          #
+          # 用户的原话点破了前提：「预览时明明是排好版的，
+          # 生成 docx 你可以自己写，但排版的逻辑是不是在本地呢」。
+          # 反汇编证实排版逻辑确实在本地，整条链在
+          # CSWordEditFlowDataManager -setupParaStyleWithAttributeString:
+          # para:ocrPage:segment:isCellPara:。本轮修掉三处实质性错误：
+          #
+          #   ① 行距少了最后一道 clamp。caculateLineHeightMultiple...
+          #      的出口无论 lineSpaceMode 是 0/1/2 都夹到 [1.0,1.5]；
+          #      v29 没夹，真机 gap=25.94 算出的 1.637x 原样写成
+          #      w:line=393，比 App 自己导出的大一档。
+          #   ② 缩进换算的两条分支（按字符 / 按 200dpi）是纯猜测，
+          #      反汇编证明缩进只乘 ocrPage.scale，与字号无关。
+          #   ③ scale 恒为 0 的机制性原因：CSFSCaptureLayoutContext
+          #      被放在早退 return 之后，开关读不到时它永远不执行。
+          #
+          # 这三条 XML 全都合法、Word 都能打开、lint 全绿，
+          # 差异只在「像不像」—— 没有任何已有检查器看得见，必须单独立项。
+          python3 tools/rev_check_v30.py
+          python3 tools/check_v30.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail

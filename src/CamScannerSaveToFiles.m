@@ -2975,6 +2975,29 @@ static void CSFSCaptureLayoutContext(id page);
 static BOOL CSFSPullOptions(id src, NSString *from) {
     if (!src) return NO;
     @try {
+        // ═══════════════════════════════════════════════════════════
+        // v30：**先抓版式上下文，再做早退判断**。
+        //
+        // 这是 scale 一直等于 0.0000 的真正原因 —— 不是取不到，
+        // 是那一行代码从来没被执行过。
+        //
+        // v25 把 CSFSCaptureLayoutContext(src) 放在函数末尾，
+        // 而它上面第 2981 行有一句：
+        //     if (!hw && !st && !hi) return NO;
+        // 真机上 CSOcrPage 的 hideWrittenImage 等字段一旦一个都没有
+        // （v27 日志实证：optKnown=0 src=(none) seen=000），
+        // 这句就直接 return 了，末尾的 CaptureLayoutContext 永远跑不到。
+        //
+        // 后果链：gCSFSPageScale 恒为 0 →
+        //   CSFSIndentTwips 走 fallback →
+        //   v25 日志全程 "why=px@200dpi scale=0.0000" →
+        //   缩进全部按 595/1654 估算 → 排版不像。
+        //
+        // scale 与开关是**互相独立**的两件事：开关读不到不代表
+        // 页面不认识自己的尺寸。所以必须无条件先抓。
+        // ═══════════════════════════════════════════════════════════
+        CSFSCaptureLayoutContext(src);
+
         id hw = CSFSValue(src, @"hideWrittenImage");
         id st = CSFSValue(src, @"hideStampImage");
         id hi = CSFSValue(src, @"handWrittenToImage");
@@ -3293,24 +3316,62 @@ static double CSFSIndentTwips(id v, double basePt, const char **why) {
         if (why) *why = "none";
         return 0.0;
     }
+    // ═══════════════════════════════════════════════════════════════
+    // v30：缩进换算 —— 按 -[CSWordEditFlowDataManager
+    //      setupParaStyleWithAttributeString:para:ocrPage:segment:isCellPara:]
+    //      的反汇编原文，不再有「字符数」「200dpi」两条猜测分支。
+    //
+    // 原文（0x10147dc98 起，全为逐条实证）：
+    //
+    //   10147dc88: bl STUB[floating_box]
+    //   10147dc98: tbnz w23,#0 → 整段跳过缩进
+    //
+    //   10147dc9c: cmp  w28, #0            ; w28 = isCellPara（第6参数）
+    //   10147dca4: ldr  d0, = 0.8          ; @0x1088ca678
+    //   10147dcac: fcsel d9, d0, 1.0, ne   ; isCellPara ? 0.8 : 1.0
+    //
+    //   ; ② 悬挂缩进（与③互斥）
+    //   10147dcb4: bl STUB[indent_hanging]
+    //   10147dcb8: cmp  x0, #1 ; b.lt → 跳过
+    //   10147dcc8: scvtf d0, x0
+    //   10147dccc: fmul  d0, d8, d0        ; d8 = ocrPage.scale
+    //   10147dcd0: fmul  d0, d9, d0        ; × (0.8 | 1.0)
+    //   10147dcd8: bl STUB[setHeadIndent:]
+    //   10147dce0: bl STUB[indent_hanging]
+    //   10147dce4: cmp  x0, #0 ; b.gt → 结束（首行不再设）
+    //
+    //   ; ③ 首行缩进
+    //   10147dcf0: bl STUB[indent_first_line]
+    //   10147dcf4: cbz  x0 → 跳过
+    //   10147dd00: scvtf d0, x0
+    //   10147dd04: fmul  d0, d8, d0        ; × scale
+    //   10147dd08: fmul  d0, d9, d0        ; × (0.8 | 1.0)
+    //   10147dd10: bl STUB[setFirstLineHeadIndent:]
+    //
+    // 两个要点，都是前几轮猜错的：
+    //   · 乘的是 ocrPage.scale，**不是** A4/200dpi 折算，也**不是**字号；
+    //   · 全函数只设 headIndent / firstLineHeadIndent，
+    //     **indent_left / indent_right 一次都没用** ——
+    //     所以 docx 里也不该写 w:left / w:right（v29 之前一直在写）。
+    //
+    // scale 未知时不能假装知道：退成 1.0（等于「渲染坐标未缩放」），
+    // 并在 why 里标出来，日志一眼可辨。
+    // ═══════════════════════════════════════════════════════════════
     double sign = (raw > 0) ? 1.0 : -1.0;
     double a = fabs(raw);
-    double pt;
+    double scale = gCSFSPageScale;
     const char *n;
-
-    if (a <= 12.0) {
-        // 字符数：1 字符 ≈ 1 个字号宽
-        pt = a * basePt;
-        n = "chars";
-    } else if (gCSFSPageScale > 0.0) {
-        pt = a * gCSFSPageScale;
-        n = "px*scale";
+    if (scale > 0.0) {
+        n = "raw*scale";
     } else {
-        pt = a * (595.0 / 1654.0);   // A4 宽 595pt / 典型 1654px
-        n = "px@200dpi";
+        scale = 1.0;
+        n = "raw*scale?scale=1";
     }
+    // isCellPara 目前恒为 NO（我们不对表格单元格走这条路径），故 ×1.0。
+    double pt = a * scale;
     if (why) *why = n;
-    return sign * pt * 20.0;
+    (void)basePt;   // 缩进与字号无关 —— 保留参数只为不改调用点
+    return sign * pt * 20.0;   // pt → twips
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -3340,18 +3401,58 @@ static long CSFSLineTwipsFromGap(id v, double fontPt, const char **why) {
     double gap = CSFSDoubleValue(v);
     if (!(gap > 0.0)) { if (why) *why = "none"; return 0; }
 
+    // ═══════════════════════════════════════════════════════════════
+    // v30：行距 —— 补上 clamp，这是「排版还是不对」的第二个真因。
+    //
+    // 前几轮算出的 originalMultiple 是对的（真机日志
+    // gap=25.94 / 11pt → 1.637x，与手算 25.94/(11×1.44) 完全一致），
+    // 错在**没有再过 App 的第二道修正**。
+    //
+    // 反汇编 -[CSITextEngineSettings
+    //   caculateLineHeightMultipleWithOriginalLineHeightMultiple:
+    //   lineSpacingMode:isExport:] 的真实实现（0x1015294a0，真身；
+    //   0x101529458 那个只是转调，w3=0 表示非导出）：
+    //
+    //   1015294a0: cmp x2,#2 ; b.eq L2
+    //   1015294a8: cmp x2,#1 ; b.ne L_cbnz
+    //   1015294b0: d1 = -0.25 ; b L_add          ; mode==1 → -0.25
+    //   1015294b8: L2: d1 = +0.25                 ; mode==2 → +0.25
+    //   1015294bc: L_add: d0 = d0 + d1
+    //   1015294e4: L_cbnz: cbnz x2 → L_cmp1
+    //                      mov v1,d0
+    //   1015294ec:          tbz w3,#0 → L_cmp1   ; mode==0 且 isExport==0
+    //                                            ;   → 原值，**直接进 clamp**
+    //   1015294c0: L_cmp1: fcmp d0, 1.0 ; b.mi → 取 1.0
+    //   1015294cc:          d1 = 1.5
+    //   1015294d0:          fcmp d0, 1.5
+    //   1015294d4:          mov v1,d0
+    //   1015294d8:          b.le → 返回 v1
+    //   1015294dc:          d1 = 1.5            ; 超过 1.5 → 压到 1.5
+    //   1015294f0: 返回 v1
+    //
+    // 也就是说 **无论 lineSpaceMode 是 0/1/2，出口一律被夹到 [1.0, 1.5]**。
+    // 上一轮只在 mode 1/2 时改，mode 0 时直接把 1.637 写进
+    // <w:spacing w:line="393">，比 App 自己导出的版本行距大一档 ——
+    // 这就是「排版看起来还是不对」的直接原因。
+    //
+    // aiBeautify 分支不经过这里：setupParaStyle 在
+    // 0x10147db18 处 cbz w27 直接 setLineHeightMultiple:1.25 并跳到
+    // 0x10147dc84，压根不调 caculateLineHeightMultiple。
+    // ═══════════════════════════════════════════════════════════════
     double multiple;
     const char *n;
     if (gCSFSAiBeautify) {
-        multiple = 1.25;
+        multiple = 1.25;                 // 常量 @0x1088cdc50，不 clamp
         n = "aiBeautify";
     } else {
         double basePt = (fontPt > 1.0 && fontPt < 200.0) ? fontPt : 11.0;
-        multiple = gap / (basePt * 1.44);
+        multiple = gap / (basePt * 1.44);   // 常量 @0x1088cbfb8
         if (gCSFSLineSpaceMode == 1)      multiple -= 0.25;
         else if (gCSFSLineSpaceMode == 2) multiple += 0.25;
+        // 导出路径必须 clamp —— 与 App 导出同一口径
         if (multiple < 1.0) multiple = 1.0;
-        n = "gap/formula";
+        if (multiple > 1.5) multiple = 1.5;
+        n = "gap/formula+clamp";
     }
     if (multiple > 10.0) multiple = 10.0;      // 上限，防脏数据把行距拉爆
 
@@ -4103,19 +4204,25 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         }
     }
 
-    // 3) 缩进 —— 按 App 的三条硬规则，不再是「一律两字符」
+    // 3) 缩进 —— 严格照 -[CSWordEditFlowDataManager
+    //    setupParaStyleWithAttributeString:para:ocrPage:segment:isCellPara:]
     //
-    // 反汇编 -[CSWordEditDataManager setupParaStyleWithAttributeString:
-    //          para:ocrPage:segment:isCellPara:] 的原文：
-    //   ① para.floating_box 为真  → 整段不设任何缩进（浮动框有自己的坐标）
-    //   ② para.indent_hanging >= 1 → setHeadIndent(page.scale * hanging * k)
-    //      **且不再设 firstLineHeadIndent** —— 这两个分支是互斥的
-    //   ③ 否则 para.indent_first_line != 0 → setFirstLineHeadIndent(
-    //                                             page.scale * fl * k)
+    // 反汇编原文（0x10147dc84 起，指令级实证）：
+    //   ① para.floating_box 为真  → 整段不设任何缩进
+    //   ② para.indent_hanging >= 1 → headIndent          = scale * hanging * k
+    //      且 **indent_hanging > 0 时直接结束**，首行缩进一律不设（互斥）
+    //   ③ 否则 para.indent_first_line != 0 → firstLineHeadIndent = scale * fl * k
+    //   k = isCellPara ? 0.8 : 1.0
     //
-    // v23/v24 只实现了③，而且字段缺失时无脑补两字符；①② 一次都没做。
-    // 「乙方：  某某公司」这种一行里带两个字段的段落，下一行要与上一行的
-    // 值左对齐，靠的就是②的悬挂缩进 —— 补不出来就必然错位。
+    // v30 修掉两处实质性错误：
+    //   A) indent_left / indent_right —— 整个函数**一次都没读**
+    //      （全函数只有 STUB[indent_hanging] 与 STUB[indent_first_line]），
+    //      所以 docx 里也不该凭空写 w:left / w:right。v29 及以前一直在写，
+    //      等于给每段多加了一份 App 根本不存在的左右缩进。
+    //   B) 悬挂缩进只写 w:left —— 语义错了。
+    //      App 设的是 headIndent=X 且 firstLineHeadIndent=0，
+    //      即「首行顶格、其余行缩 X」。只写 w:left=X 会让**首行也缩进**，
+    //      整体右移一格。OOXML 的等价写法是 w:left=X + w:hanging=X。
     if (alignLeftish) {
         BOOL floating = CSFSBoolValue([para objectForKey:kCSFSParaFloat]);
         if (!floating) {
@@ -4125,23 +4232,15 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 
             const char *flWhy = "-";
             double flT = CSFSIndentTwips([para objectForKey:kCSFSParaIndFL], paraPt, &flWhy);
-            double ilT = CSFSIndentTwips([para objectForKey:kCSFSParaIndL], paraPt, NULL);
-            double irT = CSFSIndentTwips([para objectForKey:kCSFSParaIndR], paraPt, NULL);
 
             long lim = (long)(kCSFSContentTwips * 0.9);
-            long ilL = 0, irL = 0;
-            if (ilT != 0.0 && fabs(ilT) < lim) ilL = (long)(ilT + (ilT > 0 ? 0.5 : -0.5));
-            if (irT != 0.0 && fabs(irT) < lim) irL = (long)(irT + (irT > 0 ? 0.5 : -0.5));
-
             if (hangRaw >= 1.0 && hangT > 0.0 && hangT < lim) {
-                // ② 悬挂缩进：所有行左缩进，首行不额外缩进
-                NSMutableString *attrs = [NSMutableString string];
-                [attrs appendFormat:@" w:left=\"%ld\"", (long)(hangT + 0.5)];
-                if (irL != 0) [attrs appendFormat:@" w:right=\"%ld\"", irL];
-                [pPr appendFormat:@"<w:ind%@/>", attrs];
-                CSFS_LOG(@"v25 ind hanging left=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
-                         (long)(hangT + 0.5), [para objectForKey:kCSFSParaIndH] ?: @"(nil)",
-                         hWhy, gCSFSPageScale, paraPt);
+                // ② 悬挂缩进：首行顶格，其余行缩 hangT
+                long hangL = (long)(hangT + 0.5);
+                [pPr appendFormat:@"<w:ind w:left=\"%ld\" w:hanging=\"%ld\"/>", hangL, hangL];
+                CSFS_LOG(@"v30 ind hanging left=%ld hanging=%ld (raw=%@ why=%s scale=%.4f)",
+                         hangL, hangL, [para objectForKey:kCSFSParaIndH] ?: @"(nil)",
+                         hWhy, gCSFSPageScale);
             } else {
                 // ③ 首行缩进
                 long flL = 0;
@@ -4152,23 +4251,20 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
                     if (flL < 20) flL = 20;
                     flWhy = "fallback-2chars";
                 }
-                NSMutableString *attrs = [NSMutableString string];
-                if (ilL != 0) [attrs appendFormat:@" w:left=\"%ld\"", ilL];
-                if (irL != 0) [attrs appendFormat:@" w:right=\"%ld\"", irL];
                 // firstLineChars 是 Word 扩展（按字符自适应字号），
                 // firstLine 是标准属性（twips）。两个都写：
                 // Word 优先前者，WPS/LibreOffice 只认后者。
                 long chars = (long)((double)flL / (paraPt * 20.0) * 100.0 + 0.5);
                 if (chars < 1) chars = 1;
                 if (chars > 2000) chars = 2000;
-                [pPr appendFormat:@"<w:ind%@ w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
-                    attrs, chars, flL];
-                CSFS_LOG(@"v25 ind firstLine=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
+                [pPr appendFormat:@"<w:ind w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
+                    chars, flL];
+                CSFS_LOG(@"v30 ind firstLine=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
                          flL, [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy,
                          gCSFSPageScale, paraPt);
             }
         } else {
-            CSFS_LOG(@"v25 ind skipped: floating_box");
+            CSFS_LOG(@"v30 ind skipped: floating_box");
         }
     }
 
