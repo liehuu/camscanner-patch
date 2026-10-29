@@ -1933,10 +1933,22 @@ static void (*gOrigExportWordAction)(id, SEL) = NULL;
 // 读取导出面板开关的实现放在文件后半（它依赖 CSFSValue / CSFSBoolValue），
 // 而 exportWordAction 的 hook 在更早的位置 —— C 没有 hoisting，必须先声明。
 static void CSFSReadOptionsFromBottomView(id bottomView);
+// v31：同理。清零函数也依赖后面那些全局变量，必须先声明。
+// decl_order.py 会把这条算作「定义」，所以必须排在下面的首次使用之前。
+static void CSFSResetOptionState(void);
 
 static void CSFS_exportWordAction(id self, SEL _cmd) {
     @try {
         CSFS_LOG(@"P1 exportWordAction hit (%@)", NSStringFromClass([self class]));
+        // v31：**先进批次边界清零，再读开关**。
+        //
+        // 顺序不能反。真机日志（同一进程两次导出）：
+        //   第一次 勾选 → mgr 给 1 → merged 1
+        //   第二次 取消 → mgr 给 0 → merged 仍是 1   ← 用户看到「选不选都删」
+        // 原因是 v27 的 OR 合并跨批次累积。
+        // 只清一次不够：必须每次导出都清，因为用户可能在同一份文档上
+        // 反复改勾选再导出。
+        CSFSResetOptionState();
         // v24：在这里读三个开关。
         // 这是唯一能拿到面板 _originalData（CSOcrPage）的时机 ——
         // 后续解析在后台线程跑，那时面板可能已经销毁。
@@ -2209,6 +2221,33 @@ static BOOL gCSFSHandToImage = NO;
 static BOOL gCSFSOptKnown    = NO;   // 是否成功读到过（用于日志区分「没读到」和「读到 NO」）
 static NSString *gCSFSOptSrc = nil;  // 从哪读到的：page / json / none
 
+// ── v31：每次导出前必须把这些状态清零 ────────────────────────────────────
+//
+// 真机日志（CSFS.log 11:12 与 11:13 两次导出，同一进程）：
+//
+//   第一次（勾了去除手写 + 去除印章）：
+//     v29 mgr opts: hideWritteImage=有(1) hideStampImage=有(1) | merged w=1 s=1
+//   第二次（用户取消勾选，两个都是 0）：
+//     v29 mgr opts: hideWritteImage=有(0) hideStampImage=有(0) | merged w=1 s=1
+//                                                                        ^^^^^
+//   Manager 明明给出了 0，merged 还是 1 —— 用户看到的就是
+//   「选不选都没用，都是去除状态」。
+//
+// 根因是 v27 引入的 OR 合并语义少了一半：
+//   OR 是为**同一批次内多来源**设计的（Manager 说 1、同步落后的副本说 0 →
+//   信 Manager 的 1）。但它是静态全局，没有「批次」概念，
+//   于是上一批的 1 会一直留到下一批，任何一次勾选都变成永久生效。
+//
+// 修法不是把 OR 改成「最后写入者」——那会退回 v24～v28 的失败态
+// （副本同步落后，Manager 的 1 被盖成 0）。
+// 而是**在批次边界清零**：每次 exportWordAction 进来自先 reset，
+// 然后在本次批次内照旧 OR。两个语义互不干扰。
+//
+// 注意：不能只清 hide*。seen / handToResolved / optSrc 若不清，
+// 「本次有没有读到」的判断会沿用上一批的结论；
+// scale 与 layout 也是每次导出重新抓更安全（换页、换文档都会变）。
+static void CSFSResetOptionState(void);
+
 // ── v29：开关的**真身**在 CSImageToJsonManager，而且属性名少一个 n ────────
 //
 // v24～v28 五轮全部失败，最终用三路静态分析定死了根因，两条都致命：
@@ -2396,6 +2435,42 @@ static NSInteger gCSFSFontSizeMode  = 0;
 static NSInteger gCSFSLineSpaceMode = 0;
 static BOOL    gCSFSAiBeautify    = NO;
 static NSString *gCSFSPageSrc     = nil;
+
+// v31：批次边界清零。详见 gCSFSHideWritten 上方 v31 那段注释。
+//
+// 只清「一次导出应该重新算」的状态，不动永久配置类变量。
+// 顺序无所谓，但**必须每个变量都清**：
+// 漏一个就会留下「上一批的结论」，而这类残留恰好是最难从日志上看出来的
+// —— 它会表现为「日志里 Manager 明明给了 0，输出却还是删掉了」。
+static void CSFSResetOptionStateImpl(void) {
+    gCSFSHideWritten = NO;
+    gCSFSHideStamp   = NO;
+    gCSFSHandToImage = NO;
+    gCSFSOptKnown    = NO;
+    gCSFSOptSrc      = nil;
+    gCSFSSeenWritten = NO;
+    gCSFSSeenStamp   = NO;
+    gCSFSSeenHandTo  = NO;
+    gCSFSHandToResolved = NO;
+    gCSFSPageSrc     = nil;
+    // 版式上下文同样每次重抓：换页 / 换文档后 scale 与全局偏好都会变，
+    // 沿用上一次的值会让缩进按错误的分母算。
+    gCSFSPageScale    = 0.0;
+    gCSFSPageScaleSrc = "-";
+    gCSFSPageWidth    = 0.0;
+    gCSFSRenderWidth  = 0.0;
+    gCSFSFontSizeMode  = 0;
+    gCSFSLineSpaceMode = 0;
+    gCSFSAiBeautify    = NO;
+}
+
+// 对外入口：带一行日志，便于在真机上确认「确实重置了」。
+// 没有这行日志，「开关为什么不生效」和「开关重置了吗」在日志上无法区分。
+static void CSFSResetOptionState(void) {
+    CSFSResetOptionStateImpl();
+    CSFS_LOG(@"v31 reset: 导出批次状态已清零（hideWritten/hideStamp/handToImage/"
+             @"seen/scale/layout）—— 上一批的勾选不会渗到这一批");
+}
 
 // 从 JSON 的布尔字段取值。
 // 实证：这类字段在 CamScanner 的 JSON 里以 NSString 出现（"1"/"0"/"true"/"YES"），
@@ -2900,6 +2975,29 @@ static BOOL CSFSLooksLikePath(NSString *s) {
         }
     }
     return NO;
+}
+
+// v31：是不是「纯空白」（但非空串）。
+//
+// 单独抽出来，因为它在两处的语义完全不同：
+//   · CSFSSliceText 里 → 纯空白**是内容**，要保留（见那里的长注释）
+//   · 段落级判空     → 整段都是纯空白才是「空段落」，可以丢
+// 混成一个判断就会出现「为了丢掉空段落，把段内的空格也丢了」。
+//
+// 注意只认空格/制表/换行/全角空格（U+3000）：OCR 常把中文排版里的
+// 缩进输出成全角空格，那也是最典型的「带下划线的空格」载体。
+static BOOL CSFSIsPureWhiteSpace(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    NSUInteger n = s.length;
+    for (NSUInteger i = 0; i < n; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+            c == 0x00A0 || c == 0x3000) {
+            continue;
+        }
+        return NO;
+    }
+    return YES;
 }
 
 // 取 slice 的文字。text 优先，别名兜底。
@@ -3519,13 +3617,50 @@ static NSString *CSFSSliceText(id sl) {
                  @"handwriteText", @"handwrite_text",
                  @"resultText", @"string"];
     }
-    id ws = CSFSWhiteSpaceSet();
+    // v31：`ws`（CSFSWhiteSpaceSet）原本只服务于那行「trim 后判空」，
+    // 那行已删除，这里一并去掉，避免未使用变量告警。
+    // 纯空白的判定现在完全交给 CSFSIsPureWhiteSpace。
     for (NSString *k in keys) {
         id v = CSFSValue(sl, k);
         if (![v isKindOfClass:[NSString class]]) continue;
         NSString *s = (NSString *)v;
         if (s.length == 0) continue;
-        if ([s stringByTrimmingCharactersInSet:ws].length == 0) continue;
+        // ═══════════════════════════════════════════════════════════
+        // v31：**纯空白必须保留，不能再当「没文字」丢掉**。
+        //
+        // 用户反馈：「文字之间有空格，或者带下划线的空格你都没识别出来」。
+        //
+        // 根因就在这里。原判据是
+        //     if ([s stringByTrimming...].length == 0) continue;
+        // 纯空白直接 continue → 这个 slice 拿不到文字 →
+        //   · CSFSParseSlice 返回 nil → 空格消失，两侧文字贴在一起
+        //   · 「带下划线的空格」（填空横线）通常是
+        //     text=" " + font_attribute.underline=1，
+        //     因为 text 先被丢掉，下划线属性也一起丢了 →
+        //     整条填空线消失，看起来就是「没识别出来」
+        //
+        // 更关键的是：**空格在 OCR 的 JSON 里是一个独立 slice**。
+        // 它与相邻文字 slice 之间的间隔不体现在 text 里，而体现在
+        // slice 的 position/width 上；一旦我们把这个 slice 丢掉，
+        // 就无法再从别处恢复这个间隔 —— 这不是「少一个字符」，
+        // 是整段排版错位（两列被粘成一串）。
+        //
+        // 所以这里的判断要分两件事：
+        //   ① 纯空白  → **是合法内容**，直接返回（空格本身就是内容）
+        //   ② 空串    → 仍然跳过（没有任何字符）
+        // 只有真正的空串才算「没文字」。
+        // 注意不能顺手 trim：首尾空格在两端都是内容
+        // （"___ 甲方" 这种靠前导空格对齐的排版很常见）。
+        // ═══════════════════════════════════════════════════════════
+        if (CSFSIsPureWhiteSpace(s)) {
+            // 纯空白：保留原样（不 trim），它是合法的排版内容
+            return s;
+        }
+        // v31：原来这里还有一行
+        //     if ([s stringByTrimmingCharactersInSet:ws].length == 0) continue;
+        // 现在它是死代码（纯空白在上面就 return 了，走到这里必然不是纯空白），
+        // 但故意删掉 —— 留着会让下一个维护者以为「空格还是会被丢」，
+        // 也会让 check_v31 的 S1 判据一直红。既有行为由上面那个分支保证。
         if (CSFSLooksLikePath(s)) continue;
         return s;
     }
@@ -4743,6 +4878,16 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     long hiddenBlockCount = 0;
                                     long stampSkipCount = 0;
                                     long handSkipCount = 0;
+                                    // v31：被**保留**的「stype 标 handwrit 但其实是正文」
+                                    // 的切片数。与 handSkipCount 成对出现，
+                                    // 下一轮看日志就能确认「误删」是否已经停止：
+                                    //   v30 版：handSkip=33 handKeep=0
+                                    //   v31 版：handSkip=0  handKeep=33  ← 期望
+                                    long handKeepCount = 0;
+                                    long handKeepLogCount = 0;   // 详细日志最多打 3 条，防刷屏
+                                    // v31：纯空白切片（空格 / 填空下划线）计数。
+                                    // 这个数 > 0 才说明空格这条链真的通了。
+                                    long spaceSliceCount = 0;
                                     long tabRunCount = 0;
                                     NSMutableSet *blockTypeSet = [NSMutableSet set];
                                     NSMutableSet *seenText = [NSMutableSet set];
@@ -5003,14 +5148,67 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                                      stLow ?: @"(nil)", (long)slCat);
                                                                             continue;
                                                                         }
-                                                                        if (gCSFSHideWritten &&
-                                                                            (slCat == 1 ||
-                                                                             (stLow.length > 0 &&
-                                                                              [stLow containsString:@"handwrit"]))) {
-                                                                            handSkipCount++;
-                                                                            CSFS_LOG(@"v25 hideWritten: skip slice stype=%@ cat=%ld",
-                                                                                     stLow ?: @"(nil)", (long)slCat);
-                                                                            continue;
+                                                                        // ═══════════════════════════════════════════
+                                                                        // v31：去除手写 —— 判据从「stype 含 handwrit」
+                                                                        //      改成「确实是手写**笔迹图**」。
+                                                                        //
+                                                                        // 真机日志（CSFS.log，v30 版）：
+                                                                        //   v27 stats: … stampSkip=1 handSkip=33 paras=21
+                                                                        //   v21 stats: paras=21 runs=90
+                                                                        // 而距上一版 runs 是 123 —— **正好少 33**，
+                                                                        // 每一条都是这行删的。用户看到的两个现象：
+                                                                        //   · 正文里 33 段文字凭空消失
+                                                                        //   · 勾不勾「去除手写」结果一样（每行都 cat=0 却照样删）
+                                                                        //
+                                                                        // 为什么 stype 不能当判据：
+                                                                        // OCR 引擎对**手写体文档**（比如手写合同、手写笔记）
+                                                                        // 会把识别出的正文文字 slice 的 stype 也标成
+                                                                        // "handwritten" —— 它描述的是「这段字的**来源笔迹**」，
+                                                                        // 不是「这是个笔迹图片」。日志里全部 `cat=0`
+                                                                        // （image_category 为空）就是铁证：
+                                                                        // 真正的印章/手写**图**会带 image_category=STAMP/
+                                                                        // HANDWRITTEN，而这 33 条一条都没有。
+                                                                        //
+                                                                        // 正确判据（三条同时满足才算手写图）：
+                                                                        //   ① image_category == 1（HANDWRITTEN）
+                                                                        //      —— App 自己的 -[CSOcrPageSegment
+                                                                        //         customImageCategoryType] 的语义
+                                                                        //   ② 没有识别文字（有文字就是正文，文字优先）
+                                                                        //   ③ 或 stype 明确是图片族（含 image/img/pic/photo）
+                                                                        // 只有 ② 单独成立不够：手写转文字后 stype 仍是
+                                                                        // handwrite 但 text 已填好，那是正文。
+                                                                        // ═══════════════════════════════════════════
+                                                                        if (gCSFSHideWritten) {
+                                                                            BOOL catSaysHW  = (slCat == 1);
+                                                                            BOOL stypeSaysHW =
+                                                                                (stLow.length > 0 &&
+                                                                                 [stLow containsString:@"handwrit"]);
+                                                                            // 有识别文字 → 这段是正文，绝不按手写删
+                                                                            NSString *hwText = CSFSSliceText(sl);
+                                                                            BOOL hasTextHW = (hwText != nil &&
+                                                                                              !CSFSIsPureWhiteSpace(hwText));
+                                                                            if (catSaysHW && !hasTextHW) {
+                                                                                handSkipCount++;
+                                                                                CSFS_LOG(@"v31 hideWritten: skip HW slice "
+                                                                                         @"(cat=%ld stype=%@ noText=1) —— 真手写图",
+                                                                                         (long)slCat, stLow ?: @"(nil)");
+                                                                                continue;
+                                                                            }
+                                                                            if (stypeSaysHW && !catSaysHW) {
+                                                                                // stype 说 handwrit 但 image_category 不是
+                                                                                // HANDWRITTEN —— 这是正文文字（手写体文档），
+                                                                                // 记为「保留」，并打日志以便下一轮核对。
+                                                                                handKeepCount++;
+                                                                                if (handKeepLogCount < 3) {
+                                                                                    handKeepLogCount++;
+                                                                                    CSFS_LOG(@"v31 hideWritten: KEEP slice "
+                                                                                             @"stype=%@ cat=%ld hasText=%d "
+                                                                                             @"—— stype 标 handwrit 但这是正文文字",
+                                                                                             stLow ?: @"(nil)",
+                                                                                             (long)slCat,
+                                                                                             (int)hasTextHW);
+                                                                                }
+                                                                            }
                                                                         }
                                                                         if (CSFSBoolValue(CSFSValue(sl, @"hiding"))) {
                                                                             hiddenBlockCount++;
@@ -5072,14 +5270,44 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     NSMutableDictionary *run = CSFSParseSlice(sl, &diagDone);
                                                                     if (!run) continue;
                                                                     NSString *tt = [run objectForKey:kCSFSRunText];
-                                                                    NSString *trimmed =
-                                                                        [tt stringByTrimmingCharactersInSet:CSFSWhiteSpaceSet()];
-                                                                    if (trimmed.length == 0) continue;
+                                                                    // ═══════════════════════════════════════
+                                                                    // v31：**纯空白 run 必须收下**。
+                                                                    //
+                                                                    // 原来这行是：
+                                                                    //   if (trimmed.length == 0) continue;
+                                                                    // 空格 / 带下划线的空格（填空横线）在这里被
+                                                                    // 第二次丢掉 —— 就算 CSFSSliceText 已经把它
+                                                                    // 取出来了，到这一步仍然进不了 runs。
+                                                                    //
+                                                                    // 两次丢掉的叠加效果正是用户说的：
+                                                                    //   「文字之间有空格…你都没识别出来」
+                                                                    // 而且「带下划线的空格」尤其明显：
+                                                                    // 它是一条纯空白 + underline=1 的 run，
+                                                                    // 被丢之后整条填空线消失，
+                                                                    // 打印出来合同上的填空处就没有横线了。
+                                                                    //
+                                                                    // 判据改成：只有**真正的空串**才 continue。
+                                                                    // 纯空白是内容，要进 runs。
+                                                                    // ═══════════════════════════════════════
+                                                                    if (tt.length == 0) continue;
+                                                                    BOOL ttIsSpace = CSFSIsPureWhiteSpace(tt);
+                                                                    if (ttIsSpace) {
+                                                                        spaceSliceCount++;
+                                                                        // 纯空白也要算「本段有内容」，
+                                                                        // 否则整段会被下面的 if (!hasText) 丢掉
+                                                                        hasText = YES;
+                                                                        [runs addObject:run];
+                                                                        continue;
+                                                                    }
                                                                     hasText = YES;
                                                                     if ([[run objectForKey:kCSFSRunTab] boolValue]) tabRunCount++;
                                                                     [runs addObject:run];
                                                                 }
-                                                                // 全空白段落直接丢掉（原实现靠 trim 达到同一效果）
+                                                                // 全空白段落仍然丢掉 —— 但注意「全空白」在这里
+                                                                // 指的是**一个 run 都没有**。
+                                                                // 只含空格的段落（如填空行）已经通过上面
+                                                                // spaceSliceCount 分支把 hasText 置 YES，
+                                                                // 会正常保留。
                                                                 if (!hasText) continue;
 
                                                                 NSMutableDictionary *p =
@@ -5342,16 +5570,18 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         // optKnown=0 说明面板状态压根没读到 ——
                                         // 那时 hideStamp/hideWritten 一定是 0，
                                         // 不能据此认为「用户没勾」，要单独看 opts 那行。
-                                        CSFS_LOG(@"v27 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
+                                        CSFS_LOG(@"v31 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
                                                  @" handToImage=%d seen(w/s/h)=%d%d%d | hiddenBlock=%ld"
-                                                 @" stampSkip=%ld handSkip=%ld tabRuns=%ld paras=%lu",
+                                                 @" stampSkip=%ld handSkip=%ld handKeep=%ld"
+                                                 @" spaceSlices=%ld tabRuns=%ld paras=%lu",
                                                  (int)gCSFSOptKnown, gCSFSOptSrc ?: @"(none)",
                                                  (int)gCSFSHideWritten, (int)gCSFSHideStamp,
                                                  (int)gCSFSHandToImage,
                                                  (int)gCSFSSeenWritten, (int)gCSFSSeenStamp,
                                                  (int)gCSFSSeenHandTo,
                                                  hiddenBlockCount, stampSkipCount,
-                                                 handSkipCount, tabRunCount,
+                                                 handSkipCount, handKeepCount,
+                                                 spaceSliceCount, tabRunCount,
                                                  (unsigned long)styledParas.count);
                                         if (firstStyled) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);

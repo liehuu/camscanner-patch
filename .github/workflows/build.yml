@@ -166,6 +166,31 @@ jobs:
           python3 tools/rev_check_v30.py
           python3 tools/check_v30.py src/CamScannerSaveToFiles.m
 
+          # v31：两个真机反馈的缺陷，都有日志逐行证据。
+          #
+          # 【一】「文字之间的空格、带下划线的空格都没识别出来」
+          #   空格在 OCR JSON 里是**独立 slice**，间隔只体现在它自身的
+          #   position/width 上；丢掉这个 slice 就无法从别处恢复，两列文字
+          #   会被粘成一串。丢它的地方有两处（CSFSSliceText 的 trim 判空、
+          #   段落收集循环的 trim 判空），只修一处仍然丢 —— 所以 S1/S4 分开断言。
+          #   「带下划线的空格」是 text=" " + underline=1，text 先丢，
+          #   下划线属性随之丢，整条填空横线消失，用户看到的就是「没识别出来」。
+          #
+          # 【二】「去除手写及去除印章选不选都没用，都是去除状态」
+          #   证据是同一进程两次导出：
+          #     勾选 → mgr 1 → merged 1
+          #     取消 → mgr 0 → merged 1     ← 用户看到的
+          #   根因是 v27 的 OR 合并没有**批次**概念，静态全局上一批的 1
+          #   永久残留。修法是在批次边界清零（不是改成「最后写入者」——
+          #   那会退回 v24～v28 的失败态），所以 R2 要断言顺序。
+          #
+          # 【三】stype=handwritten 不是「手写图」的判据
+          #   日志 33 次跳过全是 cat=0；OCR 对手写体文档的**正文文字**
+          #   也标 handwritten。H3 不用正则猜写法，而是把 continue
+          #   在「cat≠1 且有文字」场景下**真的求值一遍**，见 rev_check_v31 的 F1~F3。
+          python3 tools/rev_check_v31.py
+          python3 tools/check_v31.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail

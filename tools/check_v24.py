@@ -113,10 +113,55 @@ def main():
     # v25 判据从 `gCSFSHideStamp && stLow` 改成
     # `gCSFSHideStamp && (slCat == 2`（含 image_category 精确匹配 + stype 兜底）。
     # 条件跨行写，所以用正则匹配而不是 find。
+    #
+    # v31：手写过滤改成了块结构（因为判据本身要重写，见源码那段长注释），
+    # 形态从
+    #     if (gCSFSHideWritten && (slCat == 1 || stLow contains handwrit))
+    # 变成
+    #     if (gCSFSHideWritten) { … catSaysHW / stypeSaysHW … }
+    # 于是原来绑 `gCSFSHideWritten\s*&&\s*\(?\s*slCat` 的判据**当场失明**
+    # （实测：改完后它报「手写过滤缺失」，而代码里过滤明明在）。
+    #
+    # 这正是本项目反复踩的坑：判据绑「代码长什么样」而不是「行为对不对」。
+    # 所以这里改成按**实质**判两件事：
+    #   A) 存在一个由 gCSFSHideWritten 控制、且内部会 continue 的手写过滤块
+    #   B) 该块的起点早于取图语句
+    # 不再要求块内出现 `slCat == 1` 这种具体写法 —— 只要它受开关控制、
+    # 且真的会跳过当前 slice，位置对了就是对的。
     import re
     code = strip_comments(src)
     pos_stamp_filter = re.search(r'gCSFSHideStamp\s*&&\s*\(?\s*slCat', code)
-    pos_hand_filter  = re.search(r'gCSFSHideWritten\s*&&\s*\(?\s*slCat', code)
+
+    # 手写过滤：找 `if (gCSFSHideWritten)` 起的块，向后截到配对的 }
+    def _find_hand_block(text):
+        m = re.search(r'if\s*\(\s*gCSFSHideWritten\s*\)\s*\{', text)
+        if not m:
+            return None
+        i = text.find('{', m.start())
+        depth = 0
+        j = i
+        while j < len(text):
+            c = text[j]
+            if c in '"\'':
+                q = c
+                j += 1
+                while j < len(text):
+                    if text[j] == '\\':
+                        j += 2
+                        continue
+                    if text[j] == q:
+                        break
+                    j += 1
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return (m.start(), text[m.start():j + 1])
+            j += 1
+        return None
+
+    hand_blk = _find_hand_block(code)
     pos_take_img = code.find('textWins ? nil : CSFSSliceImageInfo(sl)')
     if pos_take_img < 0:
         fail('E3 找不到切片取图语句（textWins ? nil : CSFSSliceImageInfo(sl)），'
@@ -127,10 +172,15 @@ def main():
             bad.append('印章过滤缺失')
         elif pos_stamp_filter.start() > pos_take_img:
             bad.append('印章过滤排在取图之后')
-        if not pos_hand_filter:
+        if not hand_blk:
             bad.append('手写过滤缺失')
-        elif pos_hand_filter.start() > pos_take_img:
-            bad.append('手写过滤排在取图之后')
+        else:
+            pos_hand, hbody = hand_blk
+            # 必须真的会 continue —— 只读开关不跳过，等于没过滤
+            if 'continue' not in hbody:
+                bad.append('手写过滤块里没有 continue（读了开关却没跳过）')
+            elif pos_hand > pos_take_img:
+                bad.append('手写过滤排在取图之后')
         if bad:
             fail('E3 切片级过滤位置错误：%s —— 一旦取图先跑，'
                  '手写文字已入列，再拦无效' % '；'.join(bad))
