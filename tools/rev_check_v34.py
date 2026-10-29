@@ -63,6 +63,23 @@ def inject(src, old, new, tag):
     return src.replace(old, new, 1)
 
 
+# v35：字体写回从一处变成两处 —— 文字 run（判 !CSFSIsCJKFace(tf)）与
+#      空白 run（判 !CSFSIsCJKFace(face0)）。「算了不用」这种缺陷形态
+#      必须两处一起去掉，只去一处剩下那处仍能满足 V3 → 假绿。
+FACE_WRITE_TEXT = '\n                [r setObject:wideFace forKey:kCSFSRunFace];\n'
+FACE_WRITE_SPACE = '\n            [r setObject:wideFace forKey:kCSFSRunFace];\n'
+
+
+def drop_face_writeback(s):
+    """把两处 setObject:wideFace 都换成 (void)wideFace;（= 算了不用）。"""
+    if s.count(FACE_WRITE_TEXT) != 1 or s.count(FACE_WRITE_SPACE) != 1:
+        return None
+    return s.replace(FACE_WRITE_TEXT,
+                     '\n                (void)wideFace;\n', 1).replace(
+               FACE_WRITE_SPACE,
+                     '\n            (void)wideFace;\n', 1)
+
+
 def main():
     orig = open(SRC, encoding='utf-8').read()
 
@@ -101,15 +118,12 @@ def main():
                          'R2'),
     ))
 
-    # R3 判出来却没写回 run —— 半成品形态
+    # R3 判出来却没写回 run —— 半成品形态（v35 有两处写回，都要去掉）
     cases.append((
         'R3',
-        '判出字体却没写回 run（算了不用）',
+        '判出字体却没写回 run（算了不用，两处写回全去掉）',
         '[FAIL] V3',
-        lambda s: inject(s,
-                         '            [r setObject:wideFace forKey:kCSFSRunFace];\n',
-                         '            (void)wideFace;\n',
-                         'R3'),
+        drop_face_writeback,
     ))
 
     # R3b 写回的不是统一出口，而是临时拼的字符串

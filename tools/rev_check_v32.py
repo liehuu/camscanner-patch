@@ -90,13 +90,18 @@ def main():
     ))
 
     # Q2 读了但没存进 run（最常见的半成品：值拿到了，忘了带走）
+    #
+    # 锚点必须收窄到 CSFSParseSlice 里那一处写入。
+    # v35 在 CSFSFixSpaceRuns / CSFSFitParaWidth / 渲染循环里
+    # 又用了同一套 key（读、压、展开都要用它），
+    # 只写 `forKey:kCSFSRunSpaceW` 会命中 4 次，用例静默失效。
     cases.append((
         'Q2',
         '读到了 width 但没写进 kCSFSRunSpaceW',
         'P1 读到了 width 但没写进 kCSFSRunSpaceW',
         lambda s: inject(s,
-                         'forKey:kCSFSRunSpaceW',
-                         'forKey:@"sw_unused"',
+                         '[run setObject:[NSNumber numberWithDouble:sw] forKey:kCSFSRunSpaceW];',
+                         '[run setObject:[NSNumber numberWithDouble:sw] forKey:@"sw_unused"];',
                          'Q2'),
     ))
 

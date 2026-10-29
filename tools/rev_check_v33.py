@@ -95,10 +95,44 @@ BLK_SPACE_STATS_EARLY = (
     '             defaultPt, (unsigned long)zipData.length);\n'
 )
 
-NBSP_SPLIT = (
-    "(ch == ' ' ? @\"\\u00A0\" : "
-    "[NSString stringWithCharacters:&ch length:1])"
-)
+# v35：NBSP 不再是「逐字符替换」，改成整段按 2:1 折半后
+#     用 NSMutableString 累加。锚点跟着改成构造那一句。
+NBSP_SPLIT = '[nb appendString:@"\\u00A0"];'
+
+# v35：CSFSFixSpaceRuns 多了 indentTw 形参，且返回值接给 paraSuggestLeft。
+#      R5 / R7 共用这一处调用点。
+CALL_FIX = ('        paraSuggestLeft = CSFSFixSpaceRuns('
+            '(NSMutableArray *)runs, paraPt, fitIndentTw);')
+
+
+# v35：字体写回有两处 —— 文字 run（判 !CSFSIsCJKFace(tf) 后覆盖）
+#      与空白 run（判 !CSFSIsCJKFace(face0) 后覆盖）。
+#      「算出字体却没写回」这种缺陷形态必须两处都去掉，
+#      否则剩下那一处仍能满足 F2/V3 的「有 setObject」断言 → 假绿。
+FACE_WRITE_TEXT = '\n                [r setObject:wideFace forKey:kCSFSRunFace];\n'
+FACE_WRITE_SPACE = '\n            [r setObject:wideFace forKey:kCSFSRunFace];\n'
+
+
+def drop_face_writeback(s):
+    """把两处 setObject:wideFace 都换成 (void)wideFace;（= 算了不用）。"""
+    if s.count(FACE_WRITE_TEXT) != 1 or s.count(FACE_WRITE_SPACE) != 1:
+        return None
+    return s.replace(FACE_WRITE_TEXT,
+                     '\n                (void)wideFace;\n', 1).replace(
+               FACE_WRITE_SPACE,
+                     '\n            (void)wideFace;\n', 1)
+
+
+def move_fix_after_emit(s):
+    """把整段空白补齐挪到 </w:p> 之后（改了内存，输出已生成）。"""
+    if s.count(CALL_FIX + '\n') != 1:
+        return None
+    s2 = s.replace(CALL_FIX + '\n', '', 1)
+    return inject(s2,
+                  '    [out appendString:@"</w:p>"];',
+                  '    (void)CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, 0);\n'
+                  '    [out appendString:@"</w:p>"];',
+                  'R7')
 
 UNDER_BLACKLIST = (
     '        if ([s isEqualToString:@"0"] || [s isEqualToString:@"false"] ||\n'
@@ -174,9 +208,8 @@ def main():
         'R5',
         'CSFSRenderPara 里不调用 CSFSFixSpaceRuns',
         'F1 CSFSRenderPara 里没有调用 CSFSFixSpaceRuns',
-        lambda s: inject(s,
-                         'CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt);',
-                         '/* removed */', 'R5'),
+        lambda s: inject(s, CALL_FIX,
+                         '        paraSuggestLeft = NO; /* removed */', 'R5'),
     ))
 
     # R6 —— v34 起删除。
@@ -194,13 +227,7 @@ def main():
         'R7',
         'CSFSFixSpaceRuns 挪到写 XML 之后（改了内存，输出已生成）',
         'F1 CSFSFixSpaceRuns 排在写 XML 之后',
-        lambda s: inject(
-            s.replace('CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt);\n',
-                      '', 1),
-            '    [out appendString:@"</w:p>"];',
-            '    CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt);\n'
-            '    [out appendString:@"</w:p>"];',
-            'R7'),
+        move_fix_after_emit,
     ))
 
     # R8 兜底字体给空串 —— 全文都是 Calibri 时空白 run 仍按 0.226em 渲染
@@ -213,14 +240,14 @@ def main():
                          'if (gCSFSBodyFace.length == 0) gCSFSBodyFace = @"";', 'R8'),
     ))
 
-    # R9 算出字体却没写进 run
+    # R9 算出字体却没写进 run ——
+    #    v35 起有两处写回（文字 run / 空白 run），必须都去掉，
+    #    否则剩下那处照样满足 F2 的「有 setObject」断言 → 假绿。
     cases.append((
         'R9',
-        '字体变量算出来了却没写进 run',
+        '字体变量算出来了却没写进 run（两处写回全去掉）',
         'F2 字体变量算出来了',
-        lambda s: inject(s,
-                         '            [r setObject:wideFace forKey:kCSFSRunFace];\n',
-                         '            (void)wideFace;\n', 'R9'),
+        drop_face_writeback,
     ))
 
     # R10 不在段落级统一记录正文字体（每段各猜，跨段不一致）
@@ -283,13 +310,15 @@ def main():
                          'R14'),
     ))
 
-    # R15 不做 NBSP 替换 —— 行尾空格的下划线被 Word 裁掉
+    # R15 不做 NBSP 替换 —— 行尾空格的下划线被 Word 裁掉。
+    #     v35 的构造形式变了（整段折半累加，不再是逐字符替换），
+    #     锚点改成累加那一句：把 NBSP 还写成普通空格 = 没做替换。
     cases.append((
         'R15',
         '不做 NBSP 替换（行尾空格的下划线会被裁掉）',
         'U4 没有把带下划线的空白换成不换行空格',
         lambda s: inject(s, NBSP_SPLIT,
-                         '[NSString stringWithCharacters:&ch length:1]', 'R15'),
+                         '[nb appendString:@" "];', 'R15'),
     ))
 
     # R16 构造了 NBSP 却没赋回 emitText —— 写了没用上
@@ -302,14 +331,18 @@ def main():
                          '            (void)nb;\n', 'R16'),
     ))
 
-    # R17 NBSP 替换只被「纯空白」守卫 —— 所有词间空格都变 NBSP，整行溢出
+    # R17 NBSP 替换丢了「带下划线」守卫 —— 所有词间空格都变 NBSP，整行溢出。
+    #     v35 的守卫多了 emitAtTail（只换段尾），去掉 emitUnder 后
+    #     near 条件里只剩 emitIsSpace/emitAtTail → 应报「只被纯空白守卫」。
     cases.append((
         'R17',
-        'NBSP 替换丢了「带下划线」守卫',
+        'NBSP 替换丢了「带下划线」守卫（只剩纯空白 + 段尾）',
         'U5 NBSP 替换只被「纯空白」守卫',
         lambda s: inject(s,
-                         'if (emitIsSpace && emitUnder && emitText.length > 0) {',
-                         'if (emitIsSpace && emitText.length > 0) {',
+                         'if (emitIsSpace && emitUnder && emitAtTail'
+                         ' && emitText.length > 0) {',
+                         'if (emitIsSpace && emitAtTail'
+                         ' && emitText.length > 0) {',
                          'R17'),
     ))
 

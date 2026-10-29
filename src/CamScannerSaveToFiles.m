@@ -2158,6 +2158,14 @@ static NSString *const kCSFSRunUnderline = @"u";
 // slice 自己的 width 才是这条线真正的像素宽度，所以把它带进 run，
 // 渲染时按「宽度 ÷ 单空格宽」展开成足够多的空格，下划线自然就够长了。
 static NSString *const kCSFSRunSpaceW  = @"sw";
+// v35：标记「这个空白 run 位于段落末尾」。
+// 段尾空白与行中空白的处理**必须分开**：
+//   · 行中空白要保留断行点（普通 U+0020），否则 Word 会在一个
+//     超长不可断块里找不到折行位置，把断点提前到段落开头，
+//     首行内容极少 → jc=both 把首行字距撑成两三倍。
+//   · 段尾空白要换成 U+00A0，否则 Word 会把行尾空格连同它的
+//     下划线一起裁掉，填空线整条消失（v33 的结论，仍然有效）。
+static NSString *const kCSFSRunTail    = @"tail";
 // 段落的键
 static NSString *const kCSFSParaRuns     = @"runs";
 static NSString *const kCSFSParaAlign    = @"jc";
@@ -4407,6 +4415,187 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 // 保证「宽度」和「缩进」两处不会各用一套比例。
 // ═════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════
+// v35：估算一个 run 在 Word 里占多宽（pt）
+//
+// 为什么必须估：Word 是**流式排版**，而 OCR 给的是**绝对版面**。
+// 只要某行的自然宽度比页宽多出几个 pt，Word 就折行；
+// 折行之后 `jc=both` 会把「除末行以外的每一行」强行撑满页宽 ——
+// 于是「出 租 方 ：」被拉成两倍多字距。用户说的「乱七八糟」就是这个。
+//
+// 真机实测（v34 导出的 docx → Word → PDF，用 pymupdf 逐字量 bbox）：
+//   p1「出租方：…」 自然宽 470.4pt，页宽 451.3pt，超 19.1pt
+//      → 折成 2 行 → 首行字距 24.2pt（10.5pt 的字本应步进 10.5pt，撑到 2.3 倍）
+//   p3「中介方：…」 自然宽 463.3pt，超 12.0pt
+//      → 折成 4 行 → 「中」「介」「方：」各自被撑成一行
+//
+// 那 19pt 从哪来？`22018220040518001x` 这 18 个字符用 Calibri 渲染，
+// 实测占 134.3pt（0.71em/字符）；宋体数字是 0.5em，只需 94.5pt。
+// v34 只统一了**空白 run** 的字体，文字 run 还是 Calibri —— 差出 40pt。
+//
+// 结论：① 字体要统一到中文字体；② 每段写入前必须做一次宽度预算。
+// ═════════════════════════════════════════════════════════════════════
+static double CSFSEstRunWidthPt(NSDictionary *r, double paraPt) {
+    NSString *t = [r objectForKey:kCSFSRunText];
+    if (![t isKindOfClass:[NSString class]] || t.length == 0) return 0.0;
+
+    double fs = CSFSDoubleValue([r objectForKey:kCSFSRunSize]);
+    if (!(fs > 2.0) || fs > 200.0) fs = paraPt;
+    if (!(fs > 2.0) || fs > 200.0) fs = 11.0;
+
+    // 空白 run 有 slice.width（版面实测值），比按字符数估算准得多。
+    double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+    if (CSFSIsPureWhiteSpace(t) && sw > 0.0) return sw;
+
+    double w = 0.0;
+    NSUInteger n = t.length;
+    for (NSUInteger i = 0; i < n; i++) {
+        unichar c = [t characterAtIndex:i];
+        // 汉字与全角标点 1em；ASCII / 半角 0.5em。
+        // 宋体里数字字母确实是 0.5em —— 这条只在字体统一之后才成立，
+        // 也正是上面那条 40pt 差额的来源。
+        w += (c >= 0x2E80) ? fs : (fs * 0.5);
+    }
+    // v35：实测校正系数 1.06。
+    // 从导出的 PDF 逐字量 advance：10.5pt 的宋体全角字实测占 11.1pt
+    // （10.6 的墨水宽 + 侧边距）。按 1.0em 估会系统性偏小 6% ——
+    // p1 就是差这一点点，估算说「装得下」，Word 说「装不下」。
+    // 宁可估大一点被多压 6% 的空白，也不要估小了整行折行、
+    // 再被 jc=both 撑成两倍字距。
+    return w * 1.06;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// v35：段落宽度预算 —— 保证「本来一行」的段落不被挤成两行
+//
+// 判据只有三条，宁可不动也不乱动：
+//   ① 自然宽度 ≤ 可用宽度        → 装得下，一个字节都不改
+//   ② 自然宽度 > 可用宽度 × 1.9  → 这是长段落，文字本来就要折好几行，
+//                                  压空白只会让行数更多，放弃
+//   ③ 只有「差几十 pt 就能一行装下」的段落才按比例压空白
+//
+// 只压**有 slice.width 的空白**，不动文字、不动缩进 ——
+// 文字宽度是 OCR 识别出来的事实，空白宽度才是可以商量的排版量。
+// ═════════════════════════════════════════════════════════════════════
+static BOOL CSFSFitParaWidth(NSMutableArray *runs, double paraPt, long indentTw) {
+    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return NO;
+
+    double lineW = kCSFSContentTwips / 20.0;
+    if (!(lineW > 40.0)) return NO;
+
+    double indentPt = (double)indentTw / 20.0;
+    if (indentPt < 0.0 || indentPt > lineW * 0.5) indentPt = 0.0;
+    double avail = lineW - indentPt;
+    if (!(avail > 60.0)) return NO;
+
+    NSUInteger cnt = [runs count];
+    double total = 0.0, spaceSum = 0.0, tailSum = 0.0, noTail = 0.0;
+    for (NSUInteger i = 0; i < cnt; i++) {
+        NSDictionary *r = [runs objectAtIndex:i];
+        double w = CSFSEstRunWidthPt(r, paraPt);
+        total += w;
+        BOOL isTail = [[r objectForKey:kCSFSRunTail] boolValue] &&
+                      CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText]);
+        if (isTail) tailSum += w; else noTail += w;
+        double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+        if (sw > 0.0 && CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText])) {
+            spaceSum += sw;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // v35：段尾留白是「填充」，不是「内容」，必须自适应剩余宽度。
+    //
+    // 真机 p3 是：中介方：+ 43 空格 + 3 空格 + 经纪人：+ 22 空格
+    // 前面 43 个空格是版面实测宽度（225pt，要画下划线，不能动），
+    // 后面 22 个空格是「经纪人：」到行尾的填充 —— 而 App 给的
+    // 页宽和 Word 的页宽并不完全一致，这截填充按原值写出去
+    // 正好把行顶爆，折行后 jc=both 又把「中」「介」「方：」撑开。
+    //
+    // 填充没有语义，裁短不改变任何文字位置；
+    // 而它后面的东西根本不存在，所以「裁到剩余宽度」是零损失的。
+    // ═══════════════════════════════════════════════════════════════
+    if (tailSum > 0.0) {
+        double room = avail - noTail;
+        if (room < 2.0) room = 2.0;
+        double target = room * 0.97;
+        if (tailSum > target) {
+            double r2 = target / tailSum;
+            if (r2 < 0.05) r2 = 0.05;
+            for (NSUInteger i = 0; i < cnt; i++) {
+                id o = [runs objectAtIndex:i];
+                if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
+                NSMutableDictionary *r = (NSMutableDictionary *)o;
+                if (![[r objectForKey:kCSFSRunTail] boolValue]) continue;
+                if (!CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText])) continue;
+                double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+                if (sw > 0.0) {
+                    [r setObject:[NSNumber numberWithDouble:sw * r2]
+                          forKey:kCSFSRunSpaceW];
+                }
+            }
+            CSFS_LOG(@"v35 tailfit: tailSum=%.1f noTail=%.1f avail=%.1f ratio=%.3f",
+                     tailSum, noTail, avail, r2);
+            total = noTail + target;
+        }
+    }
+
+    if (total <= avail) return NO;                 // ① 装得下
+
+    // ═══════════════════════════════════════════════════════════════
+    // v35：只差 5% 以内的段落，压一点留白把它挤进一行。
+    //
+    // 真机 p2（承租方）自然宽 442pt、可用 430pt，只超 12pt ——
+    // 折行后第二行只剩「方）」三个字，和预览里「承租方」独占一行的
+    // 样子差得很远。这 12pt 摊到 47 个字符上，每字只要挤 0.26pt
+    // （≈5 twips），比折出一行残字自然得多。
+    //
+    // 但压的对象只能是**留白**，而且限制在 50% 以内：
+    //   · 压的是空白 run 的宽度 = 下划线长度，压过头就退回
+    //     「你这个明显不够长」；
+    //   · 估算本身有 ±5% 误差，所以这条只用于「差一点点」的情形，
+    //     差得多的段落宁可折行也不动它的长度。
+    // ═══════════════════════════════════════════════════════════════
+    if (total <= avail * 1.05 && spaceSum > 1.0) {
+        double need = total - avail * 0.995;
+        double ratio = (spaceSum - need) / spaceSum;
+        if (ratio >= 0.5 && ratio < 0.999) {
+            for (NSUInteger i = 0; i < cnt; i++) {
+                id o = [runs objectAtIndex:i];
+                if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
+                NSMutableDictionary *r = (NSMutableDictionary *)o;
+                double sw = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+                if (sw > 0.0 && CSFSIsPureWhiteSpace([r objectForKey:kCSFSRunText])) {
+                    [r setObject:[NSNumber numberWithDouble:sw * ratio]
+                          forKey:kCSFSRunSpaceW];
+                }
+            }
+            CSFS_LOG(@"v35 squeeze: total=%.1f avail=%.1f spaceSum=%.1f ratio=%.3f",
+                     total, avail, spaceSum, ratio);
+            return NO;                             // 挤进一行了，保持两端对齐
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 差得多的段落：**不压行中空白**，只放弃两端对齐。
+    //
+    // 曾经写过一版「按比例压缩空白直到装下」，实测不可取：
+    // 空白宽度就是用户反复要求的「下划线长度」，压它就是退回
+    // v32 的老毛病（「你这个明显不够长」）。
+    //
+    // 折行本身不是问题 —— 长段落人人都在折行。真正难看的是
+    // jc=both 把「除末行外的每一行」强行撑满：
+    //   p1 末行只剩 44pt（10% 行宽）→ 首行 24 个单元要摊掉 257pt
+    //   → 每字多 10.7pt → 10.5pt 的字步进 24.2pt，2.3 倍
+    // 只要这一段改成左对齐，折行位置和字距都恢复正常。
+    // ═══════════════════════════════════════════════════════════════
+    double rem = fmod(total, avail);
+    BOOL suggestLeft = (rem > 0.0 && rem < avail * 0.5) && (total < avail * 1.35);
+    CSFS_LOG(@"v35 overflow: total=%.1f avail=%.1f rem=%.1f left=%d",
+             total, avail, rem, (int)suggestLeft);
+    return suggestLeft;
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // v34：纯空白 run 的样式补齐 —— 修「长度不够」与「多画了假下划线」
 //
 // 这一版是被真机导出的 document.xml 直接推翻 v33 两条判断之后重写的，
@@ -4449,12 +4638,13 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 //
 // 保留 v33 做对的部分：字号缺失时从邻居继承、以及 NBSP 换行尾空格。
 // ═════════════════════════════════════════════════════════════════════
-static void CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt) {
-    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return;
+static BOOL CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt, long indentTw) {
+    if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return NO;
 
     static long fixLogCount = 0;   // 明细日志最多 6 条，防刷屏
     NSUInteger cnt = [runs count];
     long fillSize = 0, faceFix = 0, fillBody = 0, underNative = 0;
+    long textFaceFix = 0, tailDrop = 0, tabDrop = 0;
 
     // ── 定下「空白 run 该用的字体」────────────────────────────────
     //
@@ -4482,7 +4672,28 @@ static void CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt) {
         NSMutableDictionary *r = (NSMutableDictionary *)obj;
 
         NSString *t = [r objectForKey:kCSFSRunText];
-        if (!CSFSIsPureWhiteSpace(t)) continue;
+
+        // ═══════════════════════════════════════════════════════════
+        // v35：**文字 run 的字体也要统一**，不能只管空白。
+        //
+        // v34 漏了这一半。真机导出的 p1 里
+        //   <w:rFonts w:ascii="Calibri"/> 22018220040518001x
+        // 这 18 个字符实测占 134.3pt（0.71em/字符），
+        // 换成宋体后只需 94.5pt（0.5em）—— 一条 run 就差 40pt，
+        // 正好把整行顶过页宽 19pt，折行后触发字距撑开。
+        //
+        // 数字、字母、标点一律跟中文走同一套字体，是这份合同的原始版式
+        // （预览截图里身份证号与该行中文同宽），不是我们另立的规矩。
+        // ═══════════════════════════════════════════════════════════
+        if (!CSFSIsPureWhiteSpace(t)) {
+            NSString *tf = [r objectForKey:kCSFSRunFace];
+            if (![tf isKindOfClass:[NSString class]]) tf = nil;
+            if (!CSFSIsCJKFace(tf)) {
+                [r setObject:wideFace forKey:kCSFSRunFace];
+                textFaceFix++;
+            }
+            continue;
+        }
 
         // 1) 字体：不是中文字体就换掉（空格宽度才有 0.5em）
         NSString *face0 = [r objectForKey:kCSFSRunFace];
@@ -4520,11 +4731,105 @@ static void CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt) {
         if ([[r objectForKey:kCSFSRunUnderline] boolValue]) underNative++;
     }
 
-    if (fillSize || faceFix || fillBody) {
-        CSFS_LOG(@"v34 spcfix para: faceFix=%ld fillBody=%ld fillSize=%ld"
-                 @" underNative=%ld face=%@ pt=%.1f",
-                 faceFix, fillBody, fillSize, underNative, wideFace, paraPt);
+    // ═══════════════════════════════════════════════════════════════
+    // v35：行尾空白丢弃 —— 但**带下划线的不能丢**。
+    //
+    // 真机 p3（中介方）行末挂着 22 个空格 = 115.5pt，
+    // 整行自然宽 442.3pt + 缩进 21pt = 463.3pt，比页宽多 12pt。
+    // 折行后 jc=both 就把「中」「介」「方：」各自撑成一行。
+    //
+    // 行尾留白在 Word 里没有任何排版意义 —— 它唯一的作用
+    // 就是把段落顶出边界。制表位、右对齐才是表达「推到行右」的手段。
+    //
+    // 但 v35 第一版把带下划线的段尾空白也删了，那等于把
+    // 「出租方：张三______」这种挂在段尾的填空线整条抹掉。
+    // 判据必须是「有没有下划线」，不是「在不在段尾」。
+    // ═══════════════════════════════════════════════════════════════
+    NSInteger lastKeep = -1;
+    for (NSInteger i = (NSInteger)cnt - 1; i >= 0; i--) {
+        NSDictionary *c = [runs objectAtIndex:(NSUInteger)i];
+        NSString *ct = [c objectForKey:kCSFSRunText];
+        BOOL ws = CSFSIsPureWhiteSpace(ct);
+        BOOL und = [[c objectForKey:kCSFSRunUnderline] boolValue];
+        // 文字 run，或者「带下划线且确实有字符」的空白 run —— 都得留
+        if (!ws || (und && [ct isKindOfClass:[NSString class]] && ct.length > 0)) {
+            lastKeep = i;
+            break;
+        }
     }
+    if (lastKeep >= 0 && (NSUInteger)lastKeep + 1 < cnt) {
+        for (NSUInteger i = (NSUInteger)lastKeep + 1; i < cnt; i++) {
+            id o = [runs objectAtIndex:i];
+            if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
+            NSMutableDictionary *r = (NSMutableDictionary *)o;
+            NSString *ct = [r objectForKey:kCSFSRunText];
+            if ([ct isKindOfClass:[NSString class]] && ct.length > 0 &&
+                CSFSIsPureWhiteSpace(ct)) {
+                [r setObject:@"" forKey:kCSFSRunText];
+                [r setObject:[NSNumber numberWithDouble:0.0] forKey:kCSFSRunSpaceW];
+                [r setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunTail];
+                tailDrop++;
+            }
+        }
+    }
+    // v35：把「真正落在段尾的那个空白 run」标出来，供渲染时决定是否换 NBSP。
+    if (lastKeep >= 0 && (NSUInteger)lastKeep < cnt) {
+        id o = [runs objectAtIndex:(NSUInteger)lastKeep];
+        if ([o isKindOfClass:[NSMutableDictionary class]]) {
+            NSMutableDictionary *lr = (NSMutableDictionary *)o;
+            NSString *lt = [lr objectForKey:kCSFSRunText];
+            if ([lt isKindOfClass:[NSString class]] && lt.length > 0 &&
+                CSFSIsPureWhiteSpace(lt)) {
+                [lr setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunTail];
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // v35：删掉与「已展开空白」重复的 tab。
+    //
+    // 真机 p3 的 run 序列是：
+    //   中介方： | 43 个空格（sw=225.8）| <w:tab pos=4513> | 3 个空格 | 经纪人：
+    //
+    // 43 个空格已经把「经纪人：」推到 225pt 处，Tab 又推一次 ——
+    // Word 发现当前位置已越过 4513 twips 的制表位，就跳到**下一个**
+    // 默认制表位（每 720 twips），实际落在 297pt。两者相加把整行顶爆，
+    // 折成 3 行，每行只有一两个字，再被 jc=both 撑到两端。
+    // 这是 p3「中 介 方」那种惨状的全部原因。
+    //
+    // 空白和 tab 是同一件事的两种表达，留一个就够。
+    // 保留空白（它是版面实测宽度），删掉 tab。
+    // ═══════════════════════════════════════════════════════════════
+    for (NSUInteger i = 1; i < cnt; i++) {
+        id o = [runs objectAtIndex:i];
+        if (![o isKindOfClass:[NSMutableDictionary class]]) continue;
+        NSMutableDictionary *r = (NSMutableDictionary *)o;
+        if (![[r objectForKey:kCSFSRunTab] boolValue]) continue;
+
+        id po = [runs objectAtIndex:i - 1];
+        if (![po isKindOfClass:[NSMutableDictionary class]]) continue;
+        NSDictionary *pv = (NSDictionary *)po;
+        NSString *pt2 = [pv objectForKey:kCSFSRunText];
+        double pw = CSFSDoubleValue([pv objectForKey:kCSFSRunSpaceW]);
+        BOOL ws = CSFSIsPureWhiteSpace(pt2);
+        if (ws && (pw > 0.0 || [pt2 length] >= 3)) {
+            [r setObject:[NSNumber numberWithBool:NO] forKey:kCSFSRunTab];
+            tabDrop++;
+        }
+    }
+
+    // v35：宽度预算放在最后一步 —— 字体、行尾、tab 都已定稿，
+    // 这时候估出来的宽度才和真正写进 XML 的一致。
+    BOOL suggestLeft = CSFSFitParaWidth(runs, paraPt, indentTw);
+
+    if (fillSize || faceFix || fillBody || textFaceFix || tailDrop || tabDrop) {
+        CSFS_LOG(@"v35 spcfix para: faceFix=%ld textFaceFix=%ld fillBody=%ld"
+                 @" fillSize=%ld underNative=%ld tailDrop=%ld tabDrop=%ld"
+                 @" face=%@ pt=%.1f ind=%ld left=%d",
+                 faceFix, textFaceFix, fillBody, fillSize, underNative, tailDrop, tabDrop,
+                 wideFace, paraPt, indentTw, (int)suggestLeft);
+    }
+    return suggestLeft;
 }
 
 static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
@@ -4684,6 +4989,11 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     if (gCSFSFontSizeMode == 1)      paraPt -= 1.0;
     else if (gCSFSFontSizeMode == 2) paraPt += 1.0;
 
+    // v35：本段实际占用的左缩进（twips），供下面的宽度预算减去。
+    // 缩进和空白是两笔独立开销，预算时必须一起算 ——
+    // 只算空白不算缩进，就正好是 p1/p3 超页宽的那 12~19pt。
+    long fitIndentTw = 0;
+
     NSMutableString *pPr = [NSMutableString string];
 
     // v28：把决定缩进分支走向的三个输入打一次。
@@ -4806,6 +5116,9 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
                 if (chars > 2000) chars = 2000;
                 [pPr appendFormat:@"<w:ind w:firstLineChars=\"%ld\" w:firstLine=\"%ld\"/>",
                     chars, flL];
+                // 首行缩进是首行的实际开销，宽度预算要减掉它。
+                // 悬挂缩进（上面那个分支）首行顶格，开销为 0，故不设。
+                fitIndentTw = flL;
                 CSFS_LOG(@"v30 ind firstLine=%ld (raw=%@ why=%s scale=%.4f pt=%.1f)",
                          flL, [para objectForKey:kCSFSParaIndFL] ?: @"(nil)", flWhy,
                          gCSFSPageScale, paraPt);
@@ -4816,6 +5129,45 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     }
 
     // 4) 对齐
+    //
+    // v35：run 级修正必须提前到 jc 之前 —— 它要回一个「这段是否建议左对齐」，
+    // 而这个结论要写进 jc。原来的顺序是「先写 pPr、再修 run」，
+    // 于是宽度预算算出来的结论只能丢掉，等于白算。
+    id runs = [para objectForKey:kCSFSParaRuns];
+    BOOL runsOK = [runs isKindOfClass:[NSArray class]] && [(NSArray *)runs count] > 0;
+    BOOL paraSuggestLeft = NO;
+    if (runsOK) {
+        paraSuggestLeft = CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt, fitIndentTw);
+    }
+
+    // v35：标题段强制居中。
+    // 真机 p0 是 <w:jc w:val="right"/> —— 因为那一段里混了一个右对齐的
+    // 红色编号「0004025」，OCR 按整段估出了 right。
+    // 但预览里「房屋租赁合同」是居中的（截图里能直接看出来），
+    // 导出的却整行贴到右边，这是用户说「乱」的直观来源之一。
+    //
+    // 判据用字号：段内出现 ≥ 正文 1.5 倍的字号，说明它是标题，
+    // 标题的居中与编号是否靠右无关。只改 jc，不动字号和颜色。
+    if ([align isKindOfClass:[NSString class]] && !alignLeftish) {
+        if ([runs isKindOfClass:[NSArray class]]) {
+            for (NSDictionary *rr in (NSArray *)runs) {
+                double s0 = CSFSDoubleValue([rr objectForKey:kCSFSRunSize]);
+                if (s0 > defaultPt * 1.5 && s0 < 200.0) {
+                    CSFS_LOG(@"v35 title center: sz=%.1f defaultPt=%.1f was=%@",
+                             s0, defaultPt, align);
+                    align = @"center";
+                    break;
+                }
+            }
+        }
+    }
+    // v35：折行余量太小 → 改左对齐，避免 jc=both 把首行字距撑成两倍。
+    // 只覆盖 both，不动 center/right（标题与右对齐是刻意的）。
+    if (paraSuggestLeft && [align isKindOfClass:[NSString class]] &&
+        [(NSString *)align isEqualToString:@"both"]) {
+        align = @"left";
+        CSFS_LOG(@"v35 align: both -> left（折行余量 <50%%，两端对齐会撑开字距）");
+    }
     if ([align isKindOfClass:[NSString class]] && [(NSString *)align length] > 0) {
         [pPr appendFormat:@"<w:jc w:val=\"%@\"/>", align];
     }
@@ -4823,16 +5175,16 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         [out appendFormat:@"<w:pPr>%@</w:pPr>", pPr];
     }
 
-    id runs = [para objectForKey:kCSFSParaRuns];
-    if (![runs isKindOfClass:[NSArray class]] || [(NSArray *)runs count] == 0) {
+    if (!runsOK) {
         [out appendString:@"<w:r><w:t xml:space=\"preserve\"></w:t></w:r></w:p>"];
         return out;
     }
 
     // v33：纯空白 run 补齐字体/字号/下划线。
-    // 必须在这里做（整段 runs 已就绪、XML 还没写），
+    // 必须在整段 runs 就绪、XML 还没写的时候做，
     // 因为继承要看「同段相邻的文字 run」，单条 run 自己没有上下文。
-    CSFSFixSpaceRuns((NSMutableArray *)runs, paraPt);
+    // v35：这次调用已经上移到 jc 之前（见上面 paraSuggestLeft），
+    // 这里不要再调一次 —— 重复调用会把已经压过的空白再压一遍。
 
     for (NSDictionary *r in (NSArray *)runs) {
         NSString *text = [r objectForKey:kCSFSRunText];
@@ -4963,18 +5315,43 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         // 宽度与普通空格一致（宋体里同为 0.5em），
         // 所以换成它不会改变长度，只保证线画出来。
         //
-        // 只对带下划线的空白这么做：普通词间空格换成 NBSP
-        // 会让 Word 失去那个断行点，整行排不下时溢出。
+        // v35 更正：只对**段落末尾**的空白这么换。
+        // v33/v34 是无条件换，结果是行中每一条填空线都变成了
+        // 不可断的块 —— 「22018220040518001x + 7 个 NBSP + （以下简称甲方）」
+        // 连成一整块 255pt，前一行放不下就整体下移，
+        // 首行只剩 194pt 的内容却被 jc=both 撑满 451pt，
+        // 字距变成 2.3 倍。用户说的「乱七八糟」正是这么来的。
+        // 行中空白保留普通空格 = 保留断行点，Word 才能在正确位置折行。
         // ═══════════════════════════════════════════════════════════
-        if (emitIsSpace && emitUnder && emitText.length > 0) {
-            NSMutableString *nb = [NSMutableString stringWithCapacity:emitText.length];
+        BOOL emitAtTail = [[r objectForKey:kCSFSRunTail] boolValue];
+        if (emitIsSpace && emitUnder && emitAtTail && emitText.length > 0) {
+            // ═══════════════════════════════════════════════════════
+            // v35：NBSP 是**全角**的，个数必须折半。
+            //
+            // v33 的注释写着「宽度与普通空格一致（宋体里同为 0.5em）」——
+            // 这句是错的。用 Word 逐字符量位置实测（10.5pt，字体全写 SimSun）：
+            //     U+0020 普通空格  0.5255em →  5.25pt
+            //     U+00A0 NBSP      1.0490em → 10.50pt
+            //     U+3000 全角空格  1.0490em → 10.50pt
+            // 也就是说 NBSP 正好是普通空格的**两倍宽**。
+            //
+            // 后果是连锁的：段尾那条填空线换成 NBSP 后长度翻倍 →
+            // 段落比页宽多出几十 pt → 折行 → jc=both 把首行撑成
+            // 两三倍字距。用户看到的「乱七八糟」根子就在这里。
+            //
+            // 按 2:1 折半后总宽完全不变，线该多长还是多长。
+            // ═══════════════════════════════════════════════════════
             NSUInteger tn = emitText.length;
-            for (NSUInteger k = 0; k < tn; k++) {
-                unichar ch = [emitText characterAtIndex:k];
-                [nb appendString:(ch == ' ' ? @"\u00A0" : [NSString stringWithCharacters:&ch length:1])];
-            }
+            NSUInteger nbCount = (tn + 1) / 2;     // 每 2 个普通空格 = 1 个 NBSP
+            if (nbCount < 1) nbCount = 1;
+            NSMutableString *nb = [NSMutableString stringWithCapacity:nbCount];
+            for (NSUInteger k = 0; k < nbCount; k++) [nb appendString:@"\u00A0"];
             emitText = nb;
             gCSFSUnderSpaceRuns++;
+            if (gCSFSUnderSpaceRuns <= 8) {
+                CSFS_LOG(@"v35 nbsp: %lu 普通空格 -> %lu NBSP（NBSP 为 1em，折半保宽度）",
+                         (unsigned long)tn, (unsigned long)nbCount);
+            }
         }
 
         if (rPr.length > 0) {

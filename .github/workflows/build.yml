@@ -280,6 +280,39 @@ jobs:
           python3 tools/rev_check_v34.py
           python3 tools/check_v34.py src/CamScannerSaveToFiles.m
 
+          # ── v35：修「整篇排版乱七八糟」──
+          #
+          # 用户：「你看我手机预览的截图，多规整，出租房，和承租方都是单独一行，
+          #         你这导出的docx乱七八糟的」
+          #
+          # 把 v34 导出的 docx 用 Word 打开 → 转 PDF → 逐字量 bbox：
+          #   「出 租 方 ：」x0 = 93.0 / 117.1 / 141.3 / 165.4 …
+          #   步进 24.2pt（10.5pt 的字本应步进 10.5pt）—— 2.3 倍字距
+          # 不是字距被设大了，而是**折行之后 jc=both 把首行强行撑满**。
+          #
+          # 【为什么折行】自然宽 470.4pt > 页宽 451.3pt，超 19.1pt。
+          #   `22018220040518001x` 18 个字符是 Calibri，实测占 134.3pt
+          #   （0.71em/字），宋体只要 94.5pt（0.5em）—— 一条 run 就差 40pt。
+          #   v34 只统一了「空白 run」的字体，**文字 run 漏了**。
+          #   → F 组：文字 run 也走 CSFSIsCJKFace 统一。
+          #
+          # 【第二层】p3「中介方」折成 3 行、每行一两个字。run 序列是
+          #   中介方：|43 空格|<w:tab pos=4513>|3 空格|经纪人：|22 空格
+          #   空白已把「经纪人：」推到 225pt，tab 又推一次，两者相加顶爆整行。
+          #   → B 组：删掉紧跟已展开空白的 tab；T 组：段尾留白按剩余宽度自适应。
+          #
+          # 【第三层】v33 注释写着「NBSP 宽度与普通空格一致 0.5em」—— 错的。
+          #   用 Word 逐字符量位置实测（10.5pt，字体全写 SimSun）：
+          #       U+0020 普通空格  5.25pt = 0.50em
+          #       U+00A0 NBSP     10.50pt = 1.00em      ← 整整两倍
+          #   → N 组：NBSP 只用于段尾，且个数按 2:1 折半。
+          #
+          # 【收尾】p2 只超 12pt 却折出一行残字「方）」→ 差 5% 以内压留白挤进一行；
+          #   差得多则改左对齐（不压空白，保住用户要的下划线长度）。
+          #   标题段（字号 ≥ 正文 1.5 倍）强制居中，不再被红色编号带成右对齐。
+          python3 tools/rev_check_v35.py
+          python3 tools/check_v35.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail
