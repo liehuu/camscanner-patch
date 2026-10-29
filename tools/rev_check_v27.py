@@ -68,30 +68,21 @@ def main():
 
     cases = []
 
-    # 1) 复现 v25 原始缺陷：三个来源里任意一个改成「命中即 return」
+    # 1) 复现 v25 原始缺陷：任意一个来源改成「命中即 return」
     cases.append((
         'F1 来源短路（v25 原样）',
         lambda t: inject('F1', t,
-                         '    BOOL got1 = CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData");',
-                         '    if (CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData")) return;'),
+                         '        gotModel = CSFSPullOptions(mp, @"currentAIEditModel.ocrPage");',
+                         '        if (CSFSPullOptions(mp, @"currentAIEditModel.ocrPage")) return;'),
         '后面的来源成为死代码'))
 
-    # 2) 返回值不留变量
-    def inj_f2(t):
-        t = inject('F2-1', t,
-                   '    BOOL got1 = CSFSPullOptions(',
-                   '    CSFSPullOptions(')
-        if t is None:
-            return None
-        t = inject('F2-2', t,
-                   '        got2 = CSFSPullOptions(',
-                   '        CSFSPullOptions(')
-        if t is None:
-            return None
-        return inject('F2-3', t,
-                      '    BOOL got3 = CSFSPullOptions(',
-                      '    CSFSPullOptions(')
-    cases.append(('F2 返回值不留变量', inj_f2, '返回值没被保留'))
+    # 2) 返回值不留变量（只有调用、没人接结果 → 无法判断这份来源跑没跑过）
+    cases.append((
+        'F2 返回值不留变量',
+        lambda t: inject('F2', t,
+                         '        gotModel = CSFSPullOptions(mp, @"currentAIEditModel.ocrPage");',
+                         '        CSFSPullOptions(mp, @"currentAIEditModel.ocrPage");'),
+        '把返回值落进了变量'))
 
     # 3) OR 合并退化成直接赋值（后一份覆盖前一份）
     cases.append((
@@ -110,15 +101,19 @@ def main():
         '语义与 hide* 相反，不能取 OR'))
 
     # 4) 去掉 FINAL 汇总日志
+    #
+    # 这里的定位串也不能绑版本号：v27 写的是 "v27 opts: FINAL hideWritten="，
+    # v28 变成了 "v28 opts: ..."。按 check_v27 的 F4 判据（FINAL hideWritten=）
+    # 去找，才不会升一次版本就报「找不到 FINAL 日志串」而整例失效。
     def inj_f4(t):
-        i = t.find('"v27 opts: FINAL hideWritten=')
+        i = t.find('FINAL hideWritten=')
         if i < 0:
             print('[FAIL] F4: 找不到 FINAL 日志串')
             return None
         j = t.find(');', i)
         if j < 0:
             return None
-        return t[:i] + '"v27 opts: done"' + t[j:]
+        return t[:i] + 'done"' + t[j:]
     cases.append(('F4 缺 FINAL 汇总日志', inj_f4, '合并结果不可观测'))
 
     passed = 0

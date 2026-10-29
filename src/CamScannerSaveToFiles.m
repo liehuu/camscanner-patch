@@ -2260,6 +2260,7 @@ static BOOL gCSFSHandToResolved = NO; // handWrittenToImage 是否已有确定�
 // 这两个值不读，预览和导出就永远差一档 —— 跟段落字段读没读无关。
 // ═════════════════════════════════════════════════════════════════════
 static double  gCSFSPageScale     = 0.0;   // renderWidth / page_size.width，0 = 未知
+static const char *gCSFSPageScaleSrc = "-";  // v28：scale 从哪来的（page.scale / computed）
 static double  gCSFSPageWidth     = 0.0;   // page_size.width（原始像素）
 static double  gCSFSRenderWidth   = 0.0;
 static NSInteger gCSFSFontSizeMode  = 0;
@@ -2900,31 +2901,87 @@ static void CSFSReadOptionsFromBottomView(id bottomView) {
         CSFS_LOG(@"v24 opts: bottomView is nil");
         return;
     }
-    // v27：三个来源**全部**走一遍再合并，不再「谁先命中就返回」。
-    // 溯源顺序按「离真相的距离」排（近的在前，日志里先出现）：
-    //   ① bottomView.originalData —— 当前页，最直接，但可能是同步落后的副本
-    //   ② bottomView.context.allPages —— 编辑页中枢 CSJsonWordEditContext，
-    //      开关最终由它的 adapter 写到 page 上，这里才是真值
-    //   ③ bottomView 自己 —— 兜底
-    BOOL got1 = CSFSPullOptions(CSFSValue(bottomView, @"originalData"), @"bottomView.originalData");
+    // ═══════════════════════════════════════════════════════════════
+    // v28：真机日志定死了前四轮为什么一直读不到开关
+    //
+    // 日志证据（CSFS.log，三次导出六次输出全部一致）：
+    //     v27 stats: optKnown=0 src=(none) seen(w/s/h)=000
+    //     v24 opts: not found on CSJsonWordEditBottomView
+    // 即：三个来源一个都没拿到字段。而静态分析证明 CSOcrPage 确实有
+    // hideWrittenImage / hideStampImage / handWrittenToImage 三个属性
+    // （见 propowner.py 输出）。所以问题不是「字段在不在」，
+    // 而是「我拿到的那个对象是 nil」。
+    //
+    // 为什么 originalData 是 nil —— 用 callers_sel.py 反查 setter：
+    //     -[CSJsonWordEditBottomView setOriginalData:] 的全部调用者只有两个：
+    //         -aiBeautifyAction
+    //         -dismissAIBeautifyViewController:
+    // 也就是说，这个属性只在用户点「AI 美化」时才被赋值。
+    // 用户正常导出时它**永远是 nil**。
+    // 前四轮（v24 起）一直从这个 nil 对象读 → 读到 nil → 全是 NO。
+    // 这是「勾了跟不勾一样」的最终机制，v27 的合并也只是在合并三个 nil。
+    //
+    // 真正活着的 CSOcrPage 在这里（同一套反查链上）：
+    //     -[CSJsonWordEditModel ocrPage]        ← 返回 T@"CSOcrPage"
+    //     -[CSOcrPage setHideStampImage:] 的调用者包含
+    //         CSJsonWordEditAdapterManager -updateCategoryListViewItems...showRemoveSignet:...
+    //     即开关就是通过 model.ocrPage 这条链写下去的。
+    // 而 bottomView 上恰好有 currentAIEditModel(T@"CSJsonWordEditModel")。
+    //
+    // 所以正确顺序是：先 model.ocrPage，再 context.allPages，
+    // originalData 降到最后（它常常是 nil，但 nil 时不该耽误别人）。
+    // ═══════════════════════════════════════════════════════════════
 
-    BOOL got2 = NO;
+    // ① currentAIEditModel.ocrPage —— 最可能是活的那一份
+    BOOL gotModel = NO;
+    id model = CSFSValue(bottomView, @"currentAIEditModel");
+    if (model) {
+        id mp = CSFSValue(model, @"ocrPage");
+        gotModel = CSFSPullOptions(mp, @"currentAIEditModel.ocrPage");
+        if (!gotModel) {
+            CSFS_LOG(@"v28 opts: model=%@ but ocrPage=%@（ocrPage 也空）",
+                     NSStringFromClass([model class]), mp ? @"非空但无字段" : @"nil");
+        }
+    } else {
+        CSFS_LOG(@"v28 opts: currentAIEditModel=nil");
+    }
+
+    // ② context.allPages —— 编辑页中枢，多页时取第 0 页
+    BOOL gotPages = NO;
     id ctx = CSFSValue(bottomView, @"context");
     if (ctx) {
         id pages = CSFSValue(ctx, @"allPages");
         id page = CSFSFindPageObject(pages, 0);
-        got2 = CSFSPullOptions(page, @"context.allPages");
+        gotPages = CSFSPullOptions(page, @"context.allPages");
+        if (!gotPages) {
+            CSFS_LOG(@"v28 opts: context ok, allPages=%@（count=%lu）",
+                     pages ? @"非空" : @"nil",
+                     (unsigned long)([pages isKindOfClass:[NSArray class]]
+                                     ? [(NSArray *)pages count] : 0));
+        }
+    } else {
+        CSFS_LOG(@"v28 opts: context=nil");
     }
-    BOOL got3 = CSFSPullOptions(bottomView, @"bottomView");
 
-    if (!got1 && !got2 && !got3) {
+    // ③ bottomView.originalData —— 只有点过 AI 美化才非 nil，放最后
+    id od = CSFSValue(bottomView, @"originalData");
+    BOOL gotOrig = CSFSPullOptions(od, @"bottomView.originalData");
+    if (!od) {
+        CSFS_LOG(@"v28 opts: originalData=nil（正常现象：它只由 "
+                 @"aiBeautifyAction / dismissAIBeautifyViewController: 赋值）");
+    }
+
+    // ④ bottomView 自己（兜底，理论上是 view 不会有这些字段）
+    BOOL gotSelf = CSFSPullOptions(bottomView, @"bottomView");
+
+    if (!gCSFSOptKnown) {
         CSFS_LOG(@"v24 opts: not found on %@ shape=%@",
                  NSStringFromClass([bottomView class]), CSFSDescribeShape(bottomView));
     } else {
-        CSFS_LOG(@"v27 opts: FINAL hideWritten=%d hideStamp=%d handToImage=%d"
-                 @" (srcs: originalData=%d allPages=%d self=%d)",
+        CSFS_LOG(@"v28 opts: FINAL hideWritten=%d hideStamp=%d handToImage=%d"
+                 @" (srcs: model=%d allPages=%d originalData=%d self=%d)",
                  (int)gCSFSHideWritten, (int)gCSFSHideStamp, (int)gCSFSHandToImage,
-                 (int)got1, (int)got2, (int)got3);
+                 (int)gotModel, (int)gotPages, (int)gotOrig, (int)gotSelf);
     }
 }
 
@@ -2972,13 +3029,23 @@ static id CSFSFindPageObject(id obj, int depth) {
 static void CSFSCaptureLayoutContext(id page) {
     if (!page) { CSFS_LOG(@"v25 layout: page nil, scale unknown"); return; }
     @try {
+        // ── v28：优先直接读 page.scale ────────────────────────────────
+        //
+        // 之前一直自己算 renderWidth / page_size.width，
+        // 真机日志里全程 scale=0.0000 —— 说明这两条都取空，
+        // 于是所有缩进退化成 px@200dpi 估值，排版必然不像。
+        //
+        // 静态分析（propowner.py 输出）证明 CSOcrPage 自己就有：
+        //     scale       [Td,N,V_scale]      ← App 算好的渲染缩放比
+        //     renderWidth [Td,N,V_renderWidth]
+        //     page_size   [T@"CSOcrPageSize",C,N,V_page_size]
+        // 有现成的就别自己推。先读 scale，失败再退回自算。
         double rw = CSFSDoubleValue(CSFSValue(page, @"renderWidth"));
         double pw = 0.0;
         id ps = CSFSValue(page, @"page_size");
         if (ps) {
-            // page_size 在 App 里是 CSISize 模型，不是 NSValue/NSDictionary。
-            // 反汇编 -[CSOcrPage scale] 里取的是 page_size.width（getter），
-            // 所以先试 width 方法，再试字典键，两条路够覆盖。
+            // page_size 是 CSOcrPageSize 模型（不是 NSValue / NSDictionary），
+            // 取的是 width getter；字典分支只作兼容。
             if ([ps respondsToSelector:@selector(width)]) {
                 pw = [(NSNumber *)[ps performSelector:@selector(width)] doubleValue];
             }
@@ -2988,9 +3055,19 @@ static void CSFSCaptureLayoutContext(id page) {
                 pw = CSFSDoubleValue(w);
             }
         }
+
+        double s = CSFSDoubleValue(CSFSValue(page, @"scale"));
+        const char *src = "page.scale";
+        if (!(s > 0))
+        {
+            // scale 属性拿不到时的退路：自己算，但日志里标出来。
+            src = "computed";
+            if (rw > 0 && pw > 0) s = rw / pw;
+        }
         gCSFSRenderWidth = rw;
         gCSFSPageWidth   = pw;
-        if (rw > 0 && pw > 0) gCSFSPageScale = rw / pw;
+        gCSFSPageScale   = (s > 0) ? s : 0.0;
+        gCSFSPageScaleSrc = src;
 
         // 全局偏好：影响字号和行距，缺一档就差一档
         id cs = CSFSValue(page, @"clientSettings");
@@ -2999,8 +3076,9 @@ static void CSFSCaptureLayoutContext(id page) {
             gCSFSLineSpaceMode = (NSInteger)CSFSDoubleValue(CSFSValue(cs, @"lineSpaceMode"));
             gCSFSAiBeautify    = CSFSBoolValue(CSFSValue(cs, @"aiBeautifyEnable"));
         }
-        CSFS_LOG(@"v25 layout: renderW=%.1f pageW=%.1f scale=%.4f fontSizeMode=%ld lineSpaceMode=%ld aiBeautify=%d",
-                 rw, pw, gCSFSPageScale,
+        CSFS_LOG(@"v28 layout: renderW=%.1f pageW=%.1f scale=%.4f from=%s"
+                 @" fontSizeMode=%ld lineSpaceMode=%ld aiBeautify=%d",
+                 rw, pw, gCSFSPageScale, gCSFSPageScaleSrc,
                  (long)gCSFSFontSizeMode, (long)gCSFSLineSpaceMode, (int)gCSFSAiBeautify);
     } @catch (NSException *e) {
         CSFS_LOG(@"v25 layout threw: %@", e.reason);
@@ -3746,6 +3824,8 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 //   所以 rFonts 必须写在 b 前面，u 必须写在 sz 后面。
 //   v19 把 rFonts 写在 color 之后、u 写在最前，两个位置都是错的。
 static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
+    // v28：缩进分支诊断只打一次，用于定死「为什么 ih 有值却没走 hanging」。
+    static BOOL indentDiagDone = NO;
     // v21：图片段优先分流。图片段只有 kCSFSParaImage，没有 runs，
     // 走下面的文字分支会产出空段落（图依旧不显示）。
     id img = [para objectForKey:kCSFSParaImage];
@@ -3786,6 +3866,18 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     else if (gCSFSFontSizeMode == 2) paraPt += 1.0;
 
     NSMutableString *pPr = [NSMutableString string];
+
+    // v28：把决定缩进分支走向的三个输入打一次。
+    // 日志里 ih=258（有悬挂缩进）却一次都没走 hanging 分支，
+    // 说明卡在 alignLeftish 或 floating 上，而不是值本身。
+    if (indentDiagDone == NO) {
+        indentDiagDone = YES;
+        CSFS_LOG(@"v28 ind branch: align=%@ leftish=%d fl=%@ il=%@ ih=%@",
+                 align ?: @"(nil)", (int)alignLeftish,
+                 [para objectForKey:kCSFSParaFloat] ?: @"(nil)",
+                 [para objectForKey:kCSFSParaIndL] ?: @"(nil)",
+                 [para objectForKey:kCSFSParaIndH] ?: @"(nil)");
+    }
 
     // 1) 制表位
     id runsObj = [para objectForKey:kCSFSParaRuns];

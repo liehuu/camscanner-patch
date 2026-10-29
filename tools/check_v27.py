@@ -20,7 +20,7 @@ check_v27.py —— v27「开关多来源合并」的静态判据。
 
 本检查器断言四件在源码里可直接判定的事：
   F1 CSFSReadOptionsFromBottomView 里三个来源都不允许出现「命中即 return」
-  F2 每个来源的返回值必须落到变量（got1/got2/got3），而不是 if(...) return
+  F2 每处来源调用都必须把返回值落进变量（不许裸调 CSFSPullOptions(...)）
   F3 合并必须是 OR 语义：gCSFSHideXxx 只能被置 YES，不能被直接赋成某一份的值
   F4 有 FINAL 汇总日志，能一眼看出三个来源各自读到什么
 
@@ -187,13 +187,28 @@ def main():
         else:
             ok('F1 三个来源都无「命中即 return」短路')
 
-        # ── F2 返回值必须落到变量
-        got = re.findall(r'\bgot[123]\s*=', body)
-        if len(got) >= 3:
-            ok('F2 三个来源的返回值都落到了变量（got1/got2/got3）')
+        # ── F2 每处来源调用都必须把返回值落进变量
+        #
+        # v27 的判据是 re.findall(r'\bgot[123]\s*=')，期望 3 处。
+        # v28 把来源重排成 model / allPages / originalData / self 四个，
+        # 变量名随之变成 gotModel/gotPages/gotOrig/gotSelf —— 判据立刻假 FAIL。
+        # 这跟 check_v24 的 E10 是同一个病：**判据绑在会变的外壳上**
+        # （v27 那次绑的是版本号字面量 'v24 stats:'，这次绑的是变量名）。
+        #
+        # 按实质写：调用了几次，就必须有几次被赋值接住。
+        # 差一处就说明有一份来源的结果被丢掉了 —— 那正是 v25 死代码的成因：
+        # 结果没落变量，调用方也就无法知道「这份到底跑没跑过」。
+        n_call = len(re.findall(r'\bCSFSPullOptions\s*\(', body))
+        n_assign = len(re.findall(
+            r'\b[A-Za-z_]\w*\s*=\s*CSFSPullOptions\s*\(', body))
+        if n_call < 3:
+            fail('F2 只找到 %d 处 CSFSPullOptions 调用，期望至少 3 个来源' % n_call)
+        elif n_assign != n_call:
+            fail('F2 %d 处来源调用里只有 %d 处把返回值落进了变量 —— '
+                 '被丢掉的返回值意味着无法判断那份来源是否真的跑过'
+                 % (n_call, n_assign))
         else:
-            fail('F2 只找到 %d 处 gotN= 赋值，期望 3 处 —— '
-                 '返回值没被保留，无法判断是否所有来源都跑过' % len(got))
+            ok('F2 %d 处来源调用全部把返回值落进了变量' % n_call)
 
         # ── F4 FINAL 汇总日志
         if re.search(r'FINAL\s+hideWritten=', body):
