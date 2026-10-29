@@ -101,13 +101,20 @@ def main():
     ))
 
     # Q3 守卫退化成「长度不为 0」—— 于是文字 run 也会被记宽度
+    #
+    # 锚点必须带上 `double sw = ...`：v33 在同一个函数里新增了一处
+    # `if (CSFSIsPureWhiteSpace(t))`（纯空白的 DIAG 日志），
+    # 只按 if 条件注入会命中 2 次 —— 注入进去的往往是 DIAG 那一处，
+    # 而真正记 width 的守卫没被改，于是用例静默失效。
     cases.append((
         'Q3',
         '守卫从「纯空白」退化成「长度不为 0」',
         'P2 记 width 的守卫里没有「纯空白」判断',
         lambda s: inject(s,
-                         'if (CSFSIsPureWhiteSpace(t)) {',
-                         'if (t.length > 0) {',
+                         'if (CSFSIsPureWhiteSpace(t)) {\n'
+                         '        double sw = CSFSDoubleValue(CSFSValue(sl, @"width"));',
+                         'if (t.length > 0) {\n'
+                         '        double sw = CSFSDoubleValue(CSFSValue(sl, @"width"));',
                          'Q3'),
     ))
 

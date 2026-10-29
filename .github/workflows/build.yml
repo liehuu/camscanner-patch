@@ -222,6 +222,39 @@ jobs:
           python3 tools/rev_check_v32.py
           python3 tools/check_v32.py src/CamScannerSaveToFiles.m
 
+          # ── v33：下划线长度仍不对 + 有的空格本来有线却没了 ────────────
+          #
+          # 真机三条样本把 width 的单位钉死了：
+          #     w=56.0 pt=10.5 → 11 个空格
+          #     w=12.0 pt=10.5 → 2 个空格
+          #     w=36.0 pt=10.5 → 7 个空格
+          # 56 ÷ 11 ≈ 5.09pt，正好是 10.5pt 字号的半角空格宽（5.25pt）。
+          # 也就是说 width 单位**就是 pt**，v32 还乘了 A4@200dpi 的 0.3597，
+          # 把长度做小 2.8 倍 —— 这就是「明显不够长」。
+          #
+          # W1   宽度直接按 pt 用，不许再出现 200dpi 折算常量
+          # W2/W3 保留「不得短于原文字符数」与上限 clamp
+          # W4   width 缺失时原样返回，不许凭空造空格
+          #
+          # F1~F5 是最隐蔽的一半：纯空白 slice 没有 style，run 里既没字体
+          # 也没下划线。没有字体 → Word 用 docDefaults 的 Calibri 画空格
+          # （0.226em，宋体是 0.5em）→ 宽度直接腰斩。所以必须：
+          #     继承相邻文字 run 的字体 → 拿不到就用全文正文字体兜底（SimSun）
+          #     且补齐动作必须排在写 XML **之前**
+          #
+          # U1~U5「本来有线却没了」：
+          #   underline 的值可能是 "single"/"thick"/"double"，而 CSFSBoolValue
+          #   只认 1/true/yes —— 这些全被判成「没有下划线」，整条填空线消失。
+          #   改用否定词黑名单；另外行尾空格的下划线会被 Word 裁掉，
+          #   必须换成 U+00A0，且只对带下划线的空白换（否则词间空格变 NBSP，
+          #   整行没有断行点）。
+          #
+          # T1/T2 填空线阈值按「宽度 ÷ 字号 ≥ 2em」判，不按空格个数 ——
+          #   个数是 OCR 给的，可能被截断。
+          # S1 空格统计必须打在渲染之后（v32 打在渲染前，日志自相矛盾）。
+          python3 tools/rev_check_v33.py
+          python3 tools/check_v33.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail
