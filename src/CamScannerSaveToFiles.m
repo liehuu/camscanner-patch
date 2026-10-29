@@ -2150,6 +2150,14 @@ static NSString *const kCSFSRunSize      = @"s";
 static NSString *const kCSFSRunBold      = @"b";
 static NSString *const kCSFSRunItalic    = @"i";
 static NSString *const kCSFSRunUnderline = @"u";
+// v32：纯空白 run 的「目标宽度」（页面像素，直接来自 slice.width）。
+//
+// 为什么必须带这个值：空格 slice 的 text 只是一个 " "，但它在预览里
+// 可能是一条横跨十几个字符宽的下划线（合同填空线）。
+// 只输出一个空格 → Word 里的下划线只有一个空格那么长，明显不够。
+// slice 自己的 width 才是这条线真正的像素宽度，所以把它带进 run，
+// 渲染时按「宽度 ÷ 单空格宽」展开成足够多的空格，下划线自然就够长了。
+static NSString *const kCSFSRunSpaceW  = @"sw";
 // 段落的键
 static NSString *const kCSFSParaRuns     = @"runs";
 static NSString *const kCSFSParaAlign    = @"jc";
@@ -2436,6 +2444,15 @@ static NSInteger gCSFSLineSpaceMode = 0;
 static BOOL    gCSFSAiBeautify    = NO;
 static NSString *gCSFSPageSrc     = nil;
 
+// v32：全篇被按 width 撑开的空白 run 数（空格 / 填空下划线）。
+// 必须放在文件级：统计日志在 CSFSWriteDocxStyled 里，不在 CSFSRenderPara 内，
+// 局部 static 取不到 —— 上一轮就是漏了这个，编译会直接报未声明。
+// 它属于「一次导出应该重新算」的状态，所以要在下面的重置里清零，
+// 否则同一进程导出两次时，第二次的统计会混进第一次的计数。
+static long gCSFSSpaceExpandRuns  = 0;
+// 上面那个的日志节流计数（每条导出最多打 3 条明细）。
+static long gCSFSSpaceExpandLogs  = 0;
+
 // v31：批次边界清零。详见 gCSFSHideWritten 上方 v31 那段注释。
 //
 // 只清「一次导出应该重新算」的状态，不动永久配置类变量。
@@ -2462,6 +2479,9 @@ static void CSFSResetOptionStateImpl(void) {
     gCSFSFontSizeMode  = 0;
     gCSFSLineSpaceMode = 0;
     gCSFSAiBeautify    = NO;
+    // v32：空格展开计数也按批次算，否则第二次导出的统计会把第一次混进来。
+    gCSFSSpaceExpandRuns = 0;
+    gCSFSSpaceExpandLogs = 0;
 }
 
 // 对外入口：带一行日志，便于在真机上确认「确实重置了」。
@@ -3788,6 +3808,33 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
         [run setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunTab];
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // v32：把 slice 的 width 带进 run —— 这是「下划线不够长」的解药。
+    //
+    // 用户反馈：
+    //   「空格带下划线的长度应该不对，预览时看到虽然没有文字，
+    //     但是下划线很长，你这个明显不够长，甚至有的本来有下划线的
+    //     空格，你只有空格。」
+    //
+    // 原因很直接：空格 slice 的 text 就是一个 " "，v31 把它原样写进
+    // Word，Word 就只画一个空格宽的下划线。但预览里那条线是
+    // **slice.width 个像素**宽 —— 合同填空线常见的十几个字符宽。
+    //
+    // 这个 width 字段一直在 JSON 里（v21 DIAG slice 的键列表就有 width），
+    // 但此前从来没被读过（全文件搜 @\"width\" 只命中一处无关代码）。
+    // 现在读出来，渲染时按「宽度 ÷ 单空格宽」展开成够多的空格，
+    // 下划线长度就与预览一致了。
+    //
+    // 只对**纯空白** run 记这个值：普通文字 run 的宽度由字体自然决定，
+    // 强行加宽反而会把字距拉坏。
+    // ═══════════════════════════════════════════════════════════════
+    if (CSFSIsPureWhiteSpace(t)) {
+        double sw = CSFSDoubleValue(CSFSValue(sl, @"width"));
+        if (sw > 0.0) {
+            [run setObject:[NSNumber numberWithDouble:sw] forKey:kCSFSRunSpaceW];
+        }
+    }
+
     return run;
 }
 
@@ -4230,9 +4277,78 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 //     → highlight → u → …
 //   所以 rFonts 必须写在 b 前面，u 必须写在 sz 后面。
 //   v19 把 rFonts 写在 color 之后、u 写在最前，两个位置都是错的。
+// ═════════════════════════════════════════════════════════════════════
+// v32：把「一个空格」撑成「预览里那么宽」。
+//
+// 用户原话：
+//   「空格带下划线的长度应该不对，预览时看到虽然没有文字，但是下划线很长，
+//     你这个明显不够长，甚至有的本来有下划线的空格，你只有空格。」
+//
+// 两件事必须同时成立才对得上预览：
+//   ① 下划线属性要带上（v31 已经修好了 text 被丢的问题，但只带一个空格）
+//   ② 空格的**个数**要按 slice.width 展开 —— 一个空格的宽度只代表
+//      「一个半角字」，而预览里那条填空线可能横跨十几个字。
+//
+// 换算链条（全部有据，不猜）：
+//   slice.width        页面像素
+//   × gCSFSPageScale   → 渲染 pt（与 App setupParaStyle 里同一个 scale）
+//   ÷ 字号(pt)         → 该字号下一个半角空格的个数
+//                        半角空格宽 ≈ 0.5 em，em = 字号 pt
+//   所以 n = 渲染pt ÷ (0.5 × 字号)
+//
+// 没有 scale 时（真机日志 scale=0.0000）退一步：按 A4 内容宽度折算。
+// 1654px ≈ A4@200dpi，与 CSFSIndentTwips 的退路保持同一口径，
+// 保证「宽度」和「缩进」两处不会各用一套比例。
+// ═════════════════════════════════════════════════════════════════════
+static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
+                                    double fontSizePt) {
+    if (text.length == 0) return text;
+
+    // 只处理「整体是空白」的 run。夹在文字中间的空格照样保留原样，
+    // 那种位置的字距由排版引擎自然分配，硬撑会把整行拉散。
+    if (!CSFSIsPureWhiteSpace(text)) return text;
+
+    // 宽度不可用就直接原样返回 —— 宁可短，也不能凭空空造出一堆空格。
+    if (!(sliceWidthPx > 0.0)) return text;
+
+    // 字号缺省时用一个安全值（11pt 是这份文档的正文档，见日志
+    // v21 defaultPt=11.0 / v23 histogram 11pt×161）。
+    if (!(fontSizePt > 2.0) || fontSizePt > 200.0) fontSizePt = 11.0;
+
+    // px → pt
+    double pt;
+    if (gCSFSPageScale > 0.0) {
+        pt = sliceWidthPx * gCSFSPageScale;
+    } else {
+        // scale 未知：按 A4@200dpi 折回，与 CSFSIndentTwips 的退路同口径
+        pt = sliceWidthPx * (595.0 / 1654.0);
+    }
+
+    // pt → 半角空格个数（半角空格宽 ≈ 0.5 em）
+    double per = fontSizePt * 0.5;
+    if (!(per > 0.1)) per = 5.5;
+    long n = (long)(pt / per + 0.5);
+
+    // 上限保护：单个 run 最多 200 个空格。
+    // 没有上限时，一旦 width 字段的单位不是像素（比如是 1/100 pt），
+    // 会算出上万个空格，整段文档直接被撑爆 —— 那比短更糟。
+    if (n < 1) n = 1;
+    if (n > 200) n = 200;
+
+    // 原有空白里如果已经不止一个字符（偶尔 OCR 直接给 "   "），
+    // 以算出来的为准，但不允许比原来少 —— 少就等于又把它弄短了。
+    if ((long)text.length > n) n = (long)text.length;
+
+    NSMutableString *s = [NSMutableString stringWithCapacity:(NSUInteger)n];
+    for (long i = 0; i < n; i++) [s appendString:@" "];
+    return s;
+}
+
 static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     // v28：缩进分支诊断只打一次，用于定死「为什么 ih 有值却没走 hanging」。
     static BOOL indentDiagDone = NO;
+    // v32：空格展开的日志计数已提到文件级（gCSFSSpaceExpandLogs），
+    // 这样第二次导出也能打到明细，而不是只有第一次。
     // v21：图片段优先分流。图片段只有 kCSFSParaImage，没有 runs，
     // 走下面的文字分支会产出空段落（图依旧不显示）。
     id img = [para objectForKey:kCSFSParaImage];
@@ -4463,12 +4579,17 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         //    v23 把它们统一到 11pt，等于改了 App 的排版，看着「更整齐」
         //    却和预览不一样 —— 这正是用户说的「还是不对」。
         id szObj = [r objectForKey:kCSFSRunSize];
+        // v32：这个 run 实际使用的字号，供下面展开空格用。
+        // 必须取「已经过 fontSizeMode 偏移后」的值 —— 否则展开出来的
+        // 空格个数会与实际字号脱节，下划线长度又对不上。
+        double runPt = 0.0;
         if (szObj && defaultPt > 2.0 && defaultPt < 200.0) {
             double sz = [szObj doubleValue];
             if (sz > 2.0 && sz < 200.0) {
                 if (gCSFSFontSizeMode == 1)      sz -= 1.0;
                 else if (gCSFSFontSizeMode == 2) sz += 1.0;
             }
+            runPt = sz;
             if (sz > 2.0 && sz < 200.0 && fabs(sz - defaultPt) > 0.1) {
                 long hp = (long)(sz * 2.0 + 0.5);
                 // 越界字号 Word 会当损坏处理，直接钳进合法区间
@@ -4477,17 +4598,42 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
                 [rPr appendFormat:@"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>", hp, hp];
             }
         }
+        // v32：run 没有自己的字号时，用全文正文档（defaultPt）参与换算。
+        if (!(runPt > 2.0) || runPt > 200.0) runPt = defaultPt;
         // 6) 下划线 —— 必须排在 sz 之后
         if ([[r objectForKey:kCSFSRunUnderline] boolValue]) {
             [rPr appendString:@"<w:u w:val=\"single\"/>"];
         }
 
+        // ═══════════════════════════════════════════════════════════
+        // v32：纯空白 run 按 slice.width 撑开 —— 让下划线长得跟预览一样。
+        //
+        // 放在这里（rPr 已经算好、<w:t> 还没写）有两个原因：
+        //   · 展开只影响文字内容，不影响格式属性，所以可以晚于 rPr；
+        //   · 但必须在 CSFSXMLEscape(text) 之前换掉 text，
+        //     否则写出去的还是一个空格。
+        // ═══════════════════════════════════════════════════════════
+        NSString *emitText = text;
+        double spaceW = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+        if (spaceW > 0.0 && CSFSIsPureWhiteSpace(text)) {
+            emitText = CSFSExpandSpaceRun(text, spaceW, runPt);
+            if (gCSFSSpaceExpandLogs < 3) {
+                gCSFSSpaceExpandLogs++;
+                CSFS_LOG(@"v32 space: w=%.1f pt=%.1f scale=%.4f → %lu 个空格"
+                         @" (原 %lu)",
+                         spaceW, runPt, gCSFSPageScale,
+                         (unsigned long)emitText.length,
+                         (unsigned long)text.length);
+            }
+            gCSFSSpaceExpandRuns++;
+        }
+
         if (rPr.length > 0) {
             [out appendFormat:@"<w:r><w:rPr>%@</w:rPr><w:t xml:space=\"preserve\">%@</w:t></w:r>",
-                rPr, CSFSXMLEscape(text)];
+                rPr, CSFSXMLEscape(emitText)];
         } else {
             [out appendFormat:@"<w:r><w:t xml:space=\"preserve\">%@</w:t></w:r>",
-                CSFSXMLEscape(text)];
+                CSFSXMLEscape(emitText)];
         }
     }
     [out appendString:@"</w:p>"];
@@ -4878,13 +5024,19 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     long hiddenBlockCount = 0;
                                     long stampSkipCount = 0;
                                     long handSkipCount = 0;
-                                    // v31：被**保留**的「stype 标 handwrit 但其实是正文」
-                                    // 的切片数。与 handSkipCount 成对出现，
-                                    // 下一轮看日志就能确认「误删」是否已经停止：
-                                    //   v30 版：handSkip=33 handKeep=0
-                                    //   v31 版：handSkip=0  handKeep=33  ← 期望
-                                    long handKeepCount = 0;
-                                    long handKeepLogCount = 0;   // 详细日志最多打 3 条，防刷屏
+                                    // v32：手写判据命中数（cat==1 或 stype 含 handwrit）。
+                                    // 与 handSkipCount 成对看，能直接判断判据找没找对：
+                                    //   handHW=0             → 判据没找到任何手写，改判据
+                                    //   handHW>0 但 skip=0   → 找到了却没删（不该发生）
+                                    //   handHW==skip         → 勾选即全删，行为正确
+                                    // 历史对照（真机）：
+                                    //   v30：handSkip=33 但没勾也删（OR 残留）
+                                    //   v31：handSkip=0 / handKeep=33（判据废掉，开关失效）
+                                    long handHWCount = 0;
+                                    // v32：不再有「保留」分支，handKeepCount /
+                                    // handKeepLogCount 已删除。勾了去除手写就一律
+                                    // 删掉，不因它有没有识别文字而区别对待 ——
+                                    // 这是本轮日志定死的语义（见下方判据块注释）。
                                     // v31：纯空白切片（空格 / 填空下划线）计数。
                                     // 这个数 > 0 才说明空格这条链真的通了。
                                     long spaceSliceCount = 0;
@@ -5187,27 +5339,73 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                             NSString *hwText = CSFSSliceText(sl);
                                                                             BOOL hasTextHW = (hwText != nil &&
                                                                                               !CSFSIsPureWhiteSpace(hwText));
-                                                                            if (catSaysHW && !hasTextHW) {
+                                                                            // ═══════════════════════════════════
+                                                                            // v32：**v31 这里改错了，本轮纠正回来。**
+                                                                            //
+                                                                            // v31 的理由是「日志里 33 条全是 cat=0，
+                                                                            // 而真手写图应该带 image_category=1」，
+                                                                            // 于是把 stype 判据整个废掉。
+                                                                            // 但真机日志（v31，三次导出）推翻了它：
+                                                                            //
+                                                                            //   v29 runs=123 （空格被丢，手写保留）
+                                                                            //   v30 runs=90  + handSkip=33 = 123
+                                                                            //   v31 runs=170 = 123 + spaceSlices47
+                                                                            //   且 v31 handSkip=0 / handKeep=33
+                                                                            //
+                                                                            // 170 = 90 + 47 + 33 三版数字严丝合缝：
+                                                                            // **那 33 条就是手写内容本身**，v30 删得对，
+                                                                            // 错的是它「没勾也删」（OR 残留，v31 已修）。
+                                                                            // v31 把判据废掉 → 手写开关彻底失效，
+                                                                            // 用户原话「去除手写选择了不生效」。
+                                                                            //
+                                                                            // 另一个决定性事实：日志里
+                                                                            //   v21 DIAG slice dict(11){mathml,img,height,
+                                                                            //     style,break_line,position,preview_info,
+                                                                            //     text,stype,add_tabstop,width}
+                                                                            // **slice 层根本没有 image_category 字段**，
+                                                                            // 所以 slCat==1 永远为假 ——
+                                                                            // v31 的判据是「永远不成立」的死条件。
+                                                                            //
+                                                                            // 正确判据（任一成立即手写）：
+                                                                            //   ① image_category == 1（有该字段时，权威）
+                                                                            //   ② stype 含 handwrit（slice 层唯一的实证信号）
+                                                                            // 但**都要求这段没有真正的正文文字**：
+                                                                            // 手写转文字后 text 已填好、且用户没勾「手写保留成图」，
+                                                                            // 那时文字优先，不算手写图。
+                                                                            //
+                                                                            // 例外：纯空白不算「正文文字」。
+                                                                            // 手写填空处常被识别成空格 + 下划线，
+                                                                            // 那是手写的痕迹而不是正文 —— 勾了去手写就该删。
+                                                                            // ═══════════════════════════════════
+                                                                            BOOL looksHW = (catSaysHW || stypeSaysHW);
+                                                                            if (looksHW) {
+                                                                                handHWCount++;
+                                                                                // ═══════════════════════════════════
+                                                                                // 勾了「去除手写」→ 这段就该消失，**不看它有没有
+                                                                                // 识别文字**。这一点是本轮日志定死的：
+                                                                                //
+                                                                                // 那 33 条实战全是 hasText=1 的（手写填空被
+                                                                                // 识别成了文字）。若在这里用「有文字就保留」，
+                                                                                // 它们就会被全部 KEEP，开关等于没接 ——
+                                                                                // 这正是 v31 的表现（handSkip=0, handKeep=33）。
+                                                                                // 用户原话「去除手写选择了不生效」即此。
+                                                                                //
+                                                                                // 用户勾的语义是「把手写内容从结果里去掉」，
+                                                                                // 不是「把手写换成文字」。文字优先是**不勾**时的
+                                                                                // 默认行为（v22 的规则），不能盖过用户的显式选择。
+                                                                                //
+                                                                                // gCSFSHandToImage（手写保留成图）同样是要去掉文字，
+                                                                                // 所以两种情况都删，只是日志里分开标。
+                                                                                // ═══════════════════════════════════
                                                                                 handSkipCount++;
-                                                                                CSFS_LOG(@"v31 hideWritten: skip HW slice "
-                                                                                         @"(cat=%ld stype=%@ noText=1) —— 真手写图",
-                                                                                         (long)slCat, stLow ?: @"(nil)");
+                                                                                CSFS_LOG(@"v32 hideWritten: skip HW slice "
+                                                                                         @"(stype=%@ cat=%ld hasText=%d "
+                                                                                         @"handToImg=%d) —— 勾选即去除",
+                                                                                         stLow ?: @"(nil)",
+                                                                                         (long)slCat,
+                                                                                         (int)hasTextHW,
+                                                                                         (int)gCSFSHandToImage);
                                                                                 continue;
-                                                                            }
-                                                                            if (stypeSaysHW && !catSaysHW) {
-                                                                                // stype 说 handwrit 但 image_category 不是
-                                                                                // HANDWRITTEN —— 这是正文文字（手写体文档），
-                                                                                // 记为「保留」，并打日志以便下一轮核对。
-                                                                                handKeepCount++;
-                                                                                if (handKeepLogCount < 3) {
-                                                                                    handKeepLogCount++;
-                                                                                    CSFS_LOG(@"v31 hideWritten: KEEP slice "
-                                                                                             @"stype=%@ cat=%ld hasText=%d "
-                                                                                             @"—— stype 标 handwrit 但这是正文文字",
-                                                                                             stLow ?: @"(nil)",
-                                                                                             (long)slCat,
-                                                                                             (int)hasTextHW);
-                                                                                }
                                                                             }
                                                                         }
                                                                         if (CSFSBoolValue(CSFSValue(sl, @"hiding"))) {
@@ -5570,18 +5768,20 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         // optKnown=0 说明面板状态压根没读到 ——
                                         // 那时 hideStamp/hideWritten 一定是 0，
                                         // 不能据此认为「用户没勾」，要单独看 opts 那行。
-                                        CSFS_LOG(@"v31 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
+                                        CSFS_LOG(@"v32 stats: optKnown=%d src=%@ hideWritten=%d hideStamp=%d"
                                                  @" handToImage=%d seen(w/s/h)=%d%d%d | hiddenBlock=%ld"
-                                                 @" stampSkip=%ld handSkip=%ld handKeep=%ld"
-                                                 @" spaceSlices=%ld tabRuns=%ld paras=%lu",
+                                                 @" stampSkip=%ld handHW=%ld handSkip=%ld"
+                                                 @" spaceSlices=%ld spaceExpanded=%ld"
+                                                 @" tabRuns=%ld paras=%lu",
                                                  (int)gCSFSOptKnown, gCSFSOptSrc ?: @"(none)",
                                                  (int)gCSFSHideWritten, (int)gCSFSHideStamp,
                                                  (int)gCSFSHandToImage,
                                                  (int)gCSFSSeenWritten, (int)gCSFSSeenStamp,
                                                  (int)gCSFSSeenHandTo,
                                                  hiddenBlockCount, stampSkipCount,
-                                                 handSkipCount, handKeepCount,
-                                                 spaceSliceCount, tabRunCount,
+                                                 handHWCount, handSkipCount,
+                                                 spaceSliceCount, gCSFSSpaceExpandRuns,
+                                                 tabRunCount,
                                                  (unsigned long)styledParas.count);
                                         if (firstStyled) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);

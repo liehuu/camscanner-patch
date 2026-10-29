@@ -188,8 +188,39 @@ jobs:
           #   日志 33 次跳过全是 cat=0；OCR 对手写体文档的**正文文字**
           #   也标 handwritten。H3 不用正则猜写法，而是把 continue
           #   在「cat≠1 且有文字」场景下**真的求值一遍**，见 rev_check_v31 的 F1~F3。
+          #
+          #   ⚠ 该结论在 v32 被真机数据推翻，H 组已从 check_v31 撤掉，
+          #     迁到 check_v32 按行为重判（理由见下面 v32 段）。
           python3 tools/rev_check_v31.py
           python3 tools/check_v31.py src/CamScannerSaveToFiles.m
+
+          # v32：v31 真机反馈的两个缺陷 —— 一个是我上一轮改错了方向，
+          #      一个是宽度字段从来没被读过。
+          #
+          # 【一】「去除手写选择了不生效，但是去除印章选择了是生效的」
+          #   三次导出的 runs 数字三版严丝合缝：
+          #     v29 runs=123            （空格被丢，手写保留）
+          #     v30 runs=90 + handSkip=33 = 123
+          #     v31 runs=170 = 123 + spaceSlices47，handSkip=0 / handKeep=33
+          #   170 = 90 + 47 + 33 → 那 33 条 stype=handwritten cat=0 的 slice
+          #   **就是手写内容本身**。v30 删得对，错的只是「没勾也删」；
+          #   v31 把判据整个废掉，于是开关彻底失效。
+          #   另：日志 v21 DIAG slice dict(11) 的键里根本没有 image_category，
+          #   所以 v31 的 slCat==1 是恒假的死条件 —— 一条永远不成立的判据，
+          #   等于把「开关失效」写成了「合规」。
+          #   H1/H2/H3 不用正则，改成把 continue 在三种场景下真的求值：
+          #     勾了+stype命中   → 必须删
+          #     勾了+cat=1       → 必须删
+          #     没勾             → 一条都不许删
+          #
+          # 【二】「带下划线的空格，你只有空格，下划线明显不够长」
+          #   空格 slice 的 text 就是一个 " "，真正的宽度在 slice.width 里，
+          #   而该字段此前**从来没被读过**。v32 把它带进 run（kCSFSRunSpaceW），
+          #   渲染时按「宽度 pt ÷ 半角空格宽」展开成足够多的空格。
+          #   P4/P5/P6 是这次最容易踩的三种翻车：没有上限 clamp（width 单位若错
+          #   会算出上万空格把文档撑爆）、展开后反而更短、width 缺失时凭空造空格。
+          python3 tools/rev_check_v32.py
+          python3 tools/check_v32.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |

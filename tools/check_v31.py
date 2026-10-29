@@ -61,18 +61,24 @@ Manager 明明给了 0，merged 还是 1。用户看到的就是「选不选都�
   R4 重置必须同时清 scale / layout —— 换页换文档后分母会变
 
 ────────────────────────────────────────────────────────────────────
-【问题三】stype=handwritten 不能当作「手写图」的判据
+【问题三】stype=handwritten 的判据 —— 本节已撤销，改由 check_v32.py 负责
 ────────────────────────────────────────────────────────────────────
-这是 v30 引入的过度删除，与问题二叠加成「选不选都删」的表象：
-日志里 33 次跳过全部是 `stype=handwritten cat=0`。
-cat=0 意味着 image_category 为空 —— 真正的印章/手写**图**会带
-image_category=STAMP/HANDWRITTEN。所以这 33 条是**正文文字**，
-只是 OCR 把「手写体文档」识别出的文字也标成 handwritten 而已。
+v31 曾在这里断言「stype 含 handwrit 但 cat≠1 的必须保留」，
+依据是「日志里 33 次跳过全是 cat=0，真手写图应带 image_category=1」。
 
-判据：
-  H1 手写过滤必须在 image_category==1 且「无识别文字」时才删
-  H2 stype 含 handwrit 但 image_category 不是 1 时，必须**保留**
-  H3 不许出现「仅凭 stype 含 handwrit 就 continue」的写法
+**这个依据是错的，v32 已纠正。** 真机三点定位（v31 三次导出的 runs）：
+    v29 runs=123            （空格被丢，手写保留）
+    v30 runs=90 + handSkip=33 = 123
+    v31 runs=170 = 123 + spaceSlices47，且 handSkip=0 / handKeep=33
+170 = 90 + 47 + 33 三版数字严丝合缝 —— 那 33 条就是**手写内容本身**，
+v30 删得对，错的是它「没勾也删」（OR 残留，v31 已修）。
+v31 把判据废掉，于是手写开关彻底失效（用户原话「去除手写选择了不生效」）。
+另一个决定性事实：日志里 `v21 DIAG slice dict(11)` 的键列表
+**根本没有 image_category**，所以 v31 的 `slCat == 1` 是恒假的死条件。
+
+→ 保留一条永远不成立的判据，等于把「开关失效」写成了「合规」。
+   本文件因此只保留问题一（空格）与问题二（批次清零）的判据，
+   手写判据迁到 check_v32.py，按**行为**判定（见该文件说明）。
 
 用法：python3 tools/check_v31.py src/CamScannerSaveToFiles.m
 """
@@ -577,96 +583,13 @@ def main():
             ok('R4 版式上下文（scale/宽度/字号档/行距档/AI美化）全部被清')
 
     # ══════════════════════════════════════════════════════════════
-    # 问题三：stype=handwritten 不能当手写图判据
-    # ══════════════════════════════════════════════════════════════
+    # 问题三（手写判据）已迁出本文件 —— 见文件头说明。
     #
-    # 找手写过滤块：if (gCSFSHideWritten) { ... }
-    m_hand = re.search(r'if\s*\(\s*gCSFSHideWritten\s*\)\s*\{', src)
-    if not m_hand:
-        fail('H1 找不到 `if (gCSFSHideWritten) {` 手写过滤块')
-    else:
-        i = src.find('{', m_hand.start())
-        depth = 0
-        j = i
-        while j < len(src):
-            c = src[j]
-            if c in '"\'':
-                q = c
-                j += 1
-                while j < len(src):
-                    if src[j] == '\\':
-                        j += 2
-                        continue
-                    if src[j] == q:
-                        break
-                    j += 1
-            elif c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        hbody = strip_comments(src[i:j + 1])
-
-        # H1：必须有 image_category==1 的精确判据
-        if 'slCat == 1' not in hbody:
-            fail('H1 手写过滤里没有 image_category==1 的判据 —— '
-                 'App 的 -[CSOcrPageSegment customImageCategoryType] 才是权威口径')
-        else:
-            ok('H1 手写过滤以 image_category==1 为首要判据')
-
-        # H1b：必须有「有文字就不删」这一关
-        if 'hasTextHW' not in hbody and 'CSFSSliceText' not in hbody:
-            fail('H1 手写过滤没有「有识别文字就不删」这一关 —— '
-                 '手写转文字后 stype 仍是 handwrite 但 text 已填好，那是正文')
-        else:
-            ok('H1 手写过滤会先看有没有识别文字（有文字即正文，不删）')
-
-        # H2：stype 含 handwrit 但 cat 不是 1 → 必须保留
-        if 'stypeSaysHW' not in hbody:
-            fail('H2 没有区分「stype 说 handwrit」与「image_category 说 HANDWRITTEN」—— '
-                 '日志里 33 次跳过全是 stype=handwritten cat=0，'
-                 '这些是手写体文档的**正文文字**，不能删')
-        elif 'handKeepCount' not in hbody:
-            fail('H2 保留了正文但没有计数（缺 handKeepCount）—— '
-                 '下一轮日志无法确认误删是否停止')
-        else:
-            ok('H2 stype 标 handwrit 但 cat≠1 的被保留并单独计数')
-
-        # H3：不许出现「仅凭 stype 含 handwrit 就 continue」的写法
-        #
-        # ★ 判据不再是正则，而是**把这个 continue 真的算一遍**：
-        #   构造「stype 说 handwrit / cat≠1 / 有文字」这个安全场景，
-        #   如果某个 continue 在该场景下会执行 → 正文被删 → 判红。
-        # 这样写的好处：不论条件写成 `a && b`、`b && a`、拆成两层 if、
-        # 还是变量改名，行为不变则结论不变。
-        unsafe = []
-        for pos, chain in deleting_continues(hbody):
-            hit = True
-            for cond in chain:
-                try:
-                    py, _ = objc_cond_to_py(cond, UNSAFE_SCENARIO)
-                    if not bool(eval(py, {'__builtins__': {}}, {})):
-                        hit = False
-                        break
-                except Exception:
-                    # 翻不动就退回保守判断：条件里若含最外层可独立成立的
-                    # handwrit 分支，视为不安全（宁可报出来人工看）
-                    hit = or_branch_lets_alone(cond, 'handwrit')
-                    if not hit:
-                        break
-            if hit:
-                unsafe.append((pos, chain))
-
-        if unsafe:
-            pos, chain = unsafe[0]
-            snippet = hbody[max(0, pos - 120):pos + 20].replace('\n', ' ')
-            fail('H3 存在「正文会被误删」的 continue —— 构造场景'
-                 '「stype=handwritten / image_category≠1 / 有识别文字」时它会执行。'
-                 '这正是 v30 误删 33 段正文的原因。位置：…%s…' % snippet[-130:])
-        else:
-            ok('H3 在「stype=handwrit 但 cat≠1 且有文字」场景下不会误删')
+    # v31 曾在此断言「stype 含 handwrit 但 cat≠1 必须保留」，
+    # 而那是基于错误推导的结论（详见文件头）。保留它等于把
+    # 「去除手写开关失效」登记成合规行为，所以整节删除，
+    # 改由 check_v32.py 按行为判定。
+    # ══════════════════════════════════════════════════════════════
 
     print('=== check_v31 ===')
     for m in oks:

@@ -279,68 +279,12 @@ def main():
     ))
 
     # ══════════════════════════════════════════════════════════════
-    # 问题三：手写判据
-    # ══════════════════════════════════════════════════════════════
-
-    # ── H1 删掉 image_category 判据 ──────────────────────────────
-    cases.append((
-        'H1',
-        '手写过滤删掉 slCat == 1（退回「凭 stype 就删」）',
-        'H1 手写过滤里没有 image_category==1 的判据',
-        lambda s: inject(
-            s,
-            '                                                                            BOOL catSaysHW  = (slCat == 1);\n',
-            '                                                                            BOOL catSaysHW  = NO;\n',
-            'H1'),
-    ))
-
-    # ── H3 退回 v30 的 OR 写法 ───────────────────────────────────
+    # 问题三（手写判据）的注入用例已迁到 rev_check_v32.py。
     #
-    # 这是**唯一真正导致 33 段正文消失**的形态，必须实打实抓到。
-    # 注意它把整个过滤块改写为单层 if + continue，
-    # 所以注入后 A_HAND_TAIL 也会被替换掉 —— 一并给出完整新块。
-    def d3_or_form(s):
-        new_block = (
-            '                                                                        if (gCSFSHideWritten) {\n'
-            '                                                                            BOOL catSaysHW  = (slCat == 1);\n'
-            '                                                                            BOOL stypeSaysHW =\n'
-            '                                                                                (stLow.length > 0 &&\n'
-            '                                                                                 [stLow containsString:@"handwrit"]);\n'
-            '                                                                            if (catSaysHW || stypeSaysHW) {\n'
-            '                                                                                handSkipCount++;\n'
-            '                                                                                continue;\n'
-            '                                                                            }\n'
-            '                                                                        }\n'
-            '                                                                        if (CSFSBoolValue(CSFSValue(sl, @"hiding"))) {\n'
-        )
-        i = s.find(A_HAND_HEAD)
-        if i < 0:
-            print('  [BAD ] D3 找不到手写过滤块起点')
-            return None
-        # 找块尾：从起点起按花括号配平
-        b = s.find('{', i + A_HAND_HEAD.index('{'))
-        depth = 0
-        j = b
-        while j < len(s):
-            if s[j] == '{':
-                depth += 1
-            elif s[j] == '}':
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if j >= len(s):
-            print('  [BAD ] D3 手写过滤块花括号不配平')
-            return None
-        # 把整块替换成 OR 写法
-        return s[:i] + new_block + s[j + 1:]
-
-    cases.append((
-        'H3',
-        '手写过滤退回 v30 的 OR 写法（cat || stype → continue）',
-        'H3 存在「正文会被误删」的 continue',
-        d3_or_form,
-    ))
+    # 原因：v31 在这里断言「stype 含 handwrit 但 cat≠1 必须保留」，
+    # 而真机 runs 数字证明那 33 条就是手写内容本身。继续保留这些
+    # 用例，等于反向验证在替一个**错误的语义**护航 —— 比没有检查更糟。
+    # ══════════════════════════════════════════════════════════════
 
     bad = 0
     for tag, desc, expect, fn in cases:
@@ -367,65 +311,7 @@ def main():
                 if '[FAIL]' in l or 'OK ' in l:
                     print('           ' + l.strip()[:150])
 
-    # ══════════════════════════════════════════════════════════════
-    # F1 正向求值自检：确认 H3 的求值器真的会算出「会删」
-    # ══════════════════════════════════════════════════════════════
-    #
-    # 如果 UNSAFE_SCENARIO / HASTEXT 之类的占位符没对上，
-    # H3 的 eval 会总是 False → 永远绿 → 假检查。
-    # 所以这里**直接调用 check_v31 内部的函数**喂它 v30 的形态。
-    print('\n--- F1 H3 求值器自检 ---')
-    try:
-        sys.path.insert(0, HERE)
-        import importlib
-        cv31 = importlib.import_module('check_v31')
-        v30_cond = ('gCSFSHideWritten && (catSaysHW || stypeSaysHW)')
-        py, _ = cv31.objc_cond_to_py(v30_cond, cv31.UNSAFE_SCENARIO)
-        val = bool(eval(py, {'__builtins__': {}}, {}))
-        if val:
-            print('  [HIT ] F1 v30 条件在「cat=0/有文字」场景下求值为 True（会删）')
-            print('         py = %s' % py)
-        else:
-            bad += 1
-            print('  [MISS] F1 v30 条件居然求值为 False —— H3 求值器已坏，'
-                  'H3 会永远绿')
-            print('         py = %s' % py)
-
-        # 再验一遍 v31 的真实条件在安全场景下必须是 False（不删）
-        v31_cond = 'catSaysHW && !hasTextHW'
-        py2, _ = cv31.objc_cond_to_py(v31_cond, cv31.UNSAFE_SCENARIO)
-        val2 = bool(eval(py2, {'__builtins__': {}}, {}))
-        if not val2:
-            print('  [HIT ] F2 v31 条件在安全场景下求值为 False（不删）')
-        else:
-            bad += 1
-            print('  [MISS] F2 v31 条件求值为 True —— 求值器把安全场景误判成删')
-            print('         py = %s' % py2)
-
-        # F3：cat=1 且**真的没文字** → v31 必须删（真手写图要被去掉）
-        #
-        # 注意场景不能沿用 UNSAFE_SCENARIO：那里 catSaysHW=False（cat≠1），
-        # 光这一项就足以让 `catSaysHW && !hasTextHW` 恒假，
-        # 于是「无文字」这个变量根本没被真正检验到 —— 写错场景的用例
-        # 会给出一个看着像通过、其实什么都没验的结论。
-        sc = dict(cv31.UNSAFE_SCENARIO)
-        sc['catSaysHW'] = True
-        sc['slCat'] = 1
-        sc['hasTextHW'] = False
-        py3, _ = cv31.objc_cond_to_py(v31_cond, sc)
-        val3 = bool(eval(py3, {'__builtins__': {}}, {}))
-        if val3:
-            print('  [HIT ] F3 cat=1 且无文字时 v31 条件为 True（真手写图会被删，正确）')
-        else:
-            bad += 1
-            print('  [MISS] F3 cat=1 且无文字时 v31 条件仍为 False —— '
-                  '说明真手写图也删不掉了，功能反向失效')
-            print('         py = %s' % py3)
-    except Exception as e:
-        bad += 1
-        print('  [BAD ] F1 求值器自检抛异常：%r' % e)
-
-    total = len(cases) + 3
+    total = len(cases)
     print('\n反向验证：%d/%d 命中' % (total - bad, total))
     return 1 if bad else 0
 
