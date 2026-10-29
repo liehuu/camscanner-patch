@@ -180,6 +180,50 @@ def main():
 
     print("== 1. 取当前分支 head ==")
     parent = None
+
+    # ── 推送前拦截「新增文件没被 add」─────────────────────────────────
+    #
+    # 真实事故（2026-10-28，v27）：
+    #   本地新建了 tools/check_v27.py / tools/rev_check_v27.py 和 gate_local.py，
+    #   但只 `git add` 了 gate_local.py，另两个一直是 `??`。
+    #   --from-head 取的是 `git ls-tree HEAD`，未跟踪文件根本不在清单里，
+    #   于是 push 成功、CI 起来、跑到 rev_check_v27.py 报
+    #     can't open file '.../rev_check_v27.py': No such file or directory
+    #   而 build.yml 里明明引用了它 —— 整轮 5 分钟白跑。
+    #
+    #   这类失败不是「代码错」，是「交付清单不全」，编译器与门禁都拦不住，
+    #   因为本地文件确实存在、本地门禁确实能跑通。必须在推送这一步拦。
+    #
+    # 判据：工作区里任何未跟踪（??）或被改但未 add 的文件，
+    #        只要后面 CI 真的会用到，就拒绝推送。这里简化成：
+    #        有未跟踪文件就警告并列出；若其中被 .github/workflows 引用则直接失败。
+    try:
+        porcelain = git("status", "--porcelain").decode("utf-8", "replace")
+        untracked = [ln[3:].strip() for ln in porcelain.splitlines()
+                     if ln.startswith("??")]
+        if untracked:
+            print("   注意：工作区有 %d 个未跟踪文件（不会进入本次推送）：" % len(untracked))
+            for u in untracked:
+                print("     ?? %s" % u)
+            # 检查是不是 CI 会引用的 tools/*.py
+            referenced = set()
+            wf = ".github/workflows/build.yml"
+            if os.path.isfile(wf):
+                for ln in open(wf, encoding="utf-8"):
+                    if "tools/" in ln and "python3" in ln:
+                        for tok in ln.split():
+                            if tok.startswith("tools/"):
+                                referenced.add(tok.rstrip())
+            blocked = [u for u in untracked if u.replace("\\", "/") in referenced]
+            if blocked:
+                print("ERROR: 下列未跟踪文件被 build.yml 引用，但它们没被 git add，"
+                      "推送后 CI 会报 can't open file：", file=sys.stderr)
+                for b in blocked:
+                    print("   %s" % b, file=sys.stderr)
+                print("请先 `git add` 再重试。", file=sys.stderr)
+                return 1
+    except Exception as e:  # noqa: BLE001
+        print("   （未跟踪文件检查跳过：%s）" % e)
     try:
         st, ref = gh.req("GET", "/repos/%s/git/ref/heads/%s" % (args.repo, args.branch), ok=(200, 404))
         if st == 200:
