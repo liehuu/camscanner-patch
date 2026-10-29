@@ -257,6 +257,22 @@ def main():
                     if t in ppr_tags:
                         ppr_seq.append(t)
             elif var != out_var:
+                # v34：rPr 容器不参与 pPr 排序。
+                #
+                # <w:spacing> 在 OOXML 里是**两个不同元素**：
+                #   CT_PPrBase/spacing  → 段落行距
+                #   CT_RPr/spacing      → 字符间距（letter-spacing）
+                # 二者同名、位置规则也各有一套。v34 给空白 run 加了字符间距，
+                # 于是 rPr 变量里出现 <w:spacing>，被这里按「变量里只要出现
+                # pPr 专属标签就整段参与排序」收进了 pPr 序列，报出
+                #   <ind> 排在 <spacing> 之后
+                # 这是一条**假阳性** —— 段落属性一点没错，错的是判据把
+                # run 的属性算进了段落。
+                #
+                # 这正是本项目反复栽的那个坑：按「代码长什么样」归类，
+                # 而不按「输出里这个元素属于谁」归类。
+                if 'rpr' in var.lower() and 'ppr' not in var.lower():
+                    continue
                 # 变量形态：只要这个变量里出现了 pPr 专属标签，就整段参与排序
                 hits = [t for t in tags_in(lit) if t in ppr_tags]
                 if hits:

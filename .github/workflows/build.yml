@@ -249,11 +249,36 @@ jobs:
           #   必须换成 U+00A0，且只对带下划线的空白换（否则词间空格变 NBSP，
           #   整行没有断行点）。
           #
-          # T1/T2 填空线阈值按「宽度 ÷ 字号 ≥ 2em」判，不按空格个数 ——
-          #   个数是 OCR 给的，可能被截断。
+          # T0（原 T1/T2 已删）：v33 曾按「宽度 ÷ 字号 ≥ 2em」猜填空线，
+          #   该判据已被真机证伪 —— 签字区的排版留白宽度远超 2em，
+          #   被画成假下划线。现在只守「不许再用 em 阈值」这一条。
           # S1 空格统计必须打在渲染之后（v32 打在渲染前，日志自相矛盾）。
           python3 tools/rev_check_v33.py
           python3 tools/check_v33.py src/CamScannerSaveToFiles.m
+
+          # ── v34：修「不该有线的地方有线」与「空格下划线还是不够长」──
+          #
+          # 【假下划线】v33 用「宽度 ÷ 字号 ≥ 2em」猜填空线。把 v32/v33 导出的
+          #   同一份文档逐条对齐：空白 run 都是 47 个，带下划线的从 21 涨到 26，
+          #   多出来的 5 条全在合同末尾签字区（prev/next 是「董瀚霖/乙方：」
+          #   「地址：/电话：」「9845254499/电话：」），那是把「乙方：」
+          #   「电话：」推到行右侧的排版留白，宽度当然远超 2em。
+          #   → 下划线只允许来自 slice 自带的 font_attribute.underline（H 组）。
+          #
+          # 【长度不够】同一份 XML 里 47 个空白 run 有 43 个写着
+          #   w:ascii="Calibri"。空格是 U+0020，Word 严格按 w:ascii 取字形：
+          #     Calibri 0.226em × 10.5pt = 2.37pt
+          #     宋体    0.500em × 10.5pt = 5.25pt      差 2.2 倍
+          #   按 0.5em 算出 11 个空格，Word 里只占 26pt，而 slice.width 是 56pt。
+          #   v33 的兜底只在 face 为空时触发，face 是 "Calibri" 时一次都没跑到
+          #   （日志 fillBody 恒为 0）—— 兜底把错误本身藏起来了。
+          #   → 判据改成「这个字体撑不撑得住 0.5em」（V 组）。
+          #
+          # 【宽度精度】个数改 floor 向下取整，余量用 <w:spacing> 摊到每个字符上，
+          #   误差压到 1 twip；<w:spacing> 必须排在 <w:sz> 之前（CT_RPr sequence）。
+          #   另加内容区宽度上限 —— 18pt×56 空格 = 504pt > 451pt 会把段落撑爆。
+          python3 tools/rev_check_v34.py
+          python3 tools/check_v34.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |

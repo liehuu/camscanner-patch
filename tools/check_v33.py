@@ -260,41 +260,39 @@ def main():
             else:
                 ok('F1 渲染前对整段 runs 做了空白补齐')
 
-        # F2：从邻居继承 face
+        # F2：空白 run 的字体必须真的写进 run
         #
-        # 判据必须绑「sf 是从 src 取的、并且真的写进了 run」这条数据流，
-        # 不能只 grep "forKey:kCSFSRunFace" —— 兜底分支里也有一处写 face，
-        # 两处混在一起时，删掉继承那条照样能 grep 到（这就是假通过）。
-        m_sf = re.search(r'(\w+)\s*=\s*\[\s*src\s+objectForKey\s*:\s*kCSFSRunFace\s*\]', fix)
-        if not m_sf:
-            fail('F2 没有从相邻文字 run（src）读字体 —— 空白 run 拿不到 face')
+        # v33 的写法是「从邻居 src 继承 face」，v34 改成了「不是中文字体
+        # 就覆盖成 wideFace」—— 因为实机导出的 XML 里空白 run 自带
+        # w:ascii="Calibri"，根本不进「空才继承」那条分支。
+        #
+        # 写法变了，本质要求没变：算出来的字体名必须 setObject 到
+        # kCSFSRunFace，否则 Word 仍按 docDefaults 的 Calibri 渲染空格。
+        # 所以这里断言「有统一出口变量，且它被写进 run」，
+        # 不再规定这个变量是怎么来的。
+        m_wf = re.search(r'NSString\s*\*\s*(\w+)\s*=\s*gCSFSBodyFace\s*;', fix)
+        if not m_wf:
+            fail('F2 没有从 gCSFSBodyFace 派生「空白专用字体」变量 —— '
+                 '空白 run 的字体没有统一出口，各处会各写一个')
         elif not re.search(r'setObject\s*:\s*%s\s+forKey\s*:\s*kCSFSRunFace'
-                           % re.escape(m_sf.group(1)), fix):
-            fail('F2 读到了邻居字体却没有写进 run（sf 未被 setObject）—— '
-                 'Word 仍会用 docDefaults 的 Calibri 渲染空格')
+                           % re.escape(m_wf.group(1)), fix):
+            fail('F2 字体变量算出来了（%s）却没有 setObject 进 run —— '
+                 'Word 仍会用 docDefaults 的 Calibri 渲染空格，长度腰斩'
+                 % m_wf.group(1))
         else:
-            ok('F2 会把相邻文字 run 的字体继承给空白 run（%s → kCSFSRunFace）'
-               % m_sf.group(1))
+            ok('F2 空白 run 的字体走统一出口（%s → kCSFSRunFace）'
+               % m_wf.group(1))
 
-        # F3：绝不允许留空
-        m_df = re.search(r'NSString\s*\*\s*(\w+)\s*=\s*([^;]+);', fix)
-        df_ok = False
-        dfname = None
-        for mm in re.finditer(r'NSString\s*\*\s*(\w+)\s*=\s*([^;]+);', fix):
-            expr = mm.group(2)
-            if 'gCSFSBodyFace' in expr and 'SimSun' in expr:
-                dfname = mm.group(1)
-                if re.search(r'setObject\s*:\s*%s\s+forKey\s*:\s*kCSFSRunFace'
-                             % re.escape(dfname), fix):
-                    df_ok = True
-                break
-        if df_ok:
-            ok('F3 继承不到时写入兜底字体（gCSFSBodyFace → SimSun），不会留空')
-        elif dfname is None:
-            fail('F3 继承不到时没有兜底字体 —— 整段都是填空线时 face 仍为空，'
-                 '空格掉回 Calibri，长度腰斩')
+        # F3：绝不允许落到非中文字体
+        #
+        # 空格宽度 0.5em 只有中文字体成立（西文 0.226em，差 2.2 倍），
+        # 所以「一个中文字体都没找到」时必须有明确兜底，不能留空、
+        # 也不能把 Calibri 原样留着。
+        if re.search(r'gCSFSBodyFace\s*=\s*@"宋体"', fix):
+            ok('F3 找不到中文字体时兜底为「宋体」，不会落到 0.226em 的西文字体')
         else:
-            fail('F3 兜底字体算出来了（%s）却没有写进 run —— 等于没兜底' % dfname)
+            fail('F3 没有「宋体」兜底 —— 全文都是 Calibri 时空白 run 仍按 '
+                 '0.226em 渲染，下划线只有该有长度的 45%')
 
         # F4：兜底字体来自全文统计
         if re.search(r'gCSFSBodyFace\s*=\s*\[', fix):
@@ -414,37 +412,29 @@ def main():
                      '所有空格都会变成 NBSP，Word 失去断行点' % ' '.join(near.split())[:80])
 
     # ══════════════════════════════════════════════════════════════
-    # 四、填空线判据（T）
+    # 四、填空线判据（T）—— v34 起整组删除
+    #
+    # v33 在这里断言「补下划线的条件是 em ≥ 2.0」，即按版面宽度猜
+    # 「这块空白是不是一条填空线」。
+    #
+    # 这条判据已被真机证伪：把 v32 与 v33 导出的同一份文档逐条对齐，
+    # 空白 run 都是 47 个，带下划线的从 21 个变成了 26 个 ——
+    # 多出来的 5 条全在合同末尾的签字区（prev/next 是
+    # 「董瀚霖/乙方：」「地址：/电话：」「9845254499/电话：」），
+    # 那里是用来把「乙方：」「电话：」推到行右侧的排版留白，
+    # 宽度当然远超 2em，于是被画上了一条假下划线。
+    #
+    # 教训：宽度只能说明「这儿空着」，不能说明「这儿有根线」。
+    # 下划线只允许来自数据本身，所以 v34 把这段判据整条删掉了，
+    # 对应的断言也就必须一起删 —— 留着它就是留着一条错误的规格。
     # ══════════════════════════════════════════════════════════════
     if fix is None:
-        fail('T1 找不到 CSFSFixSpaceRuns，无法检查填空线判据')
+        fail('T0 找不到 CSFSFixSpaceRuns，无法检查「不许猜下划线」')
+    elif re.search(r'if\s*\(\s*!\s*hadUnder\s*&&\s*em\s*>=', fix):
+        fail('T0 仍在按 em 阈值补下划线 —— 这正是「不该有线的地方有线」的原因，'
+             '下划线必须只来自 slice 自带的 underline')
     else:
-        m_add = re.search(r'if\s*\(\s*!\s*hadUnder\s*&&\s*([^{}]+?)\)\s*\{', fix)
-        if not m_add:
-            fail('T1 找不到「补下划线」的条件分支')
-        else:
-            cond = m_add.group(1)
-            if re.search(r'\bem\b\s*>=', cond):
-                ok('T1 补下划线的条件是「宽度/字号 ≥ 阈值」（版面实测，不靠个数）')
-            elif re.search(r'\bt\s*\.\s*length\s*>=', cond) or \
-                 re.search(r'\.length\s*>=', cond):
-                fail('T1 补下划线用「空格个数」判定 —— 个数是 OCR 给的，'
-                     '可能被截断；宽度才是版面真实值')
-            else:
-                fail('T1 补下划线的条件既不是宽度也不是个数（实际：%s）'
-                     % ' '.join(cond.split())[:80])
-
-            # T2：阈值不能太小
-            m_th = re.search(r'em\s*>=\s*([0-9.]+)', cond)
-            if m_th:
-                th = float(m_th.group(1))
-                if th < 1.5:
-                    fail('T2 填空线阈值 em>=%.2f 太小 —— '
-                         '两三个词间空格就会被画成下划线' % th)
-                else:
-                    ok('T2 填空线阈值 em>=%.2f（词间距不会被误画成线）' % th)
-            else:
-                fail('T2 找不到 em 阈值常量')
+        ok('T0 不再按版面宽度猜下划线（只认 slice 自带的 underline）')
 
     # ══════════════════════════════════════════════════════════════
     # 五、统计日志时机（S）

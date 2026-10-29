@@ -2556,6 +2556,47 @@ static BOOL CSFSUnderlineValue(id v) {
     return NO;
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// v34：这个字体名是不是「中文（东亚）字体」。
+//
+// 只为一件事存在：判断空白 run 能不能用它算 0.5em。
+//
+// 背景是实测出来的，不是猜：v33 导出的 document.xml 里 47 个空白 run
+// 有 43 个写着 `w:ascii="Calibri"`。空格 U+0020 是 ASCII 字符，Word
+// 严格按 w:ascii 取字形 —— Calibri 的空格只有 0.226em，
+// 中文宋体是 0.5em，**差 2.2 倍**。v33 按 0.5em 算出 11 个空格，
+// Word 里只占 26pt，而 slice.width 是 56pt —— 这就是「还是不够长」。
+//
+// 而中文汉字在 Calibri 里没有字形，Word 会自己 fallback 到宋体，
+// 所以**汉字看着是正常的，只有空格被悄悄压扁了** —— 这正是这个缺陷
+// 从 v32 到 v33 两轮都没被看出来的原因。
+// ═════════════════════════════════════════════════════════════════════
+static BOOL CSFSIsCJKFace(NSString *f) {
+    if (![f isKindOfClass:[NSString class]] || f.length == 0) return NO;
+
+    // 1) 字体名本身带汉字：宋体 / 仿宋 / 楷体 / 黑体 / 微软雅黑 …
+    for (NSUInteger i = 0; i < f.length; i++) {
+        unichar ch = [f characterAtIndex:i];
+        if ((ch >= 0x2E80 && ch <= 0x9FFF) ||   // CJK 部首 ~ 统一表意文字
+            (ch >= 0xF900 && ch <= 0xFAFF) ||   // CJK 兼容表意文字
+            (ch >= 0xFF00 && ch <= 0xFFEF)) {   // 全角形式
+            return YES;
+        }
+    }
+
+    // 2) 拼音名：SimSun / NSimSun / Songti SC / STFangsong / PingFang SC …
+    NSString *l = [f lowercaseString];
+    static NSString *const kStems[] = {
+        @"song", @"sun", @"kai", @"fang", @"hei", @"ming",
+        @"pingfang", @"yuanti", @"libian", @"hannoto", @"notosanscjk",
+        @"notoserifcjk", @"sourcehanserif", @"sourcehansans", @"msung", @"nsimsun"
+    };
+    for (NSUInteger i = 0; i < sizeof(kStems) / sizeof(kStems[0]); i++) {
+        if ([l rangeOfString:kStems[i]].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
 // 从 JSON 取 double。字段可能是 NSNumber，也可能是数字字符串。
 static double CSFSDoubleValue(id v) {
     if (!v) return 0;
@@ -4366,51 +4407,74 @@ static void CSFSZipAddEntry(NSMutableData *zipData, NSMutableData *cd,
 // 保证「宽度」和「缩进」两处不会各用一套比例。
 // ═════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════
-// v33：纯空白 run 的样式补齐 —— 治「长度短一截」与「该有下划线却没有」
+// v34：纯空白 run 的样式补齐 —— 修「长度不够」与「多画了假下划线」
 //
-// 真机日志（v32）三条样本：
-//   w=56.0 pt=10.5 → 11 个空格 (原 11)
-//   w=12.0 pt=10.5 →  2 个空格 (原 2)
-//   w=36.0 pt=10.5 →  7 个空格 (原 7)
-// 56/11 = 5.09pt，10.5pt 宋体的半角空格 = 5.25pt —— **数量本来就是对的**。
+// 这一版是被真机导出的 document.xml 直接推翻 v33 两条判断之后重写的，
+// 两条都不是猜出来的，是对着 47 个空白 run 逐条数出来的：
 //
-// 所以 Length 问题不在数量，在「Word 里这个空格实际有多宽」。
-// 而宽度由字体决定：宋体的半角空格是 0.5em（5.25pt），
-// 默认西文衬线体只有 0.22em 左右（2.3pt）—— 差一半。
-// 空格 run 一旦没有 rFonts，Word 就按默认西文字体渲染，
-// 长度直接掉一半，这就是「明显不够长」。
+// 【推翻一】v33 说「空白 run 没有字体所以腰斩」，只对了一半
+//   实测：47 个空白 run 里 43 个**都有** rFonts，写的是
+//     <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri"/>
+//   它们不缺字体，缺的是「能撑住 0.5em 的字体」。
+//   U+0020 属于 ASCII，Word 严格按 w:ascii 取字形：
+//     Calibri 空格 0.226em × 10.5pt = 2.37pt
+//     宋体   空格 0.500em × 10.5pt = 5.25pt      差 2.2 倍
+//   按 0.5em 算出 11 个空格，Word 里只占 26pt，而 slice.width = 56pt。
+//   这正是「有的空格下划线还是不够长」。
+//   而 v33 的兜底只在 face **为空**时触发，face 明明是 "Calibri"，
+//   兜底一次都没跑（日志 fillBody 恒为 0）——
+//   **兜底把错误本身藏起来了**，这已经是这个项目里第二次栽在兜底上。
 //
-// 为什么纯空白 run 会没有字体？OCR 对空白 slice 常常不给 style
-// （`v21 DIAG style` 只 dump 到文字 slice 那一份），
-// CSFSParseSlice 于是取不到 font_face / font_attribute，
-// **字体和下划线一起丢**。下划线一丢，填空线整条消失 ——
-// 这正是「本来有下划线的空格，你只有空格」。
+//   所以判据不能是「有没有字体」，必须是「这个字体撑不撑得住 0.5em」。
+//   空格是看不见的，换掉字体名不改变任何视觉，只把宽度修正回来。
 //
-// 修法：从**同段最近的文字 run**（优先前一个）继承 face / size。
-// 这是版式继承，不是猜：同段落里的空白本来就该跟上下文用同一字体。
+// 【推翻二】v33 用「宽度 ÷ 字号 ≥ 2em」猜下划线，是错的
+//   把 v32 与 v33 导出的同一份文档逐条对齐：
+//     v32 空白 run 47 个，带下划线 21 个
+//     v33 空白 run 47 个，带下划线 26 个
+//   多出来的 5 个全部落在合同末尾的签字区：
+//     prev='董瀚霖'      next='乙方：'       len=12
+//     prev='地址：'      next='地址：'       len=26
+//     prev='地址：'      next='电话：'       len=25
+//     prev='9845254499'  next='电话：'       len=5
+//     prev='5586699161'  next='签订日期：'   len=4
+//   这些空白是用来把「乙方：」「电话：」推到行右侧的**排版留白**，
+//   宽度当然远超 2em —— 宽度只能说明「这儿空着」，不能说明「这儿有根线」。
+//   缩进、居中留白、签名区空白，宽度全都比 2em 大。用户报的
+//   「本来不应该有下划线的地方也出现了下划线」就是这 5 条。
 //
-// 下划线则不能无脑继承（前面那个字未必带下划线），改按宽度判
-// 「这是不是一条填空线」：一段宽于两个汉字的空白，本该有线。
-// 阈值取 2em 而不是「空格个数」—— 个数是 OCR 给的，可能被截断；
-// 而 width 是版面实测值，更可信。
+//   所以补线只认**数据**：slice 自己带 underline 才画。
+//   不按宽度猜，也不从邻居继承 —— 继承同样是猜（「地址：」那格本身
+//   就没有线）。少一根线，远好过多一根假线。
+//
+// 保留 v33 做对的部分：字号缺失时从邻居继承、以及 NBSP 换行尾空格。
 // ═════════════════════════════════════════════════════════════════════
 static void CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt) {
     if (![runs isKindOfClass:[NSMutableArray class]] || [runs count] == 0) return;
 
     static long fixLogCount = 0;   // 明细日志最多 6 条，防刷屏
     NSUInteger cnt = [runs count];
-    long fillFace = 0, fillSize = 0, addUnder = 0, fillBody = 0;
+    long fillSize = 0, faceFix = 0, fillBody = 0, underNative = 0;
 
-    // 先把全文正文字体记下来：后面「继承不到邻居」的空白要用它兜底，
-    // 否则会掉到 docDefaults 的 Calibri（空格只有宋体的一半宽）。
-    if (gCSFSBodyFace.length == 0) {
-        for (NSUInteger i = 0; i < cnt; i++) {
+    // ── 定下「空白 run 该用的字体」────────────────────────────────
+    //
+    // 要求只有一条：空格宽度 = 0.5em，也就是必须是中文字体。
+    // 优先用全文正文字体（它多半就是 SimSun），但它很可能是 Calibri，
+    // 那就退一步在全文里找任何一个中文名，再不行才用「宋体」。
+    //
+    // 注意这里**必须覆盖原文体**，不能只在为空时兜底 ——
+    // 见上面「推翻一」：空白 run 的 face 几乎都是非空的 Calibri。
+    if (!CSFSIsCJKFace(gCSFSBodyFace)) {
+        gCSFSBodyFace = nil;
+        for (NSUInteger i = 0; i < cnt && gCSFSBodyFace.length == 0; i++) {
             NSDictionary *c = [runs objectAtIndex:i];
             if (CSFSIsPureWhiteSpace([c objectForKey:kCSFSRunText])) continue;
             NSString *cf = [c objectForKey:kCSFSRunFace];
-            if (cf.length > 0) { gCSFSBodyFace = [cf copy]; break; }
+            if (CSFSIsCJKFace(cf)) gCSFSBodyFace = [cf copy];
         }
+        if (gCSFSBodyFace.length == 0) gCSFSBodyFace = @"宋体";
     }
+    NSString *wideFace = gCSFSBodyFace;
 
     for (NSUInteger i = 0; i < cnt; i++) {
         id obj = [runs objectAtIndex:i];
@@ -4420,86 +4484,52 @@ static void CSFSFixSpaceRuns(NSMutableArray *runs, double paraPt) {
         NSString *t = [r objectForKey:kCSFSRunText];
         if (!CSFSIsPureWhiteSpace(t)) continue;
 
-        // 属性来源：先往前找，前面没有文字才往后找。
-        NSDictionary *src = nil;
-        for (NSInteger j = (NSInteger)i - 1; j >= 0; j--) {
-            NSDictionary *c = [runs objectAtIndex:(NSUInteger)j];
-            if (!CSFSIsPureWhiteSpace([c objectForKey:kCSFSRunText])) { src = c; break; }
-        }
-        if (!src) {
-            for (NSUInteger j = i + 1; j < cnt; j++) {
-                NSDictionary *c = [runs objectAtIndex:j];
-                if (!CSFSIsPureWhiteSpace([c objectForKey:kCSFSRunText])) { src = c; break; }
-            }
-        }
-
+        // 1) 字体：不是中文字体就换掉（空格宽度才有 0.5em）
         NSString *face0 = [r objectForKey:kCSFSRunFace];
-        BOOL hadFace = (face0.length > 0);
-        BOOL hadSize = ([r objectForKey:kCSFSRunSize] != nil);
-
-        if (src) {
-            NSString *sf = [src objectForKey:kCSFSRunFace];
-            if (!hadFace && sf.length > 0) {
-                [r setObject:sf forKey:kCSFSRunFace];
-                fillFace++;
-            }
-            if (!hadSize) {
-                id ss = [src objectForKey:kCSFSRunSize];
-                if (ss) {
-                    [r setObject:ss forKey:kCSFSRunSize];
-                    fillSize++;
-                }
-            }
-        }
-
-        // 邻居也没有字体（整段就是一条填空线，前后都没文字）时，
-        // 用全文正文字体兜底。绝不能留空 —— 留空就掉到 docDefaults 的
-        // Calibri 上，空格宽度直接腰斩，下划线长度跟着错。
-        if ([[r objectForKey:kCSFSRunFace] length] == 0) {
-            NSString *df = (gCSFSBodyFace.length > 0) ? gCSFSBodyFace : @"SimSun";
-            [r setObject:df forKey:kCSFSRunFace];
-            fillBody++;
-        }
-
-        // 填空线判定：宽度 ÷ 字号 ≥ 2em（两个汉字宽）
-        double wpt = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
-        id szNow = [r objectForKey:kCSFSRunSize];
-        double fpt = szNow ? CSFSDoubleValue(szNow) : 0.0;
-        if (!(fpt > 2.0) || fpt > 200.0) fpt = paraPt;
-        if (!(fpt > 2.0) || fpt > 200.0) fpt = 11.0;
-        double em = (wpt > 0.0) ? (wpt / fpt) : 0.0;
-
-        BOOL hadUnder = [[r objectForKey:kCSFSRunUnderline] boolValue];
-        if (!hadUnder && em >= 2.0) {
-            [r setObject:[NSNumber numberWithBool:YES] forKey:kCSFSRunUnderline];
-            addUnder++;
+        if (![face0 isKindOfClass:[NSString class]]) face0 = nil;
+        if (!CSFSIsCJKFace(face0)) {
             if (fixLogCount < 6) {
                 fixLogCount++;
-                CSFS_LOG(@"v33 spcfix: ADD underline w=%.1f em=%.2f len=%lu"
-                         @" (原生无下划线，按宽度判为填空线)",
-                         wpt, em, (unsigned long)t.length);
+                BOOL wasCalibri =
+                    ([face0.lowercaseString rangeOfString:@"calibri"].location != NSNotFound);
+                CSFS_LOG(@"v34 spcfix: face %@ -> %@ (该字体空格 %.3fem，"
+                         @"换成 0.500em 才能对上 slice.width) len=%lu",
+                         face0.length > 0 ? face0 : @"(nil)", wideFace,
+                         wasCalibri ? 0.226 : 0.0,
+                         (unsigned long)t.length);
+            }
+            if (face0.length == 0) fillBody++; else faceFix++;
+            [r setObject:wideFace forKey:kCSFSRunFace];
+        }
+
+        // 2) 字号：缺失时从同段相邻文字 run 继承（版式继承，不是猜）
+        if ([r objectForKey:kCSFSRunSize] == nil) {
+            for (NSInteger j = (NSInteger)i - 1; j >= 0; j--) {
+                NSDictionary *c = [runs objectAtIndex:(NSUInteger)j];
+                if (CSFSIsPureWhiteSpace([c objectForKey:kCSFSRunText])) continue;
+                if ([c objectForKey:kCSFSRunSize]) {
+                    [r setObject:[c objectForKey:kCSFSRunSize] forKey:kCSFSRunSize];
+                    fillSize++;
+                }
+                break;
             }
         }
-        if (fixLogCount < 6 && (!hadFace || !hadSize)) {
-            fixLogCount++;
-            CSFS_LOG(@"v33 spcfix: inherit face=%@ size=%@ from=%@"
-                     @" (w=%.1f em=%.2f len=%lu)",
-                     hadFace ? @"-" : ([r objectForKey:kCSFSRunFace] ?: @"(nil)"),
-                     hadSize ? @"-" : ([r objectForKey:kCSFSRunSize] ?: @"(nil)"),
-                     src ? @"neighbor" : @"none",
-                     wpt, em, (unsigned long)t.length);
-        }
+
+        // 3) 下划线：只统计，不修改。
+        //    v33 在这里按 em>=2.0 补线，制造了 5 条假线（见函数头注释）。
+        if ([[r objectForKey:kCSFSRunUnderline] boolValue]) underNative++;
     }
 
-    if (fillFace || fillSize || addUnder || fillBody) {
-        CSFS_LOG(@"v33 spcfix para: fillFace=%ld fillBody=%ld fillSize=%ld"
-                 @" addUnderline=%ld pt=%.1f",
-                 fillFace, fillBody, fillSize, addUnder, paraPt);
+    if (fillSize || faceFix || fillBody) {
+        CSFS_LOG(@"v34 spcfix para: faceFix=%ld fillBody=%ld fillSize=%ld"
+                 @" underNative=%ld face=%@ pt=%.1f",
+                 faceFix, fillBody, fillSize, underNative, wideFace, paraPt);
     }
 }
 
 static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
-                                    double fontSizePt) {
+                                    double fontSizePt, double *outSpTw) {
+    if (outSpTw) *outSpTw = 0.0;
     if (text.length == 0) return text;
 
     // 只处理「整体是空白」的 run。夹在文字中间的空格照样保留原样，
@@ -4541,10 +4571,22 @@ static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
         pt = sliceWidthPx * gCSFSPageScale;
     }
 
-    // pt → 半角空格个数（半角空格宽 ≈ 0.5 em）
+    // v34：行宽上限。
+    // 一条空白撑不出比页面内容区更宽的东西。真机里那条
+    // `len=56 sz=36`（18pt × 56 = 504pt > 内容区 451pt）的整段空白
+    // 就会把整段挤到下一行 —— 溢价比短更难看。
+    double maxPt = kCSFSContentTwips / 20.0;
+    BOOL clippedPage = NO;
+    if (maxPt > 1.0 && pt > maxPt) { pt = maxPt; clippedPage = YES; }
+
+    // pt → 半角空格个数（中文等宽字体的半角空格 = 0.5 em）
     double per = fontSizePt * 0.5;
     if (!(per > 0.1)) per = 5.5;
-    long n = (long)(pt / per + 0.5);
+
+    // v34：向下取整，**余量用字符间距补**，不再四舍五入。
+    // round 会让结果一半偏短一半偏长，而「偏短」正是用户一直在说的那个毛病；
+    // floor + 余量能把误差压到 1 twip 以内（1/20 pt）。
+    long n = (long)floor(pt / per);
     long rawN = n;                        // 纯换算结果（诊断用）
 
     // 上限保护：单个 run 最多 200 个空格。
@@ -4557,6 +4599,18 @@ static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
     // 原有空白里如果已经不止一个字符（偶尔 OCR 直接给 "   "），
     // 以算出来的为准，但不允许比原来少 —— 少就等于又把它弄短了。
     if ((long)text.length > n) n = (long)text.length;
+
+    // 余量（pt）：n 个空格还差多少才等于 slice.width。
+    // 摊到每个字符上，交给 <w:spacing> 输出（单位 twips，1pt = 20）。
+    // 注意「原长兜底」把 n 拉大后余量会是负数，那种情况不再补。
+    double remPt = pt - (double)n * per;
+    double spTw = 0.0;
+    if (remPt > 0.0 && n > 0) {
+        spTw = (remPt * 20.0) / (double)n;
+        if (spTw < 0.0) spTw = 0.0;
+        if (spTw > 31680.0) spTw = 31680.0;   // CT_SignedTwipsMeasure 上限
+    }
+    if (outSpTw) *outSpTw = spTw;
 
     // ══════════════════════════════════════════════════════════════
     // v33：把「算出来的 / 夹过的 / 最终的」三个值全打出来。
@@ -4573,10 +4627,12 @@ static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
     // ══════════════════════════════════════════════════════════════
     if (gCSFSSpaceExpandLogs < 5) {
         gCSFSSpaceExpandLogs++;
-        CSFS_LOG(@"v33 space: w=%.1f pt=%.1f per=%.2f raw=%ld clamped=%ld"
-                 @" final=%ld srcLen=%lu scale=%.4f",
-                 sliceWidthPx, pt, per, rawN, clampedN, n,
-                 (unsigned long)text.length, gCSFSPageScale);
+        CSFS_LOG(@"v34 space: w=%.1f pt=%.1f fs=%.1f per=%.2f raw=%ld"
+                 @" clamped=%ld n=%ld rem=%.2f spTw=%.1f srcLen=%lu clip=%d"
+                 @" scale=%.4f",
+                 sliceWidthPx, pt, fontSizePt, per, rawN, clampedN, n,
+                 remPt, spTw, (unsigned long)text.length, (int)clippedPage,
+                 gCSFSPageScale);
     }
 
     NSMutableString *s = [NSMutableString stringWithCapacity:(NSUInteger)n];
@@ -4789,6 +4845,48 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         }
         if (text.length == 0) continue;
 
+        // ═══════════════════════════════════════════════════════════
+        // v34：先把这个 run 的「实际字号」「展开后的文本」「字符间距」
+        // 全部算出来，再按 CT_RPr 的法定顺序写 rPr。
+        //
+        // 为什么要提前：<w:spacing> 必须排在 <w:sz> **之前**
+        // （ECMA-376 CT_RPr 是 xsd:sequence：… color → spacing → sz → u），
+        // 而它自己的值又依赖字号（n = width ÷ (0.5 × 字号)）。
+        // v33 把展开放在 sz 之后，spacing 就再也插不进来了 ——
+        // 只能在写入前把值都算好。
+        // ═══════════════════════════════════════════════════════════
+        id szObj = [r objectForKey:kCSFSRunSize];
+        double runPt = 0.0;
+        if (szObj) {
+            double sz = CSFSDoubleValue(szObj);
+            if (sz > 2.0 && sz < 200.0) {
+                // v25：App 的规则是逐 slice 取自己的 font_size，
+                // 只在最后叠一档全局偏移 —— 反汇编
+                // -[CSITextEngineSettings caculateFontSizeWithOriginalFontSize:]：
+                //     fontSizeMode 1 → -1pt，2 → +1pt，其余原样。
+                // 展开空格必须用这个「叠完之后」的字号，
+                // 否则算出来的个数与实际排版脱节。
+                if (gCSFSFontSizeMode == 1)      sz -= 1.0;
+                else if (gCSFSFontSizeMode == 2) sz += 1.0;
+            }
+            runPt = sz;
+        }
+        // run 没有自己的字号时，用全文正文档（defaultPt）参与换算。
+        if (!(runPt > 2.0) || runPt > 200.0) runPt = defaultPt;
+
+        BOOL emitIsSpace = CSFSIsPureWhiteSpace(text);
+        BOOL emitUnder   = [[r objectForKey:kCSFSRunUnderline] boolValue];
+        double spaceW    = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
+        NSString *emitText = text;
+        double spTw = 0.0;
+        if (spaceW > 0.0 && emitIsSpace) {
+            // 明细日志统一由 CSFSExpandSpaceRun 内部打
+            //（那里能同时给出 raw / n / rem / spTw，
+            //  只看最终个数会被兜底骗过去 —— v32 就是这么被骗的）。
+            emitText = CSFSExpandSpaceRun(text, spaceW, runPt, &spTw);
+            gCSFSSpaceExpandRuns++;
+        }
+
         // 下面这段的**书写顺序就是 XML 输出顺序**，必须严格照 ECMA-376 的
         // CT_RPr sequence 排，不能按「先想到哪个写哪个」。改动前先回看上面的注释。
         NSMutableString *rPr = [NSMutableString string];
@@ -4812,41 +4910,33 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         if (color.length == 6) {
             [rPr appendFormat:@"<w:color w:val=\"%@\"/>", color];
         }
-        // 5) 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
+        // 5) 字符间距 —— v34：补上「向下取整丢掉的那点宽度」。
+        //
+        //    空白 run 展开成 n 个空格后，还会有不到一个空格的零头。
+        //    v32/v33 用四舍五入处理这个零头，结果一半偏短一半偏长 ——
+        //    而「偏短」正是用户一直在说的毛病。改成 floor + 余量后，
+        //    n 个空格 + n×spTw 的合计宽度能对到 1 twip（1/20 pt）以内。
+        //
+        //    必须排在 color 之后、sz 之前，位置写错 Word 会静默忽略。
+        if (spTw >= 1.0) {
+            long spInt = (long)(spTw + 0.5);
+            if (spInt > 31680) spInt = 31680;
+            [rPr appendFormat:@"<w:spacing w:val=\"%ld\"/>", spInt];
+        }
+        // 6) 字号：sz 是半磅。只对「与默认不同」的 run 写字号，
         //    否则每个 run 都带 sz，XML 体积翻倍且不利于后续统一改样式。
         //
-        //    v25：取消 v23 的「20% 归并」。
-        //    App 的规则是逐 slice 取自己的 font_size，只在最后叠加一档
-        //    全局偏移 —— 反汇编
-        //    -[CSITextEngineSettings caculateFontSizeWithOriginalFontSize:]：
-        //        fontSizeMode 1 → -1pt，2 → +1pt，其余原样。
-        //    也就是说预览里 10pt 与 11pt 本来就是混排的，它就该混排。
-        //    v23 把它们统一到 11pt，等于改了 App 的排版，看着「更整齐」
-        //    却和预览不一样 —— 这正是用户说的「还是不对」。
-        id szObj = [r objectForKey:kCSFSRunSize];
-        // v32：这个 run 实际使用的字号，供下面展开空格用。
-        // 必须取「已经过 fontSizeMode 偏移后」的值 —— 否则展开出来的
-        // 空格个数会与实际字号脱节，下划线长度又对不上。
-        double runPt = 0.0;
-        if (szObj && defaultPt > 2.0 && defaultPt < 200.0) {
-            double sz = [szObj doubleValue];
-            if (sz > 2.0 && sz < 200.0) {
-                if (gCSFSFontSizeMode == 1)      sz -= 1.0;
-                else if (gCSFSFontSizeMode == 2) sz += 1.0;
-            }
-            runPt = sz;
-            if (sz > 2.0 && sz < 200.0 && fabs(sz - defaultPt) > 0.1) {
-                long hp = (long)(sz * 2.0 + 0.5);
-                // 越界字号 Word 会当损坏处理，直接钳进合法区间
-                if (hp < 1) hp = 1;
-                if (hp > 3276) hp = 3276;
-                [rPr appendFormat:@"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>", hp, hp];
-            }
+        //    v25：取消 v23 的「20% 归并」，理由见上面字体那一节的注释。
+        if (szObj && defaultPt > 2.0 && defaultPt < 200.0 &&
+            runPt > 2.0 && runPt < 200.0 && fabs(runPt - defaultPt) > 0.1) {
+            long hp = (long)(runPt * 2.0 + 0.5);
+            // 越界字号 Word 会当损坏处理，直接钳进合法区间
+            if (hp < 1) hp = 1;
+            if (hp > 3276) hp = 3276;
+            [rPr appendFormat:@"<w:sz w:val=\"%ld\"/><w:szCs w:val=\"%ld\"/>", hp, hp];
         }
-        // v32：run 没有自己的字号时，用全文正文档（defaultPt）参与换算。
-        if (!(runPt > 2.0) || runPt > 200.0) runPt = defaultPt;
-        // 6) 下划线 —— 必须排在 sz 之后
-        if ([[r objectForKey:kCSFSRunUnderline] boolValue]) {
+        // 7) 下划线 —— 必须排在 sz 之后
+        if (emitUnder) {
             [rPr appendString:@"<w:u w:val=\"single\"/>"];
         }
 
@@ -4858,18 +4948,6 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
         //   · 但必须在 CSFSXMLEscape(text) 之前换掉 text，
         //     否则写出去的还是一个空格。
         // ═══════════════════════════════════════════════════════════
-        NSString *emitText = text;
-        double spaceW = CSFSDoubleValue([r objectForKey:kCSFSRunSpaceW]);
-        BOOL emitIsSpace = CSFSIsPureWhiteSpace(text);
-        BOOL emitUnder = [[r objectForKey:kCSFSRunUnderline] boolValue];
-        if (spaceW > 0.0 && emitIsSpace) {
-            // v33：明细日志统一由 CSFSExpandSpaceRun 内部打
-            //（那里能同时给出 raw / clamped / final 三个值，
-            //  而这里只能拿到 final —— v32 就是被「只打最终值」骗过的）。
-            emitText = CSFSExpandSpaceRun(text, spaceW, runPt);
-            gCSFSSpaceExpandRuns++;
-        }
-
         // ═══════════════════════════════════════════════════════════
         // v33：带下划线的空白一律换成**不换行空格 U+00A0**。
         //
@@ -5078,7 +5156,8 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     // v32 把它放在解析后、渲染前，于是日志里永远 spaceExpanded=0，
     // 而紧接着的 v32 space 明细又明明打出来了 —— 自相矛盾，
     // 上一轮差点据此判断「展开根本没走」。
-    CSFS_LOG(@"v33 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@",
+    CSFS_LOG(@"v34 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@"
+             @" (bodyFace 必须是中文字体名；若是 Calibri，空格只有 0.226em)",
              gCSFSSpaceExpandRuns, gCSFSUnderSpaceRuns,
              gCSFSBodyFace ?: @"(nil)");
     return ok;

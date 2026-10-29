@@ -67,7 +67,7 @@ def inject(src, old, new, tag):
 # 注入用的原文片段（与源码逐字节对齐）
 # ══════════════════════════════════════════════════════════════════
 
-# S1 用：docx 写出日志 + v33 space stats 的整段
+# S1 用：docx 写出日志 + v34 space stats 的整段
 BLK_SPACE_STATS = (
     '    BOOL ok = [zipData writeToFile:outPath atomically:YES];\n'
     '    CSFS_LOG(@"v21 docx written=%d paras=%lu imgs=%lu defPt=%.1f size=%lu",\n'
@@ -77,14 +77,16 @@ BLK_SPACE_STATS = (
     '    // v32 把它放在解析后、渲染前，于是日志里永远 spaceExpanded=0，\n'
     '    // 而紧接着的 v32 space 明细又明明打出来了 —— 自相矛盾，\n'
     '    // 上一轮差点据此判断「展开根本没走」。\n'
-    '    CSFS_LOG(@"v33 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@",\n'
+    '    CSFS_LOG(@"v34 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@"\n'
+    '             @" (bodyFace 必须是中文字体名；若是 Calibri，空格只有 0.226em)",\n'
     '             gCSFSSpaceExpandRuns, gCSFSUnderSpaceRuns,\n'
     '             gCSFSBodyFace ?: @"(nil)");\n'
 )
 
 # S1 注入后：统计先打、写入日志后打（= v32 的时序）
 BLK_SPACE_STATS_EARLY = (
-    '    CSFS_LOG(@"v33 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@",\n'
+    '    CSFS_LOG(@"v34 space stats: expandedRuns=%ld underNBSP=%ld bodyFace=%@"\n'
+    '             @" (bodyFace 必须是中文字体名；若是 Calibri，空格只有 0.226em)",\n'
     '             gCSFSSpaceExpandRuns, gCSFSUnderSpaceRuns,\n'
     '             gCSFSBodyFace ?: @"(nil)");\n'
     '    BOOL ok = [zipData writeToFile:outPath atomically:YES];\n'
@@ -177,15 +179,10 @@ def main():
                          '/* removed */', 'R5'),
     ))
 
-    # R6 读了邻居字体但没写进 run —— 半成品形态
-    cases.append((
-        'R6',
-        '读到邻居字体却没写进 run（get 了不 set）',
-        'F2 读到了邻居字体却没有写进 run',
-        lambda s: inject(s,
-                         '                [r setObject:sf forKey:kCSFSRunFace];\n',
-                         '                (void)sf;\n', 'R6'),
-    ))
+    # R6 —— v34 起删除。
+    #     原来注入的是「从邻居读到 sf 却没写进 run」，那是 v33 的继承写法；
+    #     v34 改成「覆盖成 wideFace」，这条锚点不存在了。
+    #     同一种缺陷（算出来但没写进去）已由 R9 覆盖，不必留两份。
 
     # R7 补齐函数排在写 XML 之后 ——
     #    只改了内存里的 run，输出早就生成了，等于白做。
@@ -206,24 +203,24 @@ def main():
             'R7'),
     ))
 
-    # R8 兜底字体留空 —— 整段都是填空线时 face 仍为空，掉回 Calibri
+    # R8 兜底字体给空串 —— 全文都是 Calibri 时空白 run 仍按 0.226em 渲染
     cases.append((
         'R8',
         '兜底字体给空串（留空等于没兜底）',
-        'F3 继承不到时没有兜底字体',
+        'F3 没有「宋体」兜底',
         lambda s: inject(s,
-                         'NSString *df = (gCSFSBodyFace.length > 0) ? gCSFSBodyFace : @"SimSun";',
-                         'NSString *df = @"";', 'R8'),
+                         'if (gCSFSBodyFace.length == 0) gCSFSBodyFace = @"宋体";',
+                         'if (gCSFSBodyFace.length == 0) gCSFSBodyFace = @"";', 'R8'),
     ))
 
-    # R9 算了兜底字体却没写进去
+    # R9 算出字体却没写进 run
     cases.append((
         'R9',
-        '兜底字体算出来了却没写进 run',
-        'F3 兜底字体算出来了',
+        '字体变量算出来了却没写进 run',
+        'F2 字体变量算出来了',
         lambda s: inject(s,
-                         '            [r setObject:df forKey:kCSFSRunFace];\n',
-                         '            (void)df;\n', 'R9'),
+                         '            [r setObject:wideFace forKey:kCSFSRunFace];\n',
+                         '            (void)wideFace;\n', 'R9'),
     ))
 
     # R10 不在段落级统一记录正文字体（每段各猜，跨段不一致）
@@ -232,8 +229,8 @@ def main():
         '不记录全文正文字体 gCSFSBodyFace',
         'F4 没有记录 gCSFSBodyFace',
         lambda s: inject(s,
-                         '            if (cf.length > 0) { gCSFSBodyFace = [cf copy]; break; }',
-                         '            if (cf.length > 0) { break; }', 'R10'),
+                         '            if (CSFSIsCJKFace(cf)) gCSFSBodyFace = [cf copy];',
+                         '            if (CSFSIsCJKFace(cf)) { }', 'R10'),
     ))
 
     # R11 批次重置漏清（第二次导出会混进上一次的字体与计数）
@@ -317,29 +314,26 @@ def main():
     ))
 
     # ══════════════════════════════════════════════════════════════
-    # T 组：填空线判据
+    # T 组：不许按宽度猜下划线
+    #
+    # v33 原来在这里注入「改用空格个数判」「阈值降到 0.5em」两个用例，
+    # 那两条检查的规格本身已被真机证伪（见 check_v33 里 T0 的说明），
+    # 现在只剩一条真正要防的回归：把 em 判据重新加回来。
     # ══════════════════════════════════════════════════════════════
 
-    # R18 按「空格个数」判 —— 个数是 OCR 给的，可能被截断
+    # R18 把 v33 的「宽度 ≥ 2em 就补下划线」重新加回来
     cases.append((
         'R18',
-        '填空线改用「空格个数」判定',
-        'T1 补下划线用「空格个数」判定',
+        '按 em 阈值补下划线（v33 的假线来源）',
+        'T0 仍在按 em 阈值补下划线',
         lambda s: inject(s,
-                         'if (!hadUnder && em >= 2.0) {',
-                         'if (!hadUnder && (long)t.length >= 3) {',
-                         'R18'),
-    ))
-
-    # R19 阈值放到 0.5em —— 两三个词间空格就被画成线
-    cases.append((
-        'R19',
-        '填空线阈值降到 em>=0.5（词间距被误画成线）',
-        'T2 填空线阈值 em>',
-        lambda s: inject(s,
-                         'if (!hadUnder && em >= 2.0) {',
-                         'if (!hadUnder && em >= 0.5) {',
-                         'R19'),
+                         '        // 3) 下划线：只统计，不修改。',
+                         '        BOOL hadUnder = [[r objectForKey:kCSFSRunUnderline] boolValue];\n'
+                         '        double em = 2.5;\n'
+                         '        if (!hadUnder && em >= 2.0) {\n'
+                         '            [r setObject:@YES forKey:kCSFSRunUnderline];\n'
+                         '        }\n'
+                         '        // 3) 下划线：只统计，不修改。', 'R18'),
     ))
 
     # ══════════════════════════════════════════════════════════════
