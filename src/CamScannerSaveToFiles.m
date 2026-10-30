@@ -3001,8 +3001,33 @@ static NSString *CSFSDescribeDeep(id obj, int depth) {
 //
 // 单位换算：
 //   像素 → EMU 按 96 DPI 解释，1 px = 914400/96 = 9525 EMU；
-//   正文可用宽度 = A4 11906 twips − 左右边距 1440×2 = 9026 twips，
-//   1 twip = 635 EMU → 5731510 EMU。超宽等比缩小。
+//   正文可用宽度 = kCSFSContentTwips，1 twip = 635 EMU。超宽等比缩小。
+// ═════════════════════════════════════════════════════════════════════
+// v37：内容区宽度 —— 版心宽度第一次有实证，不再是「Word 默认边距」。
+//
+// 根因（2026-10-30 对照实验）：w:pgMar 四周写死 1440 twips（72pt / 2.54cm），
+// 版心只有 451.3pt；而原文档正文几乎贴边。拿同一份真机导出的 docx，
+// 只改左右边距，用 Word 转 PDF、pymupdf 逐行量 bbox：
+//
+//   边距   版心      「根据…」首行收尾    「第一条」首行收尾   总行数
+//   1440   451.3pt   法律、法（41 字）    5 单（44 字）       60
+//   1080   487.3pt   法规规定，（45 字）  单元．了（47 字）   55
+//    800   515.3pt   在平（47 字）        层2 号（56 字）     52  ← 与截图逐行一致
+//    720   523.3pt   在平等、（49 字）    层2 号（56 字）     52
+//
+// 「在平」「层2 号」正是手机预览截图里的折行点；第二/四/六/十二条在
+// 1440 下全是 3 行，800 下全部回到 2 行，与截图一致。
+//
+// 再次验证：只改左右 800 与四周全改 800 **逐行完全一致**（行数、字数、
+// x0/x1、首尾文字全同）→ 上下边距不参与折行，只影响每页行数。
+// 因此只改左右，上下保持 1440，改动面收到最小。
+//
+// ⚠ 这个值同时是五处判据的基准（制表位归一化上限、lineW、空白宽度上限、
+//   均分制表位、缩进上限）。版心改了而它们不改，就会重演
+//   「判据在跑、分支从不触发」（v35 的 squeeze 一次没触发就是这样）。
+// ═════════════════════════════════════════════════════════════════════
+static const double kCSFSContentTwips = 10306.0;   // v37：A4 11906 − 左右边距各 800
+
 static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
     NSData *d = [img objectForKey:kCSFSImgData];
     if (![d isKindOfClass:[NSData class]] || d.length == 0) return @"<w:p/>";
@@ -3022,7 +3047,7 @@ static NSString *CSFSRenderImagePara(NSDictionary *img, long seq) {
 
     double cx = pxw * 9525.0;
     double cy = pxh * 9525.0;
-    const double kMaxCx = 9026.0 * 635.0;
+    const double kMaxCx = kCSFSContentTwips * 635.0;   // v37：随版心同步，勿写死
     if (cx > kMaxCx) {
         double k = kMaxCx / cx;
         cx = kMaxCx;
@@ -3506,7 +3531,9 @@ static void CSFSCaptureLayoutContext(id page) {
 //   两字符缩进 @11pt ≈ 440 twips ≈ 2 字符 ≈ 22 pt ≈ 2200 (1/100pt)
 // 下一轮拿日志一看就能定死，不用再猜。
 // ═════════════════════════════════════════════════════════════════════
-static const double kCSFSContentTwips = 9026.0;   // A4 11906 - 左右边距各 1440
+// v37：kCSFSContentTwips 已上移到 CSFSRenderImagePara 之前 ——
+//      图片宽度上限也要用它，而 static const 必须先声明后使用。
+//      定义处见「v37：内容区宽度」注释块（含 1440/1080/800/720 四档实测表）。
 
 // ═════════════════════════════════════════════════════════════════════
 // v25：缩进数值 → twips
@@ -5565,7 +5592,19 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
         @" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\""
         @" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
         @"<w:body>%@<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
-        @"<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\""
+        // ═══════════════════════════════════════════════════════════
+        // v37：左右边距 1440 → 800。
+        //
+        // 1440 twips = 72pt = 2.54cm 是 **Word 默认值**，从来没和原文档
+        // 核对过。它把版心压成 451.3pt，于是每行比手机预览少 5~8 个汉字，
+        // 折行点整体前移，后面的行全部错位 —— 用户报的「每行文字数目
+        // 跟预览很多不一样」就是这个。v32~v36 一直在 451.3pt 里调缩进、
+        // 压空白、加负右缩进，都是围着这个错值打转。
+        //
+        // 800 → 版心 10306 twips = 515.3pt，与截图逐行一致（见上方
+        // kCSFSContentTwips 的四档实测表）。只改左右，上下保持 1440。
+        // ═══════════════════════════════════════════════════════════
+        @"<w:pgMar w:top=\"1440\" w:right=\"800\" w:bottom=\"1440\" w:left=\"800\""
         @" w:header=\"851\" w:footer=\"992\" w:gutter=\"0\"/>"
         @"</w:sectPr></w:body></w:document>",
         body];

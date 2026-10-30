@@ -358,6 +358,35 @@ jobs:
           python3 tools/rev_check_v36.py
           python3 tools/check_v36.py src/CamScannerSaveToFiles.m
 
+          # ── v37：每行字数与手机预览对不上 ───────────────────────
+          #
+          # 用户：「导出的 word 每行文字数目与我手机预览的截图很多不一样」
+          #
+          # 【根因】w:pgMar 四周写死 1440 twips（72pt / 2.54cm）—— Word 的
+          #   默认值，从来没和原文档核对过。版心因此固定成 451.3pt，
+          #   而原文档正文几乎贴边。每行比预览少 5~8 个汉字，折行点整体
+          #   前移，后面的行全部错位。
+          #
+          # 【实证】同一份真机导出的 docx，只改左右边距，Word 转 PDF、
+          #   pymupdf 逐行量 bbox：
+          #     1440 → 41 字 / 「5 单」，共 60 行
+          #     1080 → 45 字 / 「单元．了」，55 行
+          #      800 → 47 字 / 「在平」，「层2 号」，52 行  ← 与截图逐行一致
+          #      720 → 49 字 / 「在平等、」，52 行
+          #   再验「只改左右 800」与「四周全改 800」逐行完全一致 →
+          #   上下不参与折行，所以只改左右，上下保持 1440。
+          #
+          # 【连锁】内容区宽度常量 kCSFSContentTwips 9026 → 10306，
+          #   并上移到图片渲染之前（图片宽度上限也用它）。这五处阈值
+          #   （lineW / maxPt / lim / 均分制表位 / 制表位上限）必须同源，
+          #   否则版心变了、判据不变 —— 与 v35 squeeze 一次不触发是同一坑。
+          #
+          # 【C1 为什么是等式】最容易出的缺陷不是改错值，是**只改一半**：
+          #   版心是新的、阈值是旧的，日志一片绿但折行全错。
+          #   所以断言 11906 − left − right == 常量，而不是各自比对字面量。
+          python3 tools/rev_check_v37.py
+          python3 tools/check_v37.py src/CamScannerSaveToFiles.m
+
       - name: Compile dylib (arm64 + arm64e)
         run: |
           set -euo pipefail
