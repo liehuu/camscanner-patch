@@ -574,51 +574,38 @@ def check_source():
     elif not FAILS or all("methodForSelector" not in f for f in FAILS):
         ok("methodForSelector: 用法安全（未取用已 hook 的 selector）")
 
-    # R8: 裸 POSIX 同步 IO（write/open）必须被限制在崩溃取证函数里
+    # R8: 终版禁止裸 POSIX 同步 IO（write/open）
     #     ────────────────────────────────────────────────────────────────
     #     为什么要有这条：R3 只管 Foundation 那套 IO（writeToFile: /
     #     createFileAtPath: …），管不到 write(2)/open(2)。而 write(2) 是
     #     同步系统调用，放在主线程就是标准的 watchdog 杀进程写法。
     #
-    #     v16 引入 CSFSCrashTrace 是有正当理由的：崩溃现场必须同步落盘，
-    #     异步队列里的日志会跟着进程一起消失 —— 这正是 CSFS(11).log
-    #     让人误判崩溃点的原因。但"有正当理由"不等于"随便用"，
-    #     所以固化成三条硬约束：
-    #       ① 只允许出现在 CSFSCrashTrace / CSFSCrashTracePath 函数体内
-    #       ② 每行写入量必须 < PIPE_BUF（512 字节缓冲），避免部分写交错
-    #       ③ 必须忽略返回值（日志失败绝不能再引发二次崩溃）
-    ALLOWED_SYNC_IO_FNS = {"CSFSCrashTrace", "CSFSCrashTracePath"}
+    #     历史沿革：v16 曾为「崩溃取证」引入 CSFSCrashTrace（同步 write(2)
+    #     落盘，异步队列里的日志会跟着进程一起消失）。定位阶段结束后，
+    #     取证埋点已整体移除，因此规则从「只允许出现在取证函数内」
+    #     **收紧为「一律不允许」**：
+    #       · 日志统一走 CSFS_LOG（global 队列 + NSLock），不需要裸 IO
+    #       · 终版不应有任何绕过 Foundation 的文件句柄
+    #     将来若又要加同步取证，请连同这条规则一起改回来 —— 不要只加代码。
     for pat, human in ((r"\bwrite\s*\(", "write(2)"), (r"\bopen\s*\(", "open(2)")):
         offenders = []
         for m in re.finditer(pat, text):
-            owner = None
-            for name, bs, be in spans:
-                if bs <= m.start() <= be:
-                    owner = name
-                    break
-            if owner not in ALLOWED_SYNC_IO_FNS:
-                ln = text.count("\n", 0, m.start()) + 1
-                offenders.append((human, ln, owner))
+            ln = text.count("\n", 0, m.start()) + 1
+            offenders.append((human, ln))
         if offenders:
-            for human, ln, owner in offenders:
-                fail(f"第 {ln} 行出现裸 {human}（所属函数 {owner or '未知'}）— "
-                     f"同步 IO 只能在崩溃取证函数 {sorted(ALLOWED_SYNC_IO_FNS)} 内部使用")
+            for human, ln in offenders:
+                fail(f"第 {ln} 行出现裸 {human} — 终版禁止同步 IO，"
+                     f"日志请走 CSFS_LOG（global 队列 + NSLock）")
         else:
-            ok(f"无越界 {human}（仅崩溃取证函数可用）")
+            ok(f"无裸 {human}（终版禁止同步 IO）")
 
-    # R8b: 崩溃取证函数自身必须安全（缓冲 < 512、忽略返回值）
-    trace_body = next((text[bs:be] for nm, bs, be in spans if nm == "CSFSCrashTrace"), "")
-    if trace_body:
-        if "ignore" not in trace_body and "(void)write" not in trace_body:
-            fail("CSFSCrashTrace 未显式忽略 write 返回值 — 日志失败可能引发二次崩溃")
-        else:
-            ok("CSFSCrashTrace 已忽略 write 返回值")
-        mbuf = re.search(r"char\s+buf\s*\[\s*(\d+)\s*\]", trace_body)
-        if mbuf and int(mbuf.group(1)) >= 512:
-            fail(f"CSFSCrashTrace 缓冲 {mbuf.group(1)} 字节 ≥ PIPE_BUF(512)，"
-                 f"多线程 O_APPEND 写入可能交错撕裂日志")
-        else:
-            ok("CSFSCrashTrace 缓冲 < PIPE_BUF（写入原子）")
+    # R8b: 崩溃取证必须已清除
+    #      诊断期的 CSFSCrashTrace 会同步写盘并留下 [CRASH-TRACE] 噪声。
+    #      终版里它既不该有定义，也不该有残留调用点。
+    if re.search(r"\bCSFSCrashTrace\b", text):
+        fail("CSFSCrashTrace 仍存在 — 崩溃取证属诊断代码，终版必须清除")
+    else:
+        ok("崩溃取证（CSFSCrashTrace）已清除")
 
 
 # ─────────────────────────────────────────────────────────────────────

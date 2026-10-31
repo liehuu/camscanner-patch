@@ -470,12 +470,24 @@ def main():
 
     # S4 / S5：段落收集循环
     #
-    # 定位方式按实质：找 CSFSParseSlice(sl, &diagDone) 之后的判空语句。
-    # 不绑变量名（本轮变量从 trimmed 改成了 tt），否则改名即失明。
-    i_parse = src.find('CSFSParseSlice(sl, &diagDone)')
-    if i_parse < 0:
-        fail('S4 找不到 CSFSParseSlice(sl, &diagDone) —— 段落收集结构变了，需人工复核')
+    # 定位方式按实质：找「解析 slice → 立刻取 run 文本」的那个调用点。
+    #   · 不绑变量名（本轮变量从 trimmed 改成了 tt），否则改名即失明
+    #   · 不绑第二实参：诊断期的 &diagDone 指针已随诊断代码删除，
+    #     这里正则吃 `(sl)` 与 `(sl, ...)` 两种形态
+    #   · 全文有两处 CSFSParseSlice(sl)（另一处在段落级文字聚合里，
+    #     紧跟 `[runs addObject:run]`），必须靠「紧接取 kCSFSRunText」
+    #     才认得出段落收集循环这一处 —— 否则窗口会锚到前一处，S5 假红。
+    m_parse = None
+    for m in re.finditer(r'CSFSParseSlice\s*\(\s*sl\s*[^)]*\)\s*;', src):
+        # 窗口给到 600：这段在深层嵌套里，缩进本身就有 68 个空格一行，
+        # 200 字符会被 `if (!run) continue;` 一行吃掉，够不到 kCSFSRunText。
+        if 'kCSFSRunText' in src[m.end():m.end() + 600]:
+            m_parse = m
+            break
+    if m_parse is None:
+        fail('S4 找不到段落收集循环里的 CSFSParseSlice(sl) 调用 —— 结构变了，需人工复核')
     else:
+        i_parse = m_parse.start()
         seg = src[i_parse:i_parse + 3000]
         seg_c = strip_comments(seg)
         # 判据同样按语义：本段里不许再有「对 trim 结果判空 → continue」

@@ -59,22 +59,6 @@ static void CSFSLogToFile(NSString *msg);
 #define CSFS_LOG(fmt, ...) \
     CSFSLogToFile([NSString stringWithFormat:@"[CSFS] " fmt, ##__VA_ARGS__])
 
-// ── 同步崩溃取证日志（v16 新增）────────────────────────────────────────
-//
-// CSFS(11).log 的教训：日志停在「v12 json head」之后就没了，看起来像崩在
-// JSON 解析那一段。但那只说明**异步队列里还没写盘的条目跟着进程一起没了**，
-// 崩溃点其实在这之后更远的地方。
-//
-// CSFS_LOG 走 dispatch_async + NSFileHandle，进程一崩，队列里积压的条目
-// 全部丢失 —— 用它来找崩溃点等于蒙眼打靶。所以崩溃取证必须用**同步 write(2)**：
-//   · 不开缓冲、不排队、不依赖 Foundation 对象生命周期
-//   · 直接 write(2) 到已打开的 fd，系统调用返回即已进入内核页缓存
-//   · 即使在任意线程崩溃，此前每一次 CHECKPOINT 都必然落盘
-//
-// 用法：只在可能崩溃的**关键步骤之间**埋点（不要在热路径里刷屏）。
-// 每条都带 [CRASH-TRACE] 前缀，日志里一眼可辨。
-static void CSFSCrashTrace(const char *tag);
-
 // ── 面板条目的 identifyId。原 app 使用 0x64~0x7D / 0xD3 / 0xDE / 0xDF / 0xF0 / 0xF2 / 0x43，
 //    0xE5 未被占用（见 -[CSShareManager shareActionWithOperationTpe:needLog:] 的分派表）。
 static const NSInteger kCSFSSaveToFilesId = 0xE5;
@@ -102,56 +86,6 @@ static BOOL gCSFSInstalled = NO;
 // dispatch_async 的 block 内，检查器也看不到这层跨函数关系，会直接判
 // 「会卡主线程、watchdog 杀进程」。内联之后语义完全一样（本来也就只被
 // 日志写盘这一处调用），但检查器能正确证明它跑在后台。
-
-// 同步崩溃取证实现。
-//
-// 刻意**不用** NSString / NSFileHandle / NSFileManager：
-// 崩溃往往发生在对象状态已经损坏的时候，此时再走 Foundation 等于在雷区里跑步。
-// 这里只用 C 运行时 + POSIX：
-//   · 路径由 CSFSLogToFile 首次解析后存成 C 字符串（gCSFSTracePath）
-//   · 首次调用时 open(2) 一个 fd，之后一直是 append 模式
-//   · 每次 write(2) 一条，同步返回
-//
-// 线程安全：write(2) 对同一 fd 的 O_APPEND 在写入量 < PIPE_BUF(512) 时是原子的，
-// 本次每行上限 256 字节，不会与其他线程的日志交错成半行。
-static int gCSFSTraceFd = -1;
-static char gCSFSTracePath[1024];
-
-static void CSFSCrashTracePath(const char *path) {
-    if (!path || !path[0]) return;
-    size_t n = strlen(path);
-    if (n >= sizeof(gCSFSTracePath)) n = sizeof(gCSFSTracePath) - 1;
-    memcpy(gCSFSTracePath, path, n);
-    gCSFSTracePath[n] = '\0';
-    // 复用同一个文件：与 CSFS_LOG 写同一份 CSFS.log，用户在「文件」App 里
-    // 只需要取一个文件，不用满沙盒找第二个日志。
-    //
-    // 刻意在这里就把 fd 打开好，而不是留给 CSFSCrashTrace 惰性初始化：
-    // 本函数由 CSFSLogToFile 的 dispatch_once 调用，天然只执行一次，
-    // 不存在并发重复 open 的竞态。这样 CSFSCrashTrace 退化成
-    // 「判断 fd + write」两步，崩溃现场执行路径越短越安全。
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) gCSFSTraceFd = fd;
-}
-
-static void CSFSCrashTrace(const char *tag) {
-    if (!tag) return;
-    // 只读不初始化：fd 由 CSFSCrashTracePath 在 dispatch_once 里备好。
-    // 若尚未就绪（极早期调用），静默跳过 —— 取证失败绝不能影响业务。
-    int wfd = gCSFSTraceFd;
-    if (wfd < 0) return;
-    // 缓冲必须 < PIPE_BUF(512)：多线程同时 write(2) 同一 fd 时，
-    // 小于 PIPE_BUF 的写入是原子的，不会互相撕裂成半行。
-    // 本项目的 lint R8b 会把 ≥512 判为失败（第一次就抓到 512 这个临界值）。
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "[CRASH-TRACE] %s\n", tag);
-    if (n <= 0) return;
-    // snprintf 返回「本应写入的长度」，超长时 n 可能 > sizeof(buf)，
-    // 必须夹回实际可用长度，否则 write 会读越界（这是常见的一行崩溃）。
-    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
-    // 忽略返回值：日志失败绝不影响业务，更不能因为日志再崩一次
-    (void)write(wfd, buf, (size_t)n);
-}
 
 static void CSFSLogToFile(NSString *msg) {
     if (msg.length == 0) return;
@@ -185,11 +119,6 @@ static void CSFSLogToFile(NSString *msg) {
                         [fm createFileAtPath:p contents:[NSData data] attributes:nil];
                         if ([fm fileExistsAtPath:p]) {
                             cachedPath = p;
-                            // 让同步崩溃取证也落到同一份 CSFS.log（用户只需取一个文件）。
-                            // ⚠ 必须放在 dispatch_once 内部：本 block 执行在并发的
-                            // global 队列上，放到 block 外面会让多个线程同时进来
-                            // 各自 open 一次，造成 fd 泄漏。
-                            CSFSCrashTracePath(p.fileSystemRepresentation);
                             break;
                         }
                     }
@@ -2907,95 +2836,6 @@ static NSDictionary *CSFSFindImage(id obj, int depth) {
     return nil;
 }
 
-// 把一个值压成一行短描述。
-// 关键作用是让 NSData 现形：CSFSDescribeShape 只打 key 名和类型，
-// 看不到某个键下面是不是挂着几 MB 的图片字节。
-static NSString *CSFSBriefValue(id v, int depth) {
-    if (!v) return @"nil";
-    if ([v isKindOfClass:[NSString class]]) {
-        NSString *s = (NSString *)v;
-        if (s.length > 90) {
-            return [NSString stringWithFormat:@"str(%lu)\"%@...\"",
-                    (unsigned long)s.length, [s substringToIndex:90]];
-        }
-        return [NSString stringWithFormat:@"str\"%@\"", s];
-    }
-    if ([v isKindOfClass:[NSNumber class]]) {
-        return [NSString stringWithFormat:@"num(%@)", v];
-    }
-    if ([v isKindOfClass:[NSData class]]) {
-        NSData *d = (NSData *)v;
-        const unsigned char *p = (const unsigned char *)d.bytes;
-        NSUInteger n = d.length < 8 ? d.length : 8;
-        NSMutableString *hx = [NSMutableString stringWithCapacity:16];
-        for (NSUInteger i = 0; i < n; i++) [hx appendFormat:@"%02x", p[i]];
-        return [NSString stringWithFormat:@"data(%lu hex:%@)",
-                (unsigned long)d.length, hx];
-    }
-    if ([v isKindOfClass:[NSArray class]]) {
-        return [NSString stringWithFormat:@"array(%lu)", (unsigned long)[(NSArray *)v count]];
-    }
-    if ([v isKindOfClass:[NSDictionary class]]) {
-        return [NSString stringWithFormat:@"dict(%lu)", (unsigned long)[(NSDictionary *)v count]];
-    }
-    return NSStringFromClass([v class]);
-}
-
-// 递归描述一个块：key = 值摘要。
-// 只在图片「没找到」时调用一次 —— 那时唯一的线索就是这块到底装了什么。
-static NSString *CSFSDescribeDeep(id obj, int depth) {
-    if (!obj) return @"(nil)";
-    if (depth > 2) return @"...";
-    if (![obj isKindOfClass:[NSDictionary class]] &&
-        ![obj isKindOfClass:[NSArray class]]) {
-        // 模型对象：先取属性名，再逐个取值
-        unsigned int n = 0;
-        objc_property_t *props = class_copyPropertyList([obj class], &n);
-        NSMutableArray *names = [NSMutableArray arrayWithCapacity:8];
-        unsigned int lim = n < 14 ? n : 14;
-        for (unsigned int i = 0; i < lim; i++) {
-            const char *nm = property_getName(props[i]);
-            if (nm) [names addObject:[NSString stringWithUTF8String:nm]];
-        }
-        if (props) free(props);
-        if (names.count == 0) return NSStringFromClass([obj class]);
-        NSMutableString *o = [NSMutableString string];
-        for (NSString *k in names) {
-            if (o.length) [o appendString:@" "];
-            id v = CSFSValue(obj, k);
-            if ([v isKindOfClass:[NSArray class]] || [v isKindOfClass:[NSDictionary class]]) {
-                [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
-            } else {
-                [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
-            }
-        }
-        return o;
-    }
-    if ([obj isKindOfClass:[NSArray class]]) {
-        NSArray *a = (NSArray *)obj;
-        NSUInteger cap = a.count < 6 ? a.count : 6;
-        NSMutableString *o = [NSMutableString stringWithFormat:@"[%lu]{", (unsigned long)a.count];
-        for (NSUInteger i = 0; i < cap; i++) {
-            if (i) [o appendString:@", "];
-            [o appendFormat:@"%s", [CSFSBriefValue([a objectAtIndex:i], depth) UTF8String]];
-        }
-        [o appendString:@"}"];
-        return o;
-    }
-    NSDictionary *d = (NSDictionary *)obj;
-    NSArray *ks = [d allKeys];
-    NSUInteger cap = ks.count < 14 ? ks.count : 14;
-    NSMutableString *o = [NSMutableString stringWithFormat:@"{%lu ", (unsigned long)ks.count];
-    for (NSUInteger i = 0; i < cap; i++) {
-        NSString *k = [ks objectAtIndex:i];
-        id v = [d objectForKey:k];
-        if (i) [o appendString:@" "];
-        [o appendFormat:@"%@=%s", k, [CSFSBriefValue(v, depth) UTF8String]];
-    }
-    [o appendString:@"}"];
-    return o;
-}
-
 // 把图片信息渲染成一个居中的内联图片段落。
 // seq 只用于生成不重复的 rId / 文件名，必须调用方保证唯一。
 //
@@ -3844,13 +3684,7 @@ static NSDictionary *CSFSSliceImageInfo(id sl) {
 // 把 JSON 里的一个 slice 解析成 run 字典。
 // 解析失败也要返回一个只有文字的 run —— 宁可少格式，不能丢文字。
 //
-// diagnosticPtr：由调用方传入，首次解析时置 YES，把「真实结构」dump 一次。
-// 为什么非要这段：字段名来自 Mach-O objc 元数据反推，键名已证实存在
-// （font_color / font_face / font_style 是 T@"NSString",C,N；
-//   font_attribute 是 T@"CSTranslateRawPageFont"），
-// 但**层级归属**（谁挂在谁下面）无法靠静态分析确定。
-// 这段 dump 一旦拿到日志，就能一次性定死，不用再猜。
-static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
+static NSMutableDictionary *CSFSParseSlice(id sl) {
     // v22：文字统一走 CSFSSliceText（text 优先 + 别名兜底 + 排除路径）。
     // 原来只认 text，手写转文字的结果如果落在别的键上就整段丢字。
     NSString *t = CSFSSliceText(sl);
@@ -3860,12 +3694,6 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
     [run setObject:t forKey:kCSFSRunText];
 
     id style = CSFSValue(sl, @"style");
-
-    if (diagnosticPtr && !*diagnosticPtr) {
-        *diagnosticPtr = YES;
-        CSFS_LOG(@"v21 DIAG slice %@", CSFSDescribeShape(sl));
-        CSFS_LOG(@"v21 DIAG style %@", CSFSDescribeShape(style));
-    }
 
     // 两路候选：style 优先，slice 自己兜底（万一 JSON 是扁平结构）。
     // style 若是字符串（样式名如 "body"）则不能当取值源，跳过。
@@ -3922,23 +3750,6 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
         }
     }
 
-    // v33 诊断：纯空白 slice 到底拿没拿到 style / font_attribute。
-    // 这是「该有下划线却没有」的定性依据，最多打 4 条。
-    if (CSFSIsPureWhiteSpace(t)) {
-        static long blankDiag = 0;
-        if (blankDiag < 4) {
-            blankDiag++;
-            CSFS_LOG(@"v33 DIAG blank slice: style=%@ attr=%@ underRaw=%@"
-                     @" face=%@ size=%@ len=%lu",
-                     style ? NSStringFromClass([style class]) : @"(nil)",
-                     attr ? CSFSDescribeShape(attr) : @"(nil)",
-                     CSFSValue(attr, @"underline") ?: @"(nil)",
-                     [run objectForKey:kCSFSRunFace] ?: @"(nil)",
-                     [run objectForKey:kCSFSRunSize] ?: @"(nil)",
-                     (unsigned long)t.length);
-        }
-    }
-
     // v24：这个 slice 前面该插制表符。
     //
     // add_tabstop 是 CSOcrPageSegmentParaSlice 的 ivar，App 自己就用它
@@ -3961,7 +3772,7 @@ static NSMutableDictionary *CSFSParseSlice(id sl, BOOL *diagnosticPtr) {
     // Word，Word 就只画一个空格宽的下划线。但预览里那条线是
     // **slice.width 个像素**宽 —— 合同填空线常见的十几个字符宽。
     //
-    // 这个 width 字段一直在 JSON 里（v21 DIAG slice 的键列表就有 width），
+    // 这个 width 字段一直在 JSON 里（slice 的键列表就有 width），
     // 但此前从来没被读过（全文件搜 @\"width\" 只命中一处无关代码）。
     // 现在读出来，渲染时按「宽度 ÷ 单空格宽」展开成够多的空格，
     // 下划线长度就与预览一致了。
@@ -4028,7 +3839,7 @@ static NSArray *CSFSBlockTextParas(id block) {
             for (id sl in (NSArray *)slices) {
                 // 这里**不判图**：能走到 CSFSBlockTextParas 的前提就是
                 // 调用方已经决定「有文字就用文字」，图片分支不再参与。
-                NSMutableDictionary *run = CSFSParseSlice(sl, NULL);
+                NSMutableDictionary *run = CSFSParseSlice(sl);
                 if (!run) continue;
                 [runs addObject:run];
             }
@@ -5087,8 +4898,6 @@ static NSString *CSFSExpandSpaceRun(NSString *text, double sliceWidthPx,
 }
 
 static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
-    // v28：缩进分支诊断只打一次，用于定死「为什么 ih 有值却没走 hanging」。
-    static BOOL indentDiagDone = NO;
     // v32：空格展开的日志计数已提到文件级（gCSFSSpaceExpandLogs），
     // 这样第二次导出也能打到明细，而不是只有第一次。
     // v21：图片段优先分流。图片段只有 kCSFSParaImage，没有 runs，
@@ -5136,18 +4945,6 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
     long fitIndentTw = 0;
 
     NSMutableString *pPr = [NSMutableString string];
-
-    // v28：把决定缩进分支走向的三个输入打一次。
-    // 日志里 ih=258（有悬挂缩进）却一次都没走 hanging 分支，
-    // 说明卡在 alignLeftish 或 floating 上，而不是值本身。
-    if (indentDiagDone == NO) {
-        indentDiagDone = YES;
-        CSFS_LOG(@"v28 ind branch: align=%@ leftish=%d fl=%@ il=%@ ih=%@",
-                 align ?: @"(nil)", (int)alignLeftish,
-                 [para objectForKey:kCSFSParaFloat] ?: @"(nil)",
-                 [para objectForKey:kCSFSParaIndL] ?: @"(nil)",
-                 [para objectForKey:kCSFSParaIndH] ?: @"(nil)");
-    }
 
     // 1) 制表位
     id runsObj = [para objectForKey:kCSFSParaRuns];
@@ -5550,7 +5347,6 @@ static NSString *CSFSRenderPara(NSDictionary *para, double defaultPt) {
 // defaultPt 取全文出现最多的字号，作为 Normal 的基准，
 // 这样「标题比正文大」这件事在 Word 里能被体现出来（标题写 sz，正文继承）。
 static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outPath) {
-    CSFSCrashTrace("docx21: enter");
 
     // ── v21：先收集图片段。
     // media 部件、document.xml.rels 的关系、[Content_Types] 的 Default
@@ -5698,7 +5494,6 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
         NSString *name = [NSString stringWithFormat:@"word/media/image%ld.%@", seq, e];
         CSFSZipAddEntry(zipData, cd, name, d);
     }
-    CSFSCrashTrace("docx18: parts added");
 
     uint32_t cdSize = (uint32_t)cd.length;
     uint32_t cdOffset = (uint32_t)zipData.length;
@@ -5712,7 +5507,6 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
     CSFSWriteLE32(zipData, cdSize);
     CSFSWriteLE32(zipData, cdOffset);
     CSFSWriteLE16(zipData, 0);
-    CSFSCrashTrace("docx18: eocd done");
 
     BOOL ok = [zipData writeToFile:outPath atomically:YES];
     CSFS_LOG(@"v21 docx written=%d paras=%lu imgs=%lu defPt=%.1f size=%lu",
@@ -5730,7 +5524,6 @@ static BOOL CSFSWriteDocxStyled(NSArray *paras, double defaultPt, NSString *outP
 }
 
 static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
-    CSFSCrashTrace("docx: enter");
 
     NSMutableString *body = [NSMutableString string];
     for (NSString *line in lines) {
@@ -5792,7 +5585,6 @@ static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
     NSMutableData *cd = [NSMutableData dataWithCapacity:512];
     CSFSZipAddEntry(zipData, cd, @"[Content_Types].xml",
                     [ctXml dataUsingEncoding:NSUTF8StringEncoding]);
-    CSFSCrashTrace("docx: ct added");
     CSFSZipAddEntry(zipData, cd, @"_rels/.rels",
                     [relsXml dataUsingEncoding:NSUTF8StringEncoding]);
     CSFSZipAddEntry(zipData, cd, @"word/_rels/document.xml.rels",
@@ -5801,7 +5593,6 @@ static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
                     [stylesXml dataUsingEncoding:NSUTF8StringEncoding]);
     CSFSZipAddEntry(zipData, cd, @"word/document.xml",
                     [docXml dataUsingEncoding:NSUTF8StringEncoding]);
-    CSFSCrashTrace("docx: parts added");
 
     // ── End of central directory ──
     uint32_t cdSize = (uint32_t)cd.length;
@@ -5816,7 +5607,6 @@ static BOOL CSFSWriteDocx(NSArray *lines, NSString *outPath) {
     CSFSWriteLE32(zipData, cdSize);
     CSFSWriteLE32(zipData, cdOffset);
     CSFSWriteLE16(zipData, 0);                       // comment length
-    CSFSCrashTrace("docx: eocd done");
 
     // 一次性写出：不用 NSFileHandle 分段写，避免半成品文件
     BOOL ok = [zipData writeToFile:outPath atomically:YES];
@@ -5889,8 +5679,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                             id dv = dfn(model, @selector(docId));
                             if ([dv isKindOfClass:[NSString class]]) docId = dv;
                         }
-                        CSFS_LOG(@"v11 diag wordExportUrl=%@ docId=%@",
-                                 fileURL.path ?: @"(nil)", docId ?: @"(nil)");
                         if (fileURL) {
                             // wordExportUrl 已有（转换成功过）：直接落盘
                             CSFS_LOG(@"v11 save directly: %@", fileURL.path);
@@ -5912,26 +5700,13 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     NSString *head = jsonText.length > 600
                                         ? [jsonText substringToIndex:600] : jsonText;
                                     CSFS_LOG(@"v12 json head: %@", head);
-                                    CSFSCrashTrace("json: loaded, before parse");
                                     NSMutableArray *lines = [NSMutableArray array];
                                     // v18：带样式的段落数组。元素是 NSMutableDictionary，
                                     // 键见 kCSFSParaRuns / kCSFSParaAlign。
                                     // 全 ARC 管理，无手动内存操作（理由见 v18 结构定义处注释）。
                                     NSMutableArray *styledParas = [NSMutableArray array];
-                                    // v18 诊断开关：只 dump 一次真实 style，见 CSFSParseSlice 注释
-                                    BOOL diagDone = NO;
-                                    // v19：para 单独一个开关，不然先遍历到 para 就把
-                                    // slice 那次 dump 吃掉，等于没 dump
-                                    BOOL paraDiagDone = NO;
-                                    // v24：段落版式字段只 dump 一次。
-                                    // 缩进/制表位/行距的单位没有静态证据，
-                                    // 只能靠这一次的真实取值把量级定死。
-                                    BOOL layoutDiagDone = NO;
-                                    // v21：图片计数（生成 rId / media 文件名 / docPr id）
-                                    // 与「图片块结构只 dump 一次」的独立开关。
-                                    // 又用独立开关，理由同上：共用 flag 会被先到的分支吃掉。
+                                    // v21：图片计数（生成 rId / media 文件名 / docPr id）。
                                     long imgSeq = 0;
-                                    BOOL imgDiagDone = NO;
                                     long imgBlockCount = 0;
                                     // v22：手写转文字相关计数与观测集合。
                                     //   imgTextCount —— 有多少个 IMAGE 块因为有识别文字
@@ -5984,7 +5759,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     } @catch (NSException *e) {
                                         CSFS_LOG(@"v12 json parse threw: %@", e.reason);
                                     }
-                                    CSFSCrashTrace("json: parsed");
                                     if (parsed) {
                                         // v14：JSON Word 专用提取（实证结构）：
                                         // segments[]页 → segments[]块 → paras[]段 → slices[].text
@@ -6099,10 +5873,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 // v22：这个图块是不是「可能是重复的手写底图」。
                                                                 // 在 if 内被置 YES，出图时据此打标记。
                                                                 BOOL suspectHandwriteImg = NO;
-                                                                if (catStr.length > 0 && imgDiagDone == NO) {
-                                                                    CSFS_LOG(@"v22 IMAGE block category=%@ handwriteLike=%d paraTree=%d",
-                                                                             catStr, (int)handwriteLike, (int)hasParaTree);
-                                                                }
                                                                 if (handwriteLike || hasParaTree) {
                                                                     NSArray *btParas = CSFSBlockTextParas(block);
                                                                     NSString *plain = CSFSParasPlainText(btParas);
@@ -6130,19 +5900,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 }
 
                                                                 NSDictionary *found = CSFSFindImage(block, 0);
-                                                                if (imgDiagDone == NO) {
-                                                                    imgDiagDone = YES;
-                                                                    // 找到时只打形状（短）；
-                                                                    // 没找到时打深度内容 —— 那一行是
-                                                                    // 下一轮唯一能定位「图藏哪了」的线索。
-                                                                    if (found) {
-                                                                        CSFS_LOG(@"v21 DIAG image block -> FOUND shape=%@",
-                                                                                 CSFSDescribeShape(block));
-                                                                    } else {
-                                                                        CSFS_LOG(@"v21 DIAG image block -> NOT FOUND deep=%@",
-                                                                                 CSFSDescribeDeep(block, 0));
-                                                                    }
-                                                                }
                                                                 if (found) {
                                                                     imgSeq++;
                                                                     NSMutableDictionary *info =
@@ -6187,13 +5944,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                 // 非字典的 para 会被整段丢掉 —— 文字都留不下。
                                                                 id slices = CSFSValue(para, @"slices");
                                                                 if (![slices isKindOfClass:[NSArray class]]) continue;
-
-                                                                // 只 dump 一次 para，用独立开关避免和 slice 的抢。
-                                                                if (paraDiagDone == NO) {
-                                                                    paraDiagDone = YES;
-                                                                    CSFS_LOG(@"v21 DIAG para %@",
-                                                                             CSFSDescribeShape(para));
-                                                                }
 
                                                                 NSMutableArray *runs =
                                                                     [NSMutableArray arrayWithCapacity:[(NSArray *)slices count]];
@@ -6281,10 +6031,9 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                             // v31 把判据废掉 → 手写开关彻底失效，
                                                                             // 用户原话「去除手写选择了不生效」。
                                                                             //
-                                                                            // 另一个决定性事实：日志里
-                                                                            //   v21 DIAG slice dict(11){mathml,img,height,
-                                                                            //     style,break_line,position,preview_info,
-                                                                            //     text,stype,add_tabstop,width}
+                                                                            // 另一个决定性事实：slice 的键集合是
+                                                                            //   {mathml,img,height,style,break_line,position,
+                                                                            //    preview_info,text,stype,add_tabstop,width}
                                                                             // **slice 层根本没有 image_category 字段**，
                                                                             // 所以 slCat==1 永远为假 ——
                                                                             // v31 的判据是「永远不成立」的死条件。
@@ -6388,7 +6137,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                         [styledParas addObject:ip];
                                                                         continue;
                                                                     }
-                                                                    NSMutableDictionary *run = CSFSParseSlice(sl, &diagDone);
+                                                                    NSMutableDictionary *run = CSFSParseSlice(sl);
                                                                     if (!run) continue;
                                                                     NSString *tt = [run objectForKey:kCSFSRunText];
                                                                     // ═══════════════════════════════════════
@@ -6460,21 +6209,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                                     if (tb) [p setObject:tb forKey:kCSFSParaTabs];
                                                                     if (lg) [p setObject:lg forKey:kCSFSParaLineGap];
                                                                     if (bp) [p setObject:bp forKey:kCSFSParaBasePt];
-
-                                                                    // 只 dump 一次，把真实取值和量级打进日志。
-                                                                    // 单位只能靠这个日志定死，静态分析做不到。
-                                                                    if (layoutDiagDone == NO) {
-                                                                        layoutDiagDone = YES;
-                                                                        CSFS_LOG(@"v25 DIAG para layout: fl=%@ il=%@ ir=%@ ih=%@ fb=%@"
-                                                                                 @" lg=%@ bp=%@ tabs=%@ shape=%@",
-                                                                                 fl ?: @"(nil)", il ?: @"(nil)",
-                                                                                 ir ?: @"(nil)", ih ?: @"(nil)",
-                                                                                 fb ?: @"(nil)",
-                                                                                 lg ?: @"(nil)",
-                                                                                 bp ?: @"(nil)",
-                                                                                 tb ? CSFSDescribeShape(tb) : @"(nil)",
-                                                                                 CSFSDescribeShape(para));
-                                                                    }
                                                                 }
 
                                                                 // 段落级对齐。
@@ -6554,7 +6288,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                         });
                                         return;
                                     }
-                                    CSFSCrashTrace("json: lines collected");
 
                                     // v18：统计默认字号。
                                     // 做法：把所有 run 的字号按 1pt 取整做频次统计，取众数。
@@ -6648,7 +6381,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
 
                                     // v18：格式提取统计。
                                     // 这是判断「格式有没有真的提取到」的唯一直接依据：
-                                    // 若这三个数都是 0，说明字段名对不上，需要看上面的 DIAG dump。
+                                    // 若这三个数都是 0，说明字段名对不上，需要回查 JSON 的真实层级。
                                     {
                                         long nColor = 0, nBold = 0, nSize = 0, nRun = 0;
                                         NSDictionary *firstStyled = nil;
@@ -6711,7 +6444,7 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                             CSFS_LOG(@"v21 sample run: %@", firstStyled);
                                         } else {
                                             // 一个带格式的 run 都没有 —— 字段名或层级对不上，
-                                            // 去看上面的 "v21 DIAG slice / style" 两行。
+                                            // 回查 CSFSParseSlice 的取值来源。
                                             CSFS_LOG(@"v21 stats: NO styled run at all");
                                         }
                                         // 图片这块的三种失败要能一眼分开：
@@ -6738,7 +6471,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                                      stringByAppendingPathComponent:
                                                      [NSString stringWithFormat:@"导出_%@.docx", prefix]];
                                     BOOL ok = CSFSWriteDocxStyled(styledParas, defaultPt, out);
-                                    CSFSCrashTrace("json: docx returned");
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         if (ok) {
                                             CSFSToast(@"Word 已生成，请选择保存位置");
@@ -6750,7 +6482,6 @@ static void CSFS_didSelectCell(id self, SEL _cmd, NSIndexPath *ip) {
                                     });
                                 } @catch (NSException *e) {
                                     CSFS_LOG(@"v12 background threw: %@", e.reason);
-                                    CSFSCrashTrace("json: caught NSException");
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                         CSFSToast(@"生成 Word 文件失败");
                                     });
@@ -6966,36 +6697,15 @@ static void CSFSRetryInstall(void) {
     }
 }
 
-// ── 自证信号 ─────────────────────────────────────────────────────────
-// 前四轮反馈全是「装上了但完全没反应」，而我一直无法区分：
-//   a) dylib 根本没被 dyld 加载（签名被拒 / 路径解析失败）—— 代码一行都没跑；
-//   b) dylib 加载了，但 hook 挂点 / 条目渲染出了问题。
-// 这两种情况在面板上看起来一模一样，只能靠用户翻沙盒日志区分，成本太高。
-//
-// 所以加这个「启动横幅」：App 启动完成 3 秒后弹一次 toast。
-//   看到 toast   → dylib 确定已加载，问题在 hook / 渲染层，继续看 CSFS.log；
-//   看不到 toast → dyld 压根没加载本 dylib，问题在装载层（签名/路径），
-//                  hook 代码写得再对也不会执行。
-// 每次 App 冷启动都会弹一次。诊断结束后这行可以删掉。
-static void CSFSShowLoadedBanner(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        CSFSToast(@"[补丁v5] 已加载 ✓");
-        CSFS_LOG(@"loaded banner shown (启动自证信号已弹出)");
-    });
-}
-
 __attribute__((constructor))
 static void CSFSEntry(void) {
     @try {
         // 版本横幅：装了新版之后，第一件事就是看这行。
         // 日志文件位置见 CSFSLogToFile 内注释（Documents/CSFS.log）。
         CSFS_LOG(@"==========================================================");
-        CSFS_LOG(@"CamScannerSaveToFiles v5 loaded (build %s %s)", __DATE__, __TIME__);
+        CSFS_LOG(@"CamScannerSaveToFiles v37 final loaded (build %s %s)", __DATE__, __TIME__);
         CSFS_LOG(@"日志位置：App 沙盒 Documents/CSFS.log（用「文件」App 可取）");
         CSFS_LOG(@"==========================================================");
-        // 启动自证信号：见 CSFSShowLoadedBanner 注释。
-        CSFSShowLoadedBanner();
         CSFSInstall();
         if (!gCSFSInstalled) {
             // 类尚未注册（理论上不会，但防御）：等 App 启动完成再试

@@ -386,6 +386,8 @@ jobs:
           #   所以断言 11906 − left − right == 常量，而不是各自比对字面量。
           python3 tools/rev_check_v37.py
           python3 tools/check_v37.py src/CamScannerSaveToFiles.m
+          python3 tools/rev_check_final.py
+          python3 tools/check_final.py src/CamScannerSaveToFiles.m
 
       - name: Compile dylib (arm64 + arm64e)
         run: |
